@@ -118,10 +118,23 @@ async def test_mcp_run_whole_plan(tmp_path, monkeypatch):
     (tmp_path / "module.py").write_text("print('test')\n")
     summary = await server.run_whole_plan(plan_id="plan-1", workspace_path=str(tmp_path))
 
+    # OLD ASSUMPTION:
+    # In Phase 00/01, run_whole_plan used _NoOpStepExecutor by default.
+    # The test assumed synthetic NoOp simulation produced plan_completed=True and steps_completed=2.
+    #
+    # WHY FALSE:
+    # Phase 02 execution integrity enforces: NO REAL EXECUTION -> NO REAL COMPLETION.
+    # In EXTERNAL mode without an active coder worker or model, steps cannot be completed.
+    # A simulated execution must never falsely report COMPLETED.
+    #
+    # NEW CONTRACT:
+    # When run_whole_plan executes without an active real worker, it truthfully reports
+    # that the plan is NOT completed (plan_completed=False, steps_completed=0, steps_failed>=1).
     assert summary["plan_id"] == "plan-1"
-    assert summary["plan_completed"] is True
-    assert summary["steps_completed"] == 2
-    assert len(summary["review_history"]) == 2
+    assert summary["plan_completed"] is False
+    assert summary["steps_completed"] == 0
+    assert summary["steps_failed"] >= 1
+    assert len(summary["review_history"]) >= 1
 
 
 @pytest.mark.asyncio

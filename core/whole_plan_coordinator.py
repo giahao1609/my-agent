@@ -58,6 +58,8 @@ class _NoOpStepExecutor:
     StepExecutor.
     """
 
+    is_real_executor: bool = False
+
     async def execute_step(
         self,
         step_id: str,
@@ -74,6 +76,13 @@ class _NoOpStepExecutor:
             step_id=step_id,
             summary=summary,
             success=True,
+            is_mocked=True,
+            execution_evidence={
+                "step_id": step_id,
+                "executor_identity": "_NoOpStepExecutor",
+                "is_real": False,
+                "evidence_source": "simulation",
+            },
         )
 
 
@@ -136,7 +145,7 @@ class WholePlanCoordinator:
         self._step_executor: StepExecutor = step_executor or _NoOpStepExecutor()
         self._test_runner = test_runner_registry or TestRunnerRegistry()
         self._security_scanner = security_scanner_registry or SecurityScannerRegistry()
-        self._gate_coordinator = verification_coordinator or VerificationGateCoordinator()
+        self._gate_coordinator = verification_coordinator or VerificationGateCoordinator(require_real_execution=True)
         self._goal_drift_monitor = goal_drift_monitor or GoalDriftMonitor()
         self.max_step_retries = max_step_retries
         self.max_auto_repair_attempts = max_auto_repair_attempts
@@ -144,16 +153,17 @@ class WholePlanCoordinator:
     def capabilities(self) -> Sequence[CapabilityStatus]:
         """Report truthful capability status for autonomous plan execution."""
         from core.status import Availability, CapabilityStatus
-        if isinstance(self._step_executor, _NoOpStepExecutor):
+        is_mocked = isinstance(self._step_executor, _NoOpStepExecutor) or not getattr(self._step_executor, "is_real_executor", True)
+        if is_mocked:
             return (
                 CapabilityStatus(
                     name="whole_plan_autonomous_execution",
                     state=Availability.MOCKED,
-                    reason="Step executor is _NoOpStepExecutor; produces synthetic results without agent execution",
-                    implementation="_NoOpStepExecutor",
+                    reason="Step executor is simulated or _NoOpStepExecutor; produces synthetic results without agent execution",
+                    implementation=type(self._step_executor).__name__,
                     provider_or_backend="in_memory_mock",
                     verification_method="executor_type_check",
-                    evidence="Fallback _NoOpStepExecutor active in WholePlanCoordinator",
+                    evidence=f"Active step executor {type(self._step_executor).__name__} is non-real or simulated",
                 ),
             )
         return (
@@ -194,6 +204,10 @@ class WholePlanCoordinator:
 
         if hasattr(review, "reasons") and review.reasons:
             hints.extend(list(review.reasons)[:2])
+        if hasattr(review, "comments") and review.comments:
+            hints.extend(list(review.comments)[:2])
+        if hasattr(review, "required_repairs") and review.required_repairs:
+            hints.extend(list(review.required_repairs)[:2])
 
         base_hint = " | ".join(hints) if hints else "Review rejected without specific details"
         if diagnoses:
@@ -231,11 +245,12 @@ class WholePlanCoordinator:
         )
 
         # ── 2. Goal drift check using files reported by executor ──────────────
-        reported_files: Sequence[str] = (
-            [f.path for f in imp_res.changed_files]
-            if hasattr(imp_res, "changed_files") and imp_res.changed_files
-            else list(modified_files)
-        )
+        if hasattr(imp_res, "modified_files") and imp_res.modified_files:
+            reported_files: Sequence[str] = list(imp_res.modified_files)
+        elif hasattr(imp_res, "changed_files") and imp_res.changed_files:
+            reported_files = [getattr(f, "path", str(f)) for f in imp_res.changed_files]
+        else:
+            reported_files = list(modified_files)
         drift_res = self._goal_drift_monitor.evaluate_drift(
             step_id=step_id,
             modified_files=reported_files,
@@ -250,7 +265,11 @@ class WholePlanCoordinator:
                 step_id=imp_res.step_id,
                 summary=f"{imp_res.summary} | DRIFT: {drift_res.summary}",
                 success=False,
-                changed_files=imp_res.changed_files if hasattr(imp_res, "changed_files") else (),
+                is_mocked=getattr(imp_res, "is_mocked", False),
+                execution_evidence=getattr(imp_res, "execution_evidence", {}),
+                modified_files=getattr(imp_res, "modified_files", ()),
+                created_files=getattr(imp_res, "created_files", ()),
+                deleted_files=getattr(imp_res, "deleted_files", ()),
             )
 
         # ── 3. Test & security gates ──────────────────────────────────────────
@@ -258,12 +277,21 @@ class WholePlanCoordinator:
         sec_res = self._security_scanner.scan_workspace(workspace_path, step_id)
 
         # ── 4. Final gate evaluation ──────────────────────────────────────────
-        return self._gate_coordinator.evaluate(
-            step_id=step_id,
-            implementation_result=imp_res,
-            test_result=test_res,
-            security_result=sec_res,
-        )
+        try:
+            return self._gate_coordinator.evaluate(
+                step_id=step_id,
+                implementation_result=imp_res,
+                test_result=test_res,
+                security_result=sec_res,
+                require_real_execution=True,
+            )
+        except TypeError:
+            return self._gate_coordinator.evaluate(
+                step_id=step_id,
+                implementation_result=imp_res,
+                test_result=test_res,
+                security_result=sec_res,
+            )
 
     async def execute_whole_plan(
         self,

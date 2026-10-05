@@ -59,6 +59,7 @@ from core.security_scanner import SecurityScannerRegistry
 from core.test_runner import TestRunnerRegistry
 from core.verification_gate_coordinator import VerificationGateCoordinator
 from core.whole_plan_coordinator import WholePlanCoordinator
+from core.step_execution import CoderRuntimeStepExecutor
 from eval.evaluation_job import EvaluationHarness
 from integrations.docs_knowledge_backend import DocsKnowledgeBackend
 from integrations.playwright_browser import PlaywrightBrowserAdapter
@@ -1332,12 +1333,41 @@ async def run_whole_plan(
     each step is assigned to its specialist role, then passed through
     test gate + security gate + verification gate → APPROVED / repair loop.
     """
+    await _initialize()
     svc = _plan_service()
     task_svc = _task_service()
+
+    plan = await plans.get_plan(plan_id)
+    if plan is None:
+        return {
+            "error": f"plan not found: {plan_id}",
+            "plan_completed": False,
+            "steps_completed": 0,
+            "steps_failed": 0,
+            "steps_skipped": 0,
+            "review_history": [],
+        }
+    task = await tasks.get(plan.task_id) if plan else None
+    project_id = task.project_id if task else None
+    task_id = task.task_id if task else None
+
+    # Wire real coder runtime step executor
+    stack = await _get_coder_stack()
+    real_executor = CoderRuntimeStepExecutor(
+        coder_stack=stack,
+        workspace_path=workspace_path,
+        project_id=project_id,
+        task_id=task_id,
+        plan_id=plan_id,
+        agent_run_service=_agent_run_service,
+        worker_task_launcher=_ensure_in_process_coder_worker,
+    )
+
     coordinator = WholePlanCoordinator(
         task_service=task_svc,
         plan_service=svc,
         plan_store=plans,
+        step_executor=real_executor,
         test_runner_registry=_test_runner_registry,
         security_scanner_registry=_security_scanner_registry,
         verification_coordinator=_verification_gate_coordinator,
