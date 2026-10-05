@@ -223,19 +223,23 @@ Categories (see contracts/agent_execution.md for full list):
 
 | Capability | Status | Class / Location | Evidence |
 |------------|--------|-----------------|---------|
-| WholePlan step execution | MOCKED | core/whole_plan_coordinator._NoOpStepExecutor | Returns synthetic ImplementationResult; does NOT run any agent or modify workspace |
-| PendingApprovalStore (default) | PARTIAL | core/control_plane.InMemoryPendingApprovalStore | dict in-process; lost on restart; SQLitePendingApprovalStore exists but not injected by default |
-| Memory consolidation persistence | PARTIAL | core/memory_consolidation.MemoryConsolidator | consolidate_session() returns MemoryEntry objects; not written to SQLiteMemoryStore |
-| Memory search | PARTIAL | persistence/sqlite_memory_store.SQLiteMemoryStore | LIKE %query% substring match; no embeddings, no vector similarity |
-| DB_MIGRATION role policy | NOT IMPLEMENTED | core/agent_role.RolePolicyEngine | Role enum exists; zero policy rules in ROLE_RULES dict |
-| PERFORMANCE role policy | NOT IMPLEMENTED | core/agent_role.RolePolicyEngine | Role enum exists; zero policy rules in ROLE_RULES dict |
-| DOCUMENTATION role policy | NOT IMPLEMENTED | core/agent_role.RolePolicyEngine | Role enum exists; zero policy rules in ROLE_RULES dict |
-| RELEASE role policy | NOT IMPLEMENTED | core/agent_role.RolePolicyEngine | Role enum exists; zero policy rules in ROLE_RULES dict |
+| PlaywrightBrowserAdapter / PlaywrightBrowserSession | MOCKED | `integrations/playwright_browser.py` | No Playwright runtime or headless browser imported; writes hardcoded 1x1 PNG header bytes (`b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"`) as fake screenshots; returns simulated navigation/click/fill strings (`"Navigated to ... successfully."`); claims READY status without a browser engine |
+| ContainerSandboxBackend | MOCKED | `integrations/container_sandbox_backend.py` | No Docker, Podman, or container runtime; maintains state in-memory dicts; `exec()` returns simulated string `"Simulated exec output for: {' '.join(argv)}"`; claims container isolation, egress security, and snapshot/rollback without container engine |
+| WholePlan step execution | MOCKED | `core/whole_plan_coordinator._NoOpStepExecutor` | Returns synthetic ImplementationResult (`"[NoOpStepExecutor] Simulated execution of step ..."` ); fallback step executor used when no real agent runtime is injected |
+| PendingApprovalStore (default) | PARTIAL | `core/control_plane.InMemoryPendingApprovalStore` | dict in-process; lost on restart; SQLitePendingApprovalStore exists but not injected by default |
+| Memory consolidation persistence | PARTIAL | `core/memory_consolidation.MemoryConsolidator` | `consolidate_session()` returns MemoryEntry objects; not written to SQLiteMemoryStore |
+| Memory search | PARTIAL | `persistence/sqlite_memory_store.SQLiteMemoryStore` | LIKE %query% substring match; no embeddings, no vector similarity |
+| DB_MIGRATION role policy | NOT IMPLEMENTED | `core/agent_role.RolePolicyEngine` | Role enum exists; zero policy rules in ROLE_RULES dict |
+| PERFORMANCE role policy | NOT IMPLEMENTED | `core/agent_role.RolePolicyEngine` | Role enum exists; zero policy rules in ROLE_RULES dict |
+| DOCUMENTATION role policy | NOT IMPLEMENTED | `core/agent_role.RolePolicyEngine` | Role enum exists; zero policy rules in ROLE_RULES dict |
+| RELEASE role policy | NOT IMPLEMENTED | `core/agent_role.RolePolicyEngine` | Role enum exists; zero policy rules in ROLE_RULES dict |
 
 Confirmed REAL (not mocked):
 
 | Capability | Evidence |
 |------------|---------|
+| LocalSandboxBackend | Real local process execution via `asyncio.create_subprocess_exec` in `integrations/local_sandbox_backend.py` |
+| VisualDiffValidator | Real PNG header and zlib IDAT chunk decompression with pixel-level comparison in `core/visual_diff.py` |
 | SQLiteTaskStore / PlanStore / CheckpointStore / MemoryStore / DecisionStore | Real SQLite reads/writes, tested in test suite |
 | TestRunnerRegistry (pytest/npm/go) | Real asyncio.create_subprocess_exec calls |
 | DecisionService + TTL expiry | Full lifecycle tested |

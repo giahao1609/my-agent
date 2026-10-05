@@ -126,6 +126,16 @@ BASELINE_VERIFIED: True
 7. No formal migration runner exists. Schema migrations are implicit at
    store initialization via CREATE TABLE IF NOT EXISTS and ALTER TABLE.
 
+8. PlaywrightBrowserAdapter / PlaywrightBrowserSession is MOCKED:
+   integrations/playwright_browser.py does not import Playwright or invoke a headless browser.
+   It generates synthetic 1-pixel PNG bytes as fake screenshots and returns canned strings
+   for navigation and element interaction.
+
+9. ContainerSandboxBackend is MOCKED:
+   integrations/container_sandbox_backend.py does not invoke Docker/Podman or container APIs.
+   It simulates command execution in-memory and returns hardcoded synthetic stdout.
+   (Note: integrations/local_sandbox_backend.py is confirmed REAL local process execution).
+
 ---
 
 ## BLOCKED_DEPENDENCIES
@@ -154,6 +164,12 @@ None - this phase had no implementation requirements.
    for existing rows in the memories table.
 
 6. Do NOT rename any existing SQLite column or table. Use additive migrations only.
+
+7. Do NOT assume PlaywrightBrowserAdapter or browser_navigate tool connects to a real
+   browser. It generates synthetic PNGs and simulated DOM action responses.
+
+8. Do NOT assume ContainerSandboxBackend runs commands inside isolated containers.
+   Commands are simulated in-process. Local command execution should use LocalSandboxBackend.
 
 ---
 
