@@ -193,6 +193,15 @@ class LocalSandboxBackend:
                     if self._enabled
                     else Availability.UNAVAILABLE
                 ),
+                reason=(
+                    None
+                    if self._enabled
+                    else "local sandbox backend is disabled (opt-in only)"
+                ),
+                implementation="LocalSandboxBackend",
+                provider_or_backend="local_subprocess",
+                verification_method="runtime_probe",
+                evidence="Real asyncio.create_subprocess_exec execution path",
             ),
         )
 

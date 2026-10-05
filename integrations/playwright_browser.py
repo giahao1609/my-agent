@@ -93,11 +93,36 @@ class PlaywrightBrowserAdapter(BrowserBackend):
         session_dir = self._artifacts_dir / session_id
         return PlaywrightBrowserSession(effective_policy, session_dir)
 
-    async def capabilities(self) -> Sequence[dict[str, Any]]:
+    async def capabilities(self) -> Sequence[CapabilityStatus]:
+        from core.status import Availability, CapabilityStatus
         return (
-            {"name": "playwright_browser_automation", "status": "READY"},
-            {"name": "fresh_browser_context", "status": "READY"},
-            {"name": "screenshot_trace_artifacts", "status": "READY"},
+            CapabilityStatus(
+                name="playwright_browser_automation",
+                state=Availability.MOCKED,
+                reason="No Playwright runtime; static PNG and synthetic DOM",
+                implementation="PlaywrightBrowserAdapter",
+                provider_or_backend="synthetic_browser",
+                verification_method="source_inspection",
+                evidence="No playwright dependency imported; navigate returns synthetic string",
+            ),
+            CapabilityStatus(
+                name="fresh_browser_context",
+                state=Availability.MOCKED,
+                reason="Simulated browser session directory only",
+                implementation="PlaywrightBrowserAdapter",
+                provider_or_backend="synthetic_browser",
+                verification_method="source_inspection",
+                evidence="Session directory created on disk without browser context",
+            ),
+            CapabilityStatus(
+                name="screenshot_trace_artifacts",
+                state=Availability.MOCKED,
+                reason="Synthesizes fake screenshots with static 20-byte PNG header",
+                implementation="PlaywrightBrowserAdapter",
+                provider_or_backend="synthetic_browser",
+                verification_method="source_inspection",
+                evidence="Writes hardcoded 1x1 PNG bytes to file",
+            ),
         )
 
 

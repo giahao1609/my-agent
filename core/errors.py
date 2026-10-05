@@ -18,6 +18,10 @@ class CapabilityUnavailableError(MyAgentError):
     code = 'capability_unavailable'
 
 
+class CapabilityMockedError(CapabilityUnavailableError):
+    code = 'capability_mocked'
+
+
 class NotReadyError(MyAgentError):
     code = 'not_ready'
 

@@ -139,9 +139,33 @@ class ContainerSandboxBackend(SandboxBackend):
 
     async def capabilities(self) -> Sequence[CapabilityStatus]:
         return (
-            CapabilityStatus(name="container_isolation", state=Availability.READY),
-            CapabilityStatus(name="default_deny_egress", state=Availability.READY),
-            CapabilityStatus(name="snapshot_rollback", state=Availability.READY),
+            CapabilityStatus(
+                name="container_isolation",
+                state=Availability.MOCKED,
+                reason="Container execution is simulated in-memory; no Docker/Podman engine attached",
+                implementation="ContainerSandboxBackend",
+                provider_or_backend="in_memory_simulation",
+                verification_method="source_inspection",
+                evidence="ContainerSandboxBackend simulates execution without container daemon",
+            ),
+            CapabilityStatus(
+                name="default_deny_egress",
+                state=Availability.MOCKED,
+                reason="Egress network policy is in-memory metadata without kernel namespace isolation",
+                implementation="ContainerSandboxBackend",
+                provider_or_backend="in_memory_simulation",
+                verification_method="source_inspection",
+                evidence="Spec network_egress stored in dictionary without network namespace rules",
+            ),
+            CapabilityStatus(
+                name="snapshot_rollback",
+                state=Availability.MOCKED,
+                reason="Filesystem snapshot/rollback operates on in-memory state dict rather than filesystem layer",
+                implementation="ContainerSandboxBackend",
+                provider_or_backend="in_memory_simulation",
+                verification_method="source_inspection",
+                evidence="ContainerSnapshot stores state_data in memory",
+            ),
         )
 
     def _require_sandbox(self, sandbox_id: str) -> dict[str, Any]:

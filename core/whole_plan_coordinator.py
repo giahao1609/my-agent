@@ -141,6 +141,33 @@ class WholePlanCoordinator:
         self.max_step_retries = max_step_retries
         self.max_auto_repair_attempts = max_auto_repair_attempts
 
+    def capabilities(self) -> Sequence[CapabilityStatus]:
+        """Report truthful capability status for autonomous plan execution."""
+        from core.status import Availability, CapabilityStatus
+        if isinstance(self._step_executor, _NoOpStepExecutor):
+            return (
+                CapabilityStatus(
+                    name="whole_plan_autonomous_execution",
+                    state=Availability.MOCKED,
+                    reason="Step executor is _NoOpStepExecutor; produces synthetic results without agent execution",
+                    implementation="_NoOpStepExecutor",
+                    provider_or_backend="in_memory_mock",
+                    verification_method="executor_type_check",
+                    evidence="Fallback _NoOpStepExecutor active in WholePlanCoordinator",
+                ),
+            )
+        return (
+            CapabilityStatus(
+                name="whole_plan_autonomous_execution",
+                state=Availability.AVAILABLE,
+                reason=None,
+                implementation=type(self._step_executor).__name__,
+                provider_or_backend="concrete_step_executor",
+                verification_method="injected_step_executor",
+                evidence=f"Active step executor: {type(self._step_executor).__name__}",
+            ),
+        )
+
     def _build_repair_hint(self, review: Any) -> str:
         """Construct an actionable, diagnostic repair hint from a gate review result using ErrorReflexionEngine."""
         hints: list[str] = []
