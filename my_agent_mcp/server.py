@@ -274,6 +274,17 @@ async def my_agent_status() -> dict[str, object]:
         for session_id, failure in _coder_task_failures.items()
     }
 
+    from core.capabilities import default_capability_registry
+    caps = default_capability_registry.list()
+    capabilities_summary = {
+        "total": len(caps),
+        "available": sum(1 for c in caps if c.available),
+        "mocked": sum(1 for c in caps if c.is_mocked),
+        "degraded": sum(1 for c in caps if c.is_degraded),
+        "unavailable": sum(1 for c in caps if c.is_unavailable),
+        "unknown": sum(1 for c in caps if c.is_unknown),
+    }
+
     return {
         "status": "ready",
         "database": str(DB_PATH),
@@ -282,7 +293,19 @@ async def my_agent_status() -> dict[str, object]:
         "active_coder_workers": active_coder_workers,
         "coder_worker_failures": coder_worker_failures,
         "coder_task_failures": coder_task_failures,
+        "capabilities_summary": capabilities_summary,
     }
+
+
+@mcp.tool()
+async def list_capabilities(filter_status: str | None = None) -> list[dict[str, object]]:
+    """List registered capabilities with truthful status, implementation, and evidence."""
+    from core.capabilities import default_capability_registry
+    caps = default_capability_registry.list()
+    if filter_status:
+        target = filter_status.strip().lower()
+        caps = [c for c in caps if c.state.value == target or (target == "available" and c.available)]
+    return [c.to_dict() for c in caps]
 
 
 @mcp.tool()
