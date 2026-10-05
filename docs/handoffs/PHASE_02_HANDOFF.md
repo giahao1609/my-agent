@@ -11,8 +11,10 @@ Merge pull request #2 from giahao1609/feat/houhou-01-capability-truth
 
 ## FINAL_COMMIT
 
-`58b2c89630abd29daa6f064d0a21be6b22e55c23`
-feat(execution): enforce truthful whole-plan execution
+- Initial Phase 02 commit: `70920b7c93d89df904f73efcc20154ec46206281`
+  `feat(execution): enforce truthful whole-plan execution`
+- Merge gate verification patch:
+  `fix(execution): require positive real-execution evidence`
 
 ---
 
@@ -167,13 +169,14 @@ Evidence contains:
 
 ## COMPLETION_GATE
 
-Enforced in `VerificationGateCoordinator.evaluate(...)`:
-1. `is_mocked is True` -> `ReviewStatus.REJECTED` ("Step '{step_id}' REJECTED: implementation result is simulated/mocked. Real execution required.").
-2. `[noopstepexecutor]` in summary -> `ReviewStatus.REJECTED`.
-3. `implementation_result.success is False` -> `ReviewStatus.REJECTED`.
-4. `test_result.failed_tests > 0` -> `ReviewStatus.NEEDS_REWORK`.
-5. `security_result.critical_count > 0` -> `ReviewStatus.REJECTED`.
-6. Only when all gates pass does the gate return `ReviewStatus.APPROVED`.
+Enforced in `VerificationGateCoordinator.evaluate(...)` and `WholePlanCoordinator._run_gates_for_step(...)`:
+1. **Positive Real Evidence Required:** In production WholePlan execution (`require_real_execution=True`), `execution_evidence` must exist, must be a non-empty mapping, and `execution_evidence["is_real"]` must strictly be `True`. Missing execution evidence fails closed.
+2. **Executor Provenance Required:** `execution_evidence` must include non-empty executor provenance (`executor_identity` or `evidence_source`).
+3. **Explicit Non-Real Evidence Rejected:** Any result declaring `is_real=False` is strictly rejected (`ReviewStatus.REJECTED`).
+4. **Mocked/Simulated Results Rejected:** `is_mocked is True` or `[noopstepexecutor]` in summary -> `ReviewStatus.REJECTED` ("Step '{step_id}' REJECTED: implementation result is simulated/mocked. Real execution required.").
+5. **Implementation Success Required:** `implementation_result.success is True`.
+6. **Verification Gates Passed:** `test_result.failed_tests == 0` (`ReviewStatus.NEEDS_REWORK` on failure) and `security_result.critical_count == 0` (`ReviewStatus.REJECTED` on critical finding).
+7. Only when all gates pass does the gate return `ReviewStatus.APPROVED`.
 
 ---
 
@@ -220,17 +223,22 @@ In `tests/test_whole_plan_execution_integrity.py`:
 4. `test_executor_failure_propagates_truthfully`: Proves model crash propagates and prevents step completion.
 5. `test_verification_failure_prevents_completion`: Proves test verification failure prevents step completion even if implementation succeeded.
 6. `test_mocked_result_rejected_by_verification_gate`: Proves gate strictly rejects results with `is_mocked=True` or `[NoOpStepExecutor]`.
-7. `test_mcp_run_whole_plan_truth`: Proves MCP tool `run_whole_plan` returns truthful non-completion when plan does not exist or steps are not executed.
-8. `test_agent_run_ledger_contains_execution_evidence`: Proves real execution populates `AgentRunRecord` with structured evidence, modified files, and session IDs.
-9. `test_plan_state_transitions_preserved`: Proves `Plan` and `PlanStep` state machines are preserved across whole plan lifecycle.
-10. `test_capability_status_reflection`: Proves coordinator capability status transitions between `MOCKED` and `AVAILABLE` based on real executor presence.
-11. `test_governance_approval_preserved_in_real_execution`: Proves dangerous command requiring approval pauses execution and does not auto-approve or complete.
+7. `test_empty_evidence_cannot_pass_whole_plan_completion_gate`: Proves `success=True` and `is_mocked=False` with empty evidence CANNOT pass WholePlan completion gate.
+8. `test_is_real_false_cannot_pass_completion_gate`: Proves `success=True` and `is_mocked=False` with `is_real=False` CANNOT pass completion gate.
+9. `test_positive_evidence_with_provenance_passes_completion_gate`: Proves `success=True` with positive `is_real=True` and executor provenance passes completion gate.
+10. `test_whole_plan_refuses_step_with_empty_or_false_evidence`: Proves `WholePlanCoordinator` enforces positive real evidence at runtime and rejects empty or false evidence.
+11. `test_mcp_run_whole_plan_truth`: Proves MCP tool `run_whole_plan` returns truthful non-completion when plan does not exist or steps are not executed.
+12. `test_agent_run_ledger_contains_execution_evidence`: Proves real execution populates `AgentRunRecord` with structured evidence, modified files, and session IDs.
+13. `test_plan_state_transitions_preserved`: Proves `Plan` and `PlanStep` state machines are preserved across whole plan lifecycle.
+14. `test_capability_status_reflection`: Proves coordinator capability status transitions between `MOCKED` and `AVAILABLE` based on real executor presence.
+15. `test_governance_approval_preserved_in_real_execution`: Proves dangerous command requiring approval pauses execution and does not auto-approve or complete.
 
 ---
 
 ## TESTS_RUN
 
-- Targeted: `tests/test_whole_plan_execution_integrity.py` (11 tests).
+- Targeted: `tests/test_whole_plan_execution_integrity.py` (15 tests).
+- Targeted: `tests/test_verification_gate_coordinator.py` (6 tests).
 - Targeted: `tests/test_whole_plan_coordinator.py` (7 tests).
 - Targeted: `tests/test_mcp_verification_tools.py` (13 tests).
 - Full Test Suite: `python -m pytest tests/ --tb=no -q`.
@@ -240,7 +248,7 @@ In `tests/test_whole_plan_execution_integrity.py`:
 ## TEST_RESULTS
 
 - Pre-Phase Baseline: 706 passed.
-- Post-Phase Suite: **717 passed in 15.43s** (0 failures, 0 errors).
+- Post-Phase Suite: **721 passed in 12.27s** (0 failures, 0 errors).
 - All 706 previous tests pass with zero regressions.
 
 ---
@@ -252,6 +260,8 @@ In `tests/test_whole_plan_execution_integrity.py`:
 - [x] Executor failure cannot create false completion.
 - [x] Verification failure cannot create false completion.
 - [x] Mock/simulated results cannot satisfy the production completion gate.
+- [x] Missing or empty execution evidence strictly fails closed.
+- [x] Positive real evidence (`is_real: True` with valid provenance) is required for WholePlan step completion.
 - [x] WholePlan production wiring uses a real executor or truthfully refuses execution when no worker is available.
 - [x] Existing real coder/runtime infrastructure (`CoderAgentStack`, `Orchestrator`, `CoderRuntimeWorker`) is reused instead of duplicated.
 - [x] Execution produces inspectable, durable evidence in `AgentRunRecord` and `ImplementationResult`.
@@ -276,8 +286,10 @@ None for Phase 02.
 
 ## FOLLOW_UP_ISSUES
 
-- Phase 03 will introduce context injection and prompt composition into the execution loop.
-- Phase 04+ will connect cognitive reasoning, reflexion repair diagnosis, and memory capture into step completion post-hooks.
+- Phase 03 will implement the Unified Memory Model according to the frozen roadmap.
+- Phase 04 will establish the Durable Memory Pipeline.
+- Phase 05 will implement the User Model.
+- Phase 06 will implement Context Assembly & Injection.
 
 ---
 
@@ -291,7 +303,11 @@ None for Phase 02.
 
 ## NEXT_PHASE_EXPECTATIONS
 
-Phase 03 (Context Assembly & Injection):
-- Will consume the truthful execution pipeline established in Phase 02.
-- Will assemble verified context from Code Graph, memory, and task specifications before passing prompts to the execution layer.
-- Must preserve the execution integrity invariants established in this phase.
+Phase 03 — Unified Memory Model:
+- Establish the canonical unified memory contract and model.
+- Strictly adhere to the frozen cognitive architecture roadmap:
+  * Phase 03 — Unified Memory Model
+  * Phase 04 — Durable Memory Pipeline
+  * Phase 05 — User Model
+  * Phase 06 — Context Assembly & Injection
+- Phase 03 must NOT implement ContextBuilder, proactive daemon, vector DB, or user modeling.

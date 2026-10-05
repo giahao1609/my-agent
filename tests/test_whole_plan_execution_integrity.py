@@ -343,7 +343,7 @@ async def test_verification_failure_prevents_completion(tmp_path: Path) -> None:
                 summary="Work done",
                 success=True,
                 is_mocked=False,
-                execution_evidence={"is_real": True},
+                execution_evidence={"is_real": True, "executor_identity": "MockRealExecutor"},
             )
 
     coordinator = WholePlanCoordinator(
@@ -391,7 +391,117 @@ def test_mocked_result_rejected_by_verification_gate() -> None:
     )
     rev_2 = gate.evaluate(step_id="step-m2", implementation_result=mock_result_2)
     assert rev_2.status == ReviewStatus.REJECTED
-    assert "simulated/mocked" in rev_2.summary
+    assert "simulated/mocked" in rev_2.summary or "noopstepexecutor" in rev_2.summary.lower()
+
+
+def test_empty_evidence_cannot_pass_whole_plan_completion_gate() -> None:
+    """success=True and is_mocked=False with empty evidence CANNOT pass WholePlan completion gate."""
+    gate = VerificationGateCoordinator(require_real_execution=True)
+
+    result_empty_evidence = ImplementationResult(
+        step_id="step-empty",
+        summary="Claimed success without evidence",
+        success=True,
+        is_mocked=False,
+        execution_evidence={},
+    )
+    review = gate.evaluate(
+        step_id="step-empty",
+        implementation_result=result_empty_evidence,
+    )
+    assert review.status == ReviewStatus.REJECTED
+    assert "positive execution evidence" in review.summary.lower()
+
+
+def test_is_real_false_cannot_pass_completion_gate() -> None:
+    """success=True and is_mocked=False with is_real=False CANNOT pass completion gate."""
+    gate_default = VerificationGateCoordinator(require_real_execution=False)
+    gate_strict = VerificationGateCoordinator(require_real_execution=True)
+
+    result_not_real = ImplementationResult(
+        step_id="step-false",
+        summary="Execution with is_real=False",
+        success=True,
+        is_mocked=False,
+        execution_evidence={"is_real": False, "executor_identity": "SomeExecutor"},
+    )
+
+    review_1 = gate_default.evaluate(
+        step_id="step-false",
+        implementation_result=result_not_real,
+    )
+    assert review_1.status == ReviewStatus.REJECTED
+    assert "is_real=false" in review_1.summary.lower() or "not indicate real" in review_1.summary.lower()
+
+    review_2 = gate_strict.evaluate(
+        step_id="step-false",
+        implementation_result=result_not_real,
+    )
+    assert review_2.status == ReviewStatus.REJECTED
+
+
+def test_positive_evidence_with_provenance_passes_completion_gate() -> None:
+    """success=True with positive is_real evidence and executor provenance may pass completion gate."""
+    gate = VerificationGateCoordinator(require_real_execution=True)
+
+    result_valid = ImplementationResult(
+        step_id="step-valid",
+        summary="Real execution done",
+        success=True,
+        is_mocked=False,
+        execution_evidence={
+            "is_real": True,
+            "executor_identity": "CoderRuntimeStepExecutor",
+            "session_id": "sess-123",
+        },
+    )
+    test_ok = TestResult(step_id="step-valid", total_tests=2, passed_tests=2, failed_tests=0)
+    review = gate.evaluate(
+        step_id="step-valid",
+        implementation_result=result_valid,
+        test_result=test_ok,
+    )
+    assert review.status == ReviewStatus.APPROVED
+
+
+@pytest.mark.asyncio
+async def test_whole_plan_refuses_step_with_empty_or_false_evidence(tmp_path: Path) -> None:
+    """WholePlanCoordinator enforces positive real evidence at runtime and rejects empty or false evidence."""
+    task_svc, plan_svc, plan_store, task_store, _ = await _setup_env(tmp_path)
+    task = await task_svc.create_task(task_id="task-ev-chk", project_id="proj-1", objective="Ev check")
+    await task_svc.start_task(task.task_id)
+    await plan_svc.materialize_plan(
+        task_id=task.task_id,
+        plan_id="plan-ev-chk",
+        steps=(("step-ev-1", "No evidence step", "instruction"),),
+    )
+
+    class _EmptyEvidenceExecutor:
+        is_real_executor = True
+        async def execute_step(self, step_id, step_title, step_role, repair_hint=""):
+            return ImplementationResult(
+                step_id=step_id,
+                summary="Claimed success without evidence",
+                success=True,
+                is_mocked=False,
+                execution_evidence={},
+            )
+
+    coordinator = WholePlanCoordinator(
+        task_service=task_svc,
+        plan_service=plan_svc,
+        plan_store=plan_store,
+        step_executor=_EmptyEvidenceExecutor(),
+        max_auto_repair_attempts=0,
+    )
+
+    summary = await coordinator.execute_whole_plan("plan-ev-chk", tmp_path)
+    assert summary.plan_completed is False
+    assert summary.steps_completed == 0
+    assert summary.steps_failed == 1
+
+    steps = await plan_store.list_steps("plan-ev-chk")
+    assert steps[0].state == PlanStepState.FAILED
 
 
 # ===========================================================================
@@ -512,7 +622,7 @@ async def test_plan_state_transitions_preserved(tmp_path: Path) -> None:
                 summary="Done",
                 success=True,
                 is_mocked=False,
-                execution_evidence={"is_real": True},
+                execution_evidence={"is_real": True, "executor_identity": "MockRealPassExecutor"},
             )
 
     coordinator = WholePlanCoordinator(

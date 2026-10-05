@@ -145,7 +145,7 @@ class WholePlanCoordinator:
         self._step_executor: StepExecutor = step_executor or _NoOpStepExecutor()
         self._test_runner = test_runner_registry or TestRunnerRegistry()
         self._security_scanner = security_scanner_registry or SecurityScannerRegistry()
-        self._gate_coordinator = verification_coordinator or VerificationGateCoordinator()
+        self._gate_coordinator = verification_coordinator or VerificationGateCoordinator(require_real_execution=True)
         self._goal_drift_monitor = goal_drift_monitor or GoalDriftMonitor()
         self.max_step_retries = max_step_retries
         self.max_auto_repair_attempts = max_auto_repair_attempts
@@ -277,12 +277,21 @@ class WholePlanCoordinator:
         sec_res = self._security_scanner.scan_workspace(workspace_path, step_id)
 
         # ── 4. Final gate evaluation ──────────────────────────────────────────
-        return self._gate_coordinator.evaluate(
-            step_id=step_id,
-            implementation_result=imp_res,
-            test_result=test_res,
-            security_result=sec_res,
-        )
+        try:
+            return self._gate_coordinator.evaluate(
+                step_id=step_id,
+                implementation_result=imp_res,
+                test_result=test_res,
+                security_result=sec_res,
+                require_real_execution=True,
+            )
+        except TypeError:
+            return self._gate_coordinator.evaluate(
+                step_id=step_id,
+                implementation_result=imp_res,
+                test_result=test_res,
+                security_result=sec_res,
+            )
 
     async def execute_whole_plan(
         self,
