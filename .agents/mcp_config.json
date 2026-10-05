@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "my-agent": {
+      "command": "/Users/haohg/Project/my-agent/.venv/bin/python",
+      "args": [
+        "-m",
+        "my_agent_mcp.server"
+      ],
+      "cwd": "/Users/haohg/Project/my-agent"
+    }
+  }
+}

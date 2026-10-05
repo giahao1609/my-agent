@@ -1,0 +1,13 @@
+[mcp_servers.my-agent]
+command = "/Users/haohg/Project/my-agent/.venv/bin/python"
+args = ["-m", "my_agent_mcp.server"]
+cwd = "/Users/haohg/Project/my-agent"
+enabled = true
+required = true
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+default_tools_approval_mode = "writes"
+
+[mcp_servers.my-agent.env]
+CODER_RUNTIME_MODE = "external"
+PYTHONUNBUFFERED = "1"

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "persistence*", "my_agent_mcp*", "agents*", "memory*", "sandbox*", "tools*", "evaluation*", "integrations*", "mcp*", "skills*"]
+exclude = ["tests*", "data*", "docs*"]
+
+[project]
+name = "my-agent"
+version = "0.1.0"
+description = "Full-stack AI coding agent with orchestration, memory, tools, sandbox, multi-agent workflows, MCP, evaluation, and self-improvement"
+readme = "README.md"
+requires-python = ">=3.13"
+
+dependencies = [
+    "mcp[cli]>=2,<3",
+    "tree-sitter-language-pack>=1.13,<2",
+    "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "ruff",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["agents", "core", "integrations", "my_agent_mcp", "persistence", "tools"]
+omit = ["*/__pycache__/*", "*/test_*", ".venv/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
