@@ -6,10 +6,20 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Sequence
 
-from .context import ExecutionContext
+from core.context import ExecutionContext
+from core.memory import (
+    MemoryRecord,
+    legacy_entry_to_memory_record,
+    memory_record_to_legacy_entry,
+)
 
 
 class MemoryLevel(StrEnum):
+    """[DEPRECATED / LEGACY COMPATIBILITY ONLY]
+    
+    Historic memory level enum that combined retention tier with semantic type.
+    Future code MUST use core.memory.MemoryType and core.memory.MemoryTier (or MemoryLevel).
+    """
     L0_EPISODIC = "L0_episodic"      # Short-term session chat memory
     L1_WORKING = "L1_working"        # Task/plan-scoped active context
     L2_SEMANTIC = "L2_semantic"      # Project rules, conventions, and architectural patterns
@@ -22,6 +32,11 @@ def utc_now_iso() -> str:
 
 @dataclass(slots=True)
 class MemoryEntry:
+    """[DEPRECATED / LEGACY COMPATIBILITY ONLY]
+    
+    Legacy in-memory entry structure used by earlier consolidation experiments.
+    Future code MUST consume core.memory.MemoryRecord instead.
+    """
     memory_id: str
     level: MemoryLevel
     key: str
@@ -34,6 +49,15 @@ class MemoryEntry:
     def touch(self) -> None:
         self.recall_count += 1
         self.updated_at = utc_now_iso()
+
+    def to_canonical(self, project_id: str | None = None) -> MemoryRecord:
+        """Convert this legacy entry into a canonical MemoryRecord."""
+        return legacy_entry_to_memory_record(self, project_id=project_id)
+
+    @classmethod
+    def from_canonical(cls, record: MemoryRecord) -> MemoryEntry:
+        """Convert a canonical MemoryRecord into this legacy entry structure."""
+        return memory_record_to_legacy_entry(record)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -62,14 +86,18 @@ class MemoryEntry:
 
 
 class MemoryConsolidator:
-    """Manages multi-tier memory consolidation (L0 -> L1 -> L2 -> L3)."""
+    """Manages multi-tier memory consolidation (L0 -> L1 -> L2 -> L3).
+    
+    NOTE: Operates purely in-memory. Does NOT automatically persist records.
+    Durable persistence pipeline wiring is deferred to Phase 04.
+    """
 
     def consolidate_session(
         self,
         context: ExecutionContext,
         session_messages: Sequence[dict[str, str]],
     ) -> list[MemoryEntry]:
-        """Summarizes short-term L0 session messages into L1 working memories."""
+        """Summarizes short-term L0 session messages into L1 working memories (legacy format)."""
         consolidated: list[MemoryEntry] = []
         user_requests = [m["content"] for m in session_messages if m.get("role") == "user"]
 
@@ -85,6 +113,18 @@ class MemoryConsolidator:
             consolidated.append(mem)
 
         return consolidated
+
+    def consolidate_session_records(
+        self,
+        context: ExecutionContext,
+        session_messages: Sequence[dict[str, str]],
+    ) -> list[MemoryRecord]:
+        """Summarizes short-term L0 session messages into canonical MemoryRecord objects.
+        
+        Pure in-memory operation. Does NOT write to persistence.
+        """
+        entries = self.consolidate_session(context, session_messages)
+        return [entry.to_canonical(project_id=context.project_id) for entry in entries]
 
     def promote_memories(
         self,
@@ -110,3 +150,4 @@ class MemoryConsolidator:
                     promoted.append(mem)
 
         return promoted
+
