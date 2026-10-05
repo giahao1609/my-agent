@@ -239,8 +239,10 @@ async def test_no_op_executor_returns_success(tmp_path: Path) -> None:
         repair_hint="fix something",
     )
     assert result.success is True
+    assert result.is_mocked is True
     assert "NoOpStepExecutor" in result.summary
     assert "repair" in result.summary
+    assert result.execution_evidence.get("is_real") is False
 
 
 def test_build_repair_hint_with_reflexion() -> None:

@@ -59,8 +59,26 @@ class VerificationGateCoordinator:
             and security_result is None
         )
 
+        # Guard against synthetic/mocked execution results:
+        # A mocked/simulated result must NEVER satisfy the production completion gate.
+        is_mocked = False
+        if implementation_result is not None:
+            if getattr(implementation_result, "is_mocked", False):
+                is_mocked = True
+            elif "[noopstepexecutor]" in getattr(implementation_result, "summary", "").lower():
+                is_mocked = True
+
+        if is_mocked:
+            comments.append("Implementation was simulated or mocked without real execution.")
+            required_repairs.append(
+                f"Step '{step_id}' was simulated/mocked. Real execution through an authorized runtime is required."
+            )
+
         # Determine overall status
-        if no_evidence:
+        if is_mocked:
+            status = ReviewStatus.REJECTED
+            summary = f"Step '{step_id}' REJECTED: implementation result is simulated/mocked. Real execution required."
+        elif no_evidence:
             status = ReviewStatus.REQUEST_REWORK
             summary = (
                 f"Step '{step_id}' cannot be approved: no implementation, test, or "

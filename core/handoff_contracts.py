@@ -83,6 +83,8 @@ class ImplementationResult:
     created_files: tuple[str, ...] = field(default_factory=tuple)
     deleted_files: tuple[str, ...] = field(default_factory=tuple)
     success: bool = True
+    is_mocked: bool = False
+    execution_evidence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -92,6 +94,8 @@ class ImplementationResult:
             'created_files': list(self.created_files),
             'deleted_files': list(self.deleted_files),
             'success': self.success,
+            'is_mocked': self.is_mocked,
+            'execution_evidence': dict(self.execution_evidence),
         }
 
     @classmethod
@@ -103,6 +107,8 @@ class ImplementationResult:
             created_files=tuple(data.get('created_files', ())),
             deleted_files=tuple(data.get('deleted_files', ())),
             success=data.get('success', True),
+            is_mocked=data.get('is_mocked', False),
+            execution_evidence=dict(data.get('execution_evidence', {})),
         )
 
 
