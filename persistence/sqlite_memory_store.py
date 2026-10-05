@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Sequence
 
 from core.memory import (
     MemoryLevel,
@@ -48,6 +49,20 @@ class SQLiteMemoryStore:
                 )
                 """
             )
+            # Phase 04: additive columns — safe for pre-existing databases.
+            for col_def in (
+                "status TEXT NOT NULL DEFAULT 'active'",
+                "logical_key TEXT",
+            ):
+                col_name = col_def.split()[0]
+                try:
+                    connection.execute(
+                        f"ALTER TABLE memories ADD COLUMN {col_def}"
+                    )
+                except sqlite3.OperationalError:
+                    # Column already exists — idempotent.
+                    pass
+                _ = col_name  # suppress unused-variable warning
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_memories_project
@@ -58,6 +73,18 @@ class SQLiteMemoryStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_memories_lookup
                 ON memories(project_id, kind, importance)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memories_status
+                ON memories(project_id, status, importance)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memories_logical_key
+                ON memories(project_id, logical_key)
                 """
             )
 
@@ -110,8 +137,10 @@ class SQLiteMemoryStore:
                     content,
                     importance,
                     metadata_json,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at,
+                    status,
+                    logical_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -126,6 +155,8 @@ class SQLiteMemoryStore:
                             ensure_ascii=False,
                         ),
                         record.created_at.isoformat(),
+                        record.status.value,
+                        record.metadata.get("logical_key"),
                     )
                     for record in records
                 ],
@@ -181,6 +212,205 @@ class SQLiteMemoryStore:
 
         return tuple(self._row_to_memory(row) for row in rows)
 
+    # ------------------------------------------------------------------
+    # Phase 04: Durable Memory Pipeline — new retrieval & lifecycle API
+    # ------------------------------------------------------------------
+
+    async def retrieve(
+        self,
+        project_id: str,
+        query: str,
+        *,
+        limit: int = 10,
+        status_filter: MemoryStatus | None = MemoryStatus.ACTIVE,
+        tier_filter: MemoryLevel | None = None,
+        memory_type_filter: MemoryType | None = None,
+        min_importance: float = 0.0,
+    ) -> tuple[MemoryRecord, ...]:
+        """Filtered + scored retrieval from the durable store.
+
+        Results are ordered by a lightweight relevance score:
+            score = (term_match_bonus) + importance * 0.4 + confidence * 0.1
+
+        No vector or embedding model is required.
+        """
+        return await asyncio.to_thread(
+            self._retrieve_sync,
+            project_id,
+            query,
+            limit,
+            status_filter,
+            tier_filter,
+            memory_type_filter,
+            min_importance,
+        )
+
+    def _retrieve_sync(
+        self,
+        project_id: str,
+        query: str,
+        limit: int,
+        status_filter: MemoryStatus | None,
+        tier_filter: MemoryLevel | None,
+        memory_type_filter: MemoryType | None,
+        min_importance: float,
+    ) -> tuple[MemoryRecord, ...]:
+        if limit < 0:
+            raise ValueError("retrieve limit must be >= 0")
+        if limit == 0:
+            return ()
+
+        conditions: list[str] = ["project_id = ?"]
+        params: list[object] = [project_id]
+
+        if status_filter is not None:
+            conditions.append("status = ?")
+            params.append(status_filter.value)
+
+        if tier_filter is not None:
+            conditions.append("level = ?")
+            params.append(tier_filter.value)
+
+        if min_importance > 0.0:
+            conditions.append("importance >= ?")
+            params.append(min_importance)
+
+        where_clause = " AND ".join(conditions)
+
+        # Fetch a slightly larger candidate set for re-ranking.
+        fetch_limit = min(limit * 4, 200)
+        params.append(fetch_limit)
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM memories
+                WHERE {where_clause}
+                ORDER BY importance DESC, created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+
+        records = [self._row_to_memory(row) for row in rows]
+
+        # Post-filter by memory_type (stored in __canonical__, not in a dedicated column).
+        if memory_type_filter is not None:
+            records = [r for r in records if r.memory_type == memory_type_filter]
+
+        # Score and rank.
+        query_lower = query.strip().lower()
+        query_terms = set(query_lower.split()) if query_lower else set()
+
+        def _score(rec: MemoryRecord) -> float:
+            content_lower = rec.content.lower()
+            # Full-phrase bonus.
+            phrase_bonus = 0.5 if query_lower and query_lower in content_lower else 0.0
+            # Per-term bonus (IDF-lite: uniform 0.1 per distinct term matched).
+            term_bonus = (
+                sum(0.1 for t in query_terms if t in content_lower)
+                if query_terms
+                else 0.0
+            )
+            return phrase_bonus + term_bonus + rec.importance * 0.4 + rec.confidence * 0.1
+
+        scored = sorted(records, key=_score, reverse=True)
+        return tuple(scored[:limit])
+
+    async def supersede(
+        self,
+        old_memory_id: str,
+        new_record: MemoryRecord,
+    ) -> None:
+        """Atomic superseding transition: marks old record SUPERSEDED and inserts new one.
+
+        Both operations occur within a single SQLite transaction.
+        The new_record.supersedes field MUST reference old_memory_id.
+        """
+        await asyncio.to_thread(self._supersede_sync, old_memory_id, new_record)
+
+    def _supersede_sync(
+        self,
+        old_memory_id: str,
+        new_record: MemoryRecord,
+    ) -> None:
+        if new_record.supersedes != old_memory_id:
+            raise ValueError(
+                f"new_record.supersedes must equal old_memory_id '{old_memory_id}', "
+                f"got '{new_record.supersedes}'"
+            )
+        updated_at = datetime.now(UTC).isoformat()
+
+        with self._connect() as connection:
+            # Step 1: mark old record SUPERSEDED.
+            connection.execute(
+                """
+                UPDATE memories
+                SET status = ?, metadata_json = json_patch(
+                    metadata_json,
+                    json_object('__status_updated_at', ?)
+                )
+                WHERE memory_id = ?
+                """,
+                (MemoryStatus.SUPERSEDED.value, updated_at, old_memory_id),
+            )
+            # Step 2: insert new record.
+            connection.execute(
+                """
+                INSERT INTO memories (
+                    memory_id, project_id, level, kind, content,
+                    importance, metadata_json, created_at, status, logical_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_record.memory_id,
+                    new_record.project_id if new_record.project_id is not None else "",
+                    new_record.level.value,
+                    new_record.kind,
+                    new_record.content,
+                    new_record.importance,
+                    json.dumps(
+                        self._serialize_metadata(new_record),
+                        ensure_ascii=False,
+                    ),
+                    new_record.created_at.isoformat(),
+                    new_record.status.value,
+                    new_record.metadata.get("logical_key"),
+                ),
+            )
+
+    async def get_by_logical_key(
+        self,
+        project_id: str,
+        logical_key: str,
+        *,
+        status_filter: MemoryStatus = MemoryStatus.ACTIVE,
+    ) -> tuple[MemoryRecord, ...]:
+        """Fetch records matching a logical_key, optionally filtered by status."""
+        return await asyncio.to_thread(
+            self._get_by_logical_key_sync, project_id, logical_key, status_filter
+        )
+
+    def _get_by_logical_key_sync(
+        self,
+        project_id: str,
+        logical_key: str,
+        status_filter: MemoryStatus,
+    ) -> tuple[MemoryRecord, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memories
+                WHERE project_id = ?
+                  AND logical_key = ?
+                  AND status = ?
+                ORDER BY created_at DESC, rowid DESC
+                """,
+                (project_id, logical_key, status_filter.value),
+            ).fetchall()
+        return tuple(self._row_to_memory(row) for row in rows)
+
     @staticmethod
     def _row_to_memory(row: sqlite3.Row) -> MemoryRecord:
         raw_meta = json.loads(str(row["metadata_json"]))
@@ -226,4 +456,34 @@ class SQLiteMemoryStore:
             metadata=raw_meta if isinstance(raw_meta, dict) else {},
             created_at=datetime.fromisoformat(str(row["created_at"])),
         )
+
+    async def _archive_record(
+        self,
+        project_id: str,
+        memory_id: str,
+        updated_at: str,
+    ) -> None:
+        """Mark a memory record as ARCHIVED (internal; called by DurableMemoryService)."""
+        await asyncio.to_thread(
+            self._archive_record_sync, project_id, memory_id, updated_at
+        )
+
+    def _archive_record_sync(
+        self,
+        project_id: str,
+        memory_id: str,
+        updated_at: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE memories
+                SET status = ?, metadata_json = json_patch(
+                    metadata_json,
+                    json_object('__status_updated_at', ?)
+                )
+                WHERE memory_id = ? AND project_id = ?
+                """,
+                (MemoryStatus.ARCHIVED.value, updated_at, memory_id, project_id),
+            )
 
