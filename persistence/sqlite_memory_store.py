@@ -69,6 +69,10 @@ class SQLiteMemoryStore:
 
     @staticmethod
     def _serialize_metadata(record: MemoryRecord) -> dict[str, object]:
+        if "__canonical__" in record.metadata:
+            raise ValueError(
+                "metadata key '__canonical__' is reserved for internal store persistence"
+            )
         meta = dict(record.metadata)
         meta["__canonical__"] = {
             "memory_type": record.memory_type.value,

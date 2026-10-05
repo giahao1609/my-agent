@@ -391,6 +391,7 @@ def test_10_consolidator_output_contract() -> None:
     """TEST 10 — CONSOLIDATOR OUTPUT CONTRACT:
     
     MemoryConsolidator provides consolidate_session_records returning canonical MemoryRecord objects.
+    Uses conservative SEMANTIC fallback with explicit provenance metadata.
     """
     consolidator = MemoryConsolidator()
     context = ExecutionContext(
@@ -411,7 +412,9 @@ def test_10_consolidator_output_contract() -> None:
     assert isinstance(rec, MemoryRecord)
     assert rec.project_id == "proj-99"
     assert rec.tier == MemoryLevel.L1
-    assert rec.memory_type == MemoryType.PROJECT
+    assert rec.memory_type == MemoryType.SEMANTIC
+    assert rec.metadata.get("legacy_level") == "l1_working"
+    assert rec.metadata.get("legacy_compatibility_fallback") is True
     assert "Implement unified memory domain model" in rec.content
     assert rec.source == "session:sess-99"
 
@@ -447,7 +450,7 @@ async def test_11_no_pipeline_side_effect(tmp_path: Path) -> None:
 def test_12_validation_invariants() -> None:
     """TEST 12 — VALIDATION INVARIANTS:
     
-    Verify boundary checks for memory_id, content, importance, and confidence.
+    Verify boundary checks for memory_id, content, importance, confidence, and project_id.
     """
     with pytest.raises(ValueError, match="memory_id"):
         MemoryRecord(memory_id="", content="valid content")
@@ -469,3 +472,145 @@ def test_12_validation_invariants() -> None:
 
     with pytest.raises(ValueError, match="project_id"):
         MemoryRecord(memory_id="m1", content="ok", project_id="")
+
+
+def test_13_audit1_l1_working_conservative_fallback() -> None:
+    """AUDIT 1 TEST:
+    
+    Verify L1_WORKING does not claim unsupported PROJECT semantics solely because it is L1.
+    If explicit evidence exists in key, respect it; otherwise use SEMANTIC fallback with metadata.
+    """
+    # Case A: Generic working entry without project evidence -> fallback to SEMANTIC + tier L1
+    generic_entry = MemoryEntry(
+        memory_id="entry-gen",
+        level=LegacyMemoryLevel.L1_WORKING,
+        key="scratch_note",
+        content="Transient task context",
+        source="runtime",
+    )
+    rec_gen = legacy_entry_to_memory_record(generic_entry, project_id="proj-x")
+    assert rec_gen.tier == MemoryLevel.L1
+    assert rec_gen.memory_type == MemoryType.SEMANTIC
+    assert rec_gen.metadata.get("legacy_level") == "l1_working"
+    assert rec_gen.metadata.get("legacy_compatibility_fallback") is True
+
+    # Case B: Working entry with explicit semantic evidence in key -> maps to PROJECT
+    project_entry = MemoryEntry(
+        memory_id="entry-dec",
+        level=LegacyMemoryLevel.L1_WORKING,
+        key="architecture_decision",
+        content="Chosen Redis for caching",
+        source="runtime",
+    )
+    rec_dec = legacy_entry_to_memory_record(project_entry, project_id="proj-x")
+    assert rec_dec.tier == MemoryLevel.L1
+    assert rec_dec.memory_type == MemoryType.PROJECT
+    assert rec_dec.metadata.get("legacy_level") == "l1_working"
+    assert rec_dec.metadata.get("legacy_compatibility_fallback") is None
+
+
+def test_14_audit2_all_four_legacy_levels_preservation() -> None:
+    """AUDIT 2 TEST:
+    
+    Verify all four legacy levels preserve original source information (legacy level,
+    key, source, recall count, timestamps, content, project).
+    """
+    levels = [
+        (LegacyMemoryLevel.L0_EPISODIC, MemoryLevel.L0, MemoryType.EPISODIC),
+        (LegacyMemoryLevel.L1_WORKING, MemoryLevel.L1, MemoryType.SEMANTIC),
+        (LegacyMemoryLevel.L2_SEMANTIC, MemoryLevel.L2, MemoryType.SEMANTIC),
+        (LegacyMemoryLevel.L3_LONG_TERM, MemoryLevel.L3, MemoryType.SEMANTIC),
+    ]
+
+    for legacy_lvl, expected_tier, expected_type in levels:
+        entry = MemoryEntry(
+            memory_id=f"entry-{legacy_lvl.value}",
+            level=legacy_lvl,
+            key=f"key_{legacy_lvl.value}",
+            content=f"Content for {legacy_lvl.value}",
+            source=f"source_{legacy_lvl.value}",
+            recall_count=7,
+        )
+
+        canonical = legacy_entry_to_memory_record(entry, project_id="proj-audit")
+
+        # Verify preservation in canonical record
+        assert canonical.memory_id == entry.memory_id
+        assert canonical.content == entry.content
+        assert canonical.tier == expected_tier
+        assert canonical.memory_type == expected_type
+        assert canonical.source == f"source_{legacy_lvl.value}"
+        assert canonical.project_id == "proj-audit"
+        assert canonical.metadata["legacy_level"] == legacy_lvl.value.lower()
+        assert canonical.metadata["key"] == f"key_{legacy_lvl.value}"
+        assert canonical.metadata["recall_count"] == 7
+
+        # Verify roundtrip back to legacy
+        restored = memory_record_to_legacy_entry(canonical)
+        assert restored.memory_id == entry.memory_id
+        assert restored.level == legacy_lvl
+        assert restored.key == f"key_{legacy_lvl.value}"
+        assert restored.content == entry.content
+        assert restored.source == f"source_{legacy_lvl.value}"
+        assert restored.recall_count == 7
+
+
+def test_15_audit3_reserved_canonical_metadata_rejected() -> None:
+    """AUDIT 3 TEST:
+    
+    Caller metadata containing '__canonical__' must be rejected with ValueError,
+    preventing silent data overwrite in SQLite persistence.
+    """
+    with pytest.raises(ValueError, match="reserved for internal store persistence"):
+        MemoryRecord(
+            memory_id="coll-1",
+            content="Testing collision",
+            metadata={"__canonical__": {"hijack": True}},
+        )
+
+    # Also test store serialization defense directly
+    rec = MemoryRecord(memory_id="coll-2", content="Safe record")
+    # If someone somehow bypasses init and sets __canonical__ in metadata
+    tampered_rec = MemoryRecord(
+        memory_id="coll-3",
+        content="Safe",
+        metadata={"user_key": "val"},
+    )
+    object.__setattr__(tampered_rec, "metadata", {"__canonical__": "evil"})
+    with pytest.raises(ValueError, match="reserved for internal store persistence"):
+        SQLiteMemoryStore._serialize_metadata(tampered_rec)
+
+
+def test_16_audit4_project_id_scope_consistency() -> None:
+    """AUDIT 4 TEST:
+    
+    Ensure project_id and scope maintain strict consistency without contradictory defaults:
+    - project_id=None defaults to scope='global'
+    - project_id=None with explicit scope='project' normalizes to 'global'
+    - project_id present defaults to scope='project'
+    """
+    # Case 1: Global memory without scope specified
+    global_mem = MemoryRecord(memory_id="g1", content="Global fact", project_id=None)
+    assert global_mem.project_id is None
+    assert global_mem.scope == "global"
+
+    # Case 2: Global memory with contradictory scope='project'
+    norm_mem = MemoryRecord(memory_id="g2", content="Global fact", project_id=None, scope="project")
+    assert norm_mem.project_id is None
+    assert norm_mem.scope == "global"
+
+    # Case 3: Project memory without scope specified
+    proj_mem = MemoryRecord(memory_id="p1", content="Project fact", project_id="proj-omega")
+    assert proj_mem.project_id == "proj-omega"
+    assert proj_mem.scope == "project"
+
+    # Case 4: Project memory with explicit scope
+    custom_scope_mem = MemoryRecord(
+        memory_id="p2",
+        content="Workspace fact",
+        project_id="proj-omega",
+        scope="workspace:ws-1",
+    )
+    assert custom_scope_mem.project_id == "proj-omega"
+    assert custom_scope_mem.scope == "workspace:ws-1"
+

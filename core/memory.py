@@ -194,16 +194,32 @@ class MemoryRecord:
         resolved_until = datetime.fromisoformat(valid_until) if isinstance(valid_until, str) else valid_until
 
         resolved_meta = dict(metadata) if metadata is not None else {}
+        if "__canonical__" in resolved_meta:
+            raise ValueError("metadata key '__canonical__' is reserved for internal store persistence")
+
+        resolved_project_id = str(project_id).strip() if project_id else None
+
+        # Scope resolution with consistency invariant:
+        # If project_id is None, scope must not falsely imply a specific project.
+        if scope is None or scope == "project":
+            if resolved_project_id is None:
+                resolved_scope = "global"
+            else:
+                resolved_scope = "project"
+        else:
+            resolved_scope = str(scope).strip()
+            if resolved_project_id is None and resolved_scope == "project":
+                resolved_scope = "global"
 
         object.__setattr__(self, "memory_id", str(memory_id).strip())
         object.__setattr__(self, "content", str(content).strip())
-        object.__setattr__(self, "project_id", str(project_id).strip() if project_id else None)
+        object.__setattr__(self, "project_id", resolved_project_id)
         object.__setattr__(self, "memory_type", resolved_type)
         object.__setattr__(self, "tier", resolved_tier)
         object.__setattr__(self, "importance", float(importance))
         object.__setattr__(self, "confidence", float(confidence))
         object.__setattr__(self, "subject", str(subject).strip())
-        object.__setattr__(self, "scope", str(scope).strip())
+        object.__setattr__(self, "scope", resolved_scope)
         object.__setattr__(self, "source", str(source).strip())
         object.__setattr__(self, "status", resolved_status)
         object.__setattr__(self, "supersedes", str(supersedes).strip() if supersedes else None)
@@ -306,33 +322,57 @@ def legacy_entry_to_memory_record(
     """Explicit compatibility adapter: maps legacy MemoryEntry to canonical MemoryRecord.
     
     Preserves both semantic type and retention tier without loss.
+    Does NOT infer unsupported PROJECT semantics merely from L1 retention tier.
     """
     level_raw = str(entry.level.value if hasattr(entry.level, "value") else entry.level).lower()
+    key_lower = str(entry.key or "").lower()
 
-    if "l0" in level_raw or "episodic" in level_raw:
-        m_type = MemoryType.EPISODIC
-        tier = MemoryLevel.L0
-    elif "l1" in level_raw or "working" in level_raw:
+    is_fallback = False
+
+    # Check for explicit semantic evidence in key if available
+    if "decision" in key_lower or "constraint" in key_lower or "architecture" in key_lower:
         m_type = MemoryType.PROJECT
-        tier = MemoryLevel.L1
-    elif "l2" in level_raw:
+    elif "preference" in key_lower:
+        m_type = MemoryType.PREFERENCE
+    elif "lesson" in key_lower or "mistake" in key_lower:
+        m_type = MemoryType.LESSON
+    elif "procedure" in key_lower or "workflow" in key_lower:
+        m_type = MemoryType.PROCEDURE
+    elif "chat" in key_lower or "event" in key_lower or "episodic" in level_raw or "l0" in level_raw:
+        m_type = MemoryType.EPISODIC
+    elif "l2" in level_raw or "l3" in level_raw or "semantic" in level_raw or "long_term" in level_raw:
         m_type = MemoryType.SEMANTIC
-        tier = MemoryLevel.L2
-    elif "l3" in level_raw or "long_term" in level_raw:
+    elif "l1" in level_raw or "working" in level_raw:
+        # Conservative compatibility fallback: do not infer PROJECT solely from working retention level
         m_type = MemoryType.SEMANTIC
-        tier = MemoryLevel.L3
+        is_fallback = True
     else:
         m_type = MemoryType.SEMANTIC
+        is_fallback = True
+
+    # Tier resolution
+    if "l0" in level_raw or "episodic" in level_raw:
+        tier = MemoryLevel.L0
+    elif "l1" in level_raw or "working" in level_raw:
+        tier = MemoryLevel.L1
+    elif "l2" in level_raw or "semantic" in level_raw:
+        tier = MemoryLevel.L2
+    elif "l3" in level_raw or "long_term" in level_raw:
+        tier = MemoryLevel.L3
+    else:
         tier = MemoryLevel.L1
 
     created_at = datetime.fromisoformat(entry.created_at) if isinstance(entry.created_at, str) else entry.created_at
     updated_at = datetime.fromisoformat(entry.updated_at) if isinstance(entry.updated_at, str) else entry.updated_at
 
-    meta = {
+    meta: dict[str, object] = {
         "key": entry.key,
+        "source": entry.source,
         "recall_count": entry.recall_count,
         "legacy_level": level_raw,
     }
+    if is_fallback:
+        meta["legacy_compatibility_fallback"] = True
 
     return MemoryRecord(
         memory_id=entry.memory_id,
@@ -343,7 +383,7 @@ def legacy_entry_to_memory_record(
         importance=0.5,
         confidence=1.0,
         subject=entry.key or "project",
-        scope="project" if project_id else "global",
+        scope=f"project:{project_id}" if project_id else "global",
         source=entry.source or "runtime",
         status=MemoryStatus.ACTIVE,
         metadata=meta,
@@ -357,16 +397,31 @@ def memory_record_to_legacy_entry(record: MemoryRecord) -> Any:
     """Explicit compatibility adapter: maps canonical MemoryRecord to legacy MemoryEntry."""
     from core.memory_consolidation import MemoryEntry, MemoryLevel as LegacyMemoryLevel
 
-    if record.tier == MemoryLevel.L0:
-        legacy_level = LegacyMemoryLevel.L0_EPISODIC
-    elif record.tier == MemoryLevel.L1:
-        legacy_level = LegacyMemoryLevel.L1_WORKING
-    elif record.tier == MemoryLevel.L2:
-        legacy_level = LegacyMemoryLevel.L2_SEMANTIC
-    elif record.tier == MemoryLevel.L3:
-        legacy_level = LegacyMemoryLevel.L3_LONG_TERM
-    else:
-        legacy_level = LegacyMemoryLevel.L1_WORKING
+    # Restore original legacy level from provenance metadata when available
+    legacy_level: LegacyMemoryLevel | None = None
+    legacy_level_val = record.metadata.get("legacy_level")
+    if isinstance(legacy_level_val, str):
+        raw_lower = legacy_level_val.lower()
+        if "l0" in raw_lower or "episodic" in raw_lower:
+            legacy_level = LegacyMemoryLevel.L0_EPISODIC
+        elif "l1" in raw_lower or "working" in raw_lower:
+            legacy_level = LegacyMemoryLevel.L1_WORKING
+        elif "l2" in raw_lower or "semantic" in raw_lower:
+            legacy_level = LegacyMemoryLevel.L2_SEMANTIC
+        elif "l3" in raw_lower or "long_term" in raw_lower:
+            legacy_level = LegacyMemoryLevel.L3_LONG_TERM
+
+    if legacy_level is None:
+        if record.tier == MemoryLevel.L0:
+            legacy_level = LegacyMemoryLevel.L0_EPISODIC
+        elif record.tier == MemoryLevel.L1:
+            legacy_level = LegacyMemoryLevel.L1_WORKING
+        elif record.tier == MemoryLevel.L2:
+            legacy_level = LegacyMemoryLevel.L2_SEMANTIC
+        elif record.tier == MemoryLevel.L3:
+            legacy_level = LegacyMemoryLevel.L3_LONG_TERM
+        else:
+            legacy_level = LegacyMemoryLevel.L1_WORKING
 
     key = str(record.metadata.get("key") or record._custom_kind or record.memory_id)
     recall_count = int(record.metadata.get("recall_count", 0))

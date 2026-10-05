@@ -105,16 +105,17 @@ class MemoryRecord:
 - `record.level`: Read-only property returning `record.tier` (`MemoryLevel`).
 - `record.kind`: Read-only property returning legacy kind string (e.g. `"decision"`, `"note"`) or `record.memory_type.value`.
 
-### 4.2 Field Semantics
+### 4.2 Field Semantics & Consistency Invariants
 - `memory_id`: Non-empty stable unique identifier.
 - `project_id`: Optional project scoping. Set to `None` for global, non-project memories.
+- `scope`: Logical scope boundary.
+  - **Consistency Invariant:** If `project_id` is `None`, default scope is `"global"` (never contradictory `"project"`). If caller passes `project_id=None` with `scope="project"`, it normalizes to `"global"`. If `project_id` is provided, default scope is `"project"`.
 - `memory_type`: Semantic classification (`EPISODIC`, `SEMANTIC`, `PREFERENCE`, etc.).
 - `tier`: Storage intent tier (`L0`, `L1`, `L2`, `L3`).
 - `content`: Non-empty text content of the remembered information.
 - `importance`: Float normalized in `[0.0, 1.0]`.
 - `confidence`: Float normalized in `[0.0, 1.0]`, expressing certainty of accuracy.
 - `subject`: Entity the memory concerns (e.g., `"user"`, `"houhou"`, `"project"`, `"system"`).
-- `scope`: Logical scope boundary (e.g., `"global"`, `"project:alpha"`, `"session:beta"`).
 - `source`: Provenance of memory (e.g., `"conversation"`, `"runtime"`, `"manual"`, `"migration"`).
 - `status`: Structural lifecycle state (`ACTIVE`, `SUPERSEDED`, `ARCHIVED`).
 - `supersedes`: Identifier of an older memory replaced by this record (structural reference).
@@ -150,6 +151,11 @@ To support canonical fields without altering SQLite columns:
   - If `__canonical__` exists, full canonical semantics are restored.
   - If `__canonical__` is absent (legacy row created prior to Phase 03), safe defaults are supplied: `tier=MemoryLevel(row["level"])`, `memory_type=normalize_memory_type(row["kind"])`, `confidence=1.0`, `status=ACTIVE`.
 
+### 5.3 Reserved Metadata Namespace Policy
+- The key `"__canonical__"` within `metadata` is strictly reserved for internal persistence packaging in `SQLiteMemoryStore`.
+- Any caller-supplied `metadata` containing `"__canonical__"` is rejected with `ValueError` at both `MemoryRecord.__init__` and `SQLiteMemoryStore._serialize_metadata`.
+- This ensures zero risk of silent caller data loss or collision.
+
 ---
 
 ## 6. Legacy Adapters (`core/memory_consolidation.py`)
@@ -165,7 +171,22 @@ canonical_record = legacy_entry_to_memory_record(legacy_entry, project_id=...)
 legacy_entry = memory_record_to_legacy_entry(canonical_record)
 ```
 
-`MemoryConsolidator.consolidate_session_records(context, messages)` outputs canonical `MemoryRecord` instances directly.
+### 6.1 Legacy L1_WORKING Semantics
+- `L1_WORKING` represents a retention tier (`MemoryLevel.L1`), NOT an unsupported semantic claim of `MemoryType.PROJECT`.
+- If explicit semantic evidence is present in `entry.key` (e.g. `"decision"`, `"constraint"`), it is mapped accordingly.
+- Otherwise, the adapter applies a conservative compatibility fallback: `MemoryType.SEMANTIC` with `tier=MemoryLevel.L1`, recording `legacy_compatibility_fallback: True` and `legacy_level: "l1_working"` in `metadata`.
+
+### 6.2 Provenance & Information Preservation
+For all four legacy levels (`L0_EPISODIC`, `L1_WORKING`, `L2_SEMANTIC`, `L3_LONG_TERM`), conversion preserves:
+- Original legacy level string (in `metadata["legacy_level"]`)
+- `key` (in `metadata["key"]` and `_custom_kind`)
+- `source` (in `record.source` and `metadata["source"]`)
+- `recall_count` (in `metadata["recall_count"]`)
+- `created_at` and `updated_at`
+- `content`
+- `project_id` when available
+
+`MemoryConsolidator.consolidate_session_records(context, messages)` outputs canonical `MemoryRecord` instances directly using these adapters.
 
 ---
 
@@ -178,3 +199,4 @@ The following capabilities are intentionally NOT implemented in Phase 03:
 4. **Conflict Resolution:** Automated evaluation of contradictory statements and superseding transitions (Phase 04).
 5. **User Model (`UserModel`):** User profiles, preferences reasoning (Phase 05).
 6. **Context Builder (`ContextBuilder`):** Automatic memory injection into LLM prompts (Phase 06).
+

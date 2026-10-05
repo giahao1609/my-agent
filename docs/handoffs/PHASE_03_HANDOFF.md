@@ -8,10 +8,19 @@
 
 `ac9b20cc02bcee4fe4ec4a9e6221efabdf988378` (origin/main, main)
 
-## FINAL_COMMIT
+## INITIAL_PHASE_03_COMMIT
 
-`519c99907679cb9ed2d5e2c3f18d165dba343dd4`
+`50ec68fcacac91fa7722b53c281110aa3c003fc5`
 `feat(memory): unify canonical memory domain model`
+
+## COMMIT_DISCREPANCY_EXPLANATION
+
+The human review observed that the reported CURRENT_COMMIT in chat (`50ec68f...`) differed from the string recorded inside `docs/handoffs/PHASE_03_HANDOFF.md` (`519c999...`).
+**Root Cause:** In Git's Merkle tree model, a commit hash is computed over the entire tree state including all file contents. Updating the hash text inside `PHASE_03_HANDOFF.md` and running `git commit --amend` altered the tree contents, which deterministically generated a new commit SHA (`50ec68f...`). The commit history is linear and clean:
+1. `b397a47`: initial Phase 03 implementation.
+2. `519c999`: amend recording `b397a47`.
+3. `50ec68f`: amend recording `519c999` (Actual HEAD reviewed).
+4. Merge Gate Verification commit: applies hardening patches for Audits 1–4.
 
 ---
 
@@ -102,10 +111,49 @@ No enum conflates these two concepts.
 
 ---
 
+## L1_WORKING_MAPPING (AUDIT 1)
+
+- **Before Verification:** `L1_WORKING` was unconditionally mapped to `MemoryType.PROJECT + MemoryLevel.L1`. This violated the `MEMORY TYPE != MEMORY TIER` invariant by conflating working context with project domain semantics.
+- **After Verification:** `L1_WORKING` maps to `tier = MemoryLevel.L1`. For semantic type:
+  - If `entry.key` contains explicit evidence (e.g. `"decision"`, `"constraint"`, `"architecture"`), it maps to `MemoryType.PROJECT`.
+  - If `entry.key` contains explicit preference/lesson/procedure evidence, it maps to the matching type.
+  - Otherwise, it maps to conservative fallback `MemoryType.SEMANTIC` with `metadata["legacy_compatibility_fallback"] = True`.
+  - Original level string is always preserved in `metadata["legacy_level"] = "l1_working"`.
+
+---
+
+## LEGACY_INFORMATION_PRESERVATION (AUDIT 2)
+
+All four legacy levels (`L0_EPISODIC`, `L1_WORKING`, `L2_SEMANTIC`, `L3_LONG_TERM`) preserve 100% of source information during roundtrip:
+- `legacy_level`: stored in `metadata["legacy_level"]`
+- `key`: stored in `metadata["key"]` and `_custom_kind`
+- `source`: stored in `record.source` and `metadata["source"]`
+- `recall_count`: stored in `metadata["recall_count"]`
+- `created_at` and `updated_at`: preserved as datetimes
+- `content`: preserved untouched
+- `project_id`: preserved when provided
+
+---
+
+## CANONICAL_METADATA_NAMESPACE_POLICY (AUDIT 3)
+
+- **Policy:** The key `"__canonical__"` within `metadata` is strictly reserved for internal persistence packaging by `SQLiteMemoryStore`.
+- **Enforcement:** If a caller supplies `metadata` containing `"__canonical__"`, a `ValueError` is raised at `MemoryRecord.__init__` and verified again in `SQLiteMemoryStore._serialize_metadata`.
+- **Guarantee:** Eliminates silent overwrite of caller metadata and prevents namespace collision.
+
+---
+
+## PROJECT_SCOPE_INVARIANT (AUDIT 4)
+
+- If `project_id is None`: default scope is `"global"`. If caller passes contradictory `scope="project"`, it normalizes to `"global"`.
+- If `project_id is not None`: default scope is `"project"`. Explicit custom scopes (e.g. `"workspace:ws-1"`) are preserved.
+
+---
+
 ## FILES_CHANGED
 
 ### New files created:
-1. `tests/test_unified_memory_model.py`: 12 comprehensive unit and behavioral tests verifying canonical model invariants, orthogonal dimensions, legacy compatibility, SQLite round-trip, global memory representation, and absence of pipeline side-effects.
+1. `tests/test_unified_memory_model.py`: 16 comprehensive unit and behavioral tests verifying canonical model invariants, orthogonal dimensions, legacy compatibility, SQLite round-trip, global memory representation, reserved namespace validation, and scope consistency.
 2. `docs/cognitive_architecture/contracts/memory.md`: Frozen architectural contract for memory domain model.
 3. `docs/handoffs/PHASE_03_HANDOFF.md`: This handoff document.
 
@@ -113,9 +161,8 @@ No enum conflates these two concepts.
 1. `core/memory.py`:
    - Defined `MemoryType`, `MemoryStatus`, `MemoryTier`.
    - Enhanced `MemoryRecord` to canonical form with full temporal, provenance, and lifecycle fields.
-   - Preserved backward-compatible properties (`.level`, `.kind`) and constructor signatures.
-   - Added `to_dict()`, `from_dict()`, and normalization helpers.
-   - Added bidirectional adapters `legacy_entry_to_memory_record` and `memory_record_to_legacy_entry`.
+   - Enforced reserved metadata key validation and scope consistency invariant.
+   - Refined legacy adapters with conservative L1 fallback and bidirectional lossless conversion.
 2. `core/memory_consolidation.py`:
    - Marked `MemoryLevel` and `MemoryEntry` with `[DEPRECATED / LEGACY COMPATIBILITY ONLY]`.
    - Added `.to_canonical()` and `.from_canonical()` methods to `MemoryEntry`.
@@ -123,6 +170,7 @@ No enum conflates these two concepts.
    - Maintained `consolidate_session()` and `promote_memories()` for zero-breakage backward compatibility.
    - Strictly ensured zero automatic persistence side effects.
 3. `persistence/sqlite_memory_store.py`:
+   - Added defensive check rejecting caller metadata collision with `"__canonical__"`.
    - Updated serialization to store canonical metadata inside `__canonical__` in `metadata_json`.
    - Handled non-project global memories (`project_id=None`) safely against SQLite `NOT NULL` constraint.
    - Implemented dual-path row deserializer restoring canonical records from `__canonical__` while gracefully reading historical rows.
@@ -149,28 +197,9 @@ No enum conflates these two concepts.
   - Added fields: `confidence`, `subject`, `scope`, `source`, `status`, `supersedes`, `updated_at`, `last_accessed_at`, `valid_from`, `valid_until`.
   - Added properties: `.level` (aliasing `.tier`), `.kind` (aliasing legacy kind or `.memory_type.value`).
   - Added methods: `to_dict()`, `from_dict()`.
+  - Added validations: reserved `"__canonical__"` check, scope consistency normalization.
 - `persistence.sqlite_memory_store.SQLiteMemoryStore`:
-  - Internal serialization and deserialization seamlessly round-trips canonical `MemoryRecord`.
-
----
-
-## LEGACY_TYPES_RETAINED
-
-- `core.memory_consolidation.MemoryEntry`: Retained strictly for backward compatibility with existing tests and callers. Marked as `[DEPRECATED / LEGACY COMPATIBILITY ONLY]`.
-- `core.memory_consolidation.MemoryLevel`: Retained strictly for legacy mapping. Marked as `[DEPRECATED / LEGACY COMPATIBILITY ONLY]`.
-
----
-
-## LEGACY_ADAPTERS
-
-1. `legacy_entry_to_memory_record(entry, project_id=None) -> MemoryRecord`:
-   - Maps `L0_episodic` -> `(MemoryType.EPISODIC, MemoryLevel.L0)`
-   - Maps `L1_working` -> `(MemoryType.PROJECT, MemoryLevel.L1)`
-   - Maps `L2_semantic` -> `(MemoryType.SEMANTIC, MemoryLevel.L2)`
-   - Maps `L3_long_term` -> `(MemoryType.SEMANTIC, MemoryLevel.L3)`
-   - Preserves `key`, `source`, `recall_count`, and timestamps.
-2. `memory_record_to_legacy_entry(record) -> MemoryEntry`:
-   - Reconstructs legacy `MemoryEntry` without data loss.
+  - Internal serialization and deserialization seamlessly round-trips canonical `MemoryRecord` with reserved namespace guard.
 
 ---
 
@@ -206,21 +235,9 @@ No enum conflates these two concepts.
 
 ---
 
-## PERSISTENCE_BEHAVIOR_BEFORE
-
-- Stored simple `MemoryRecord` with basic `kind` and `level`.
-- Did not persist or restore temporal or lifecycle metadata.
-
-## PERSISTENCE_BEHAVIOR_AFTER
-
-- Fully persists and restores canonical `MemoryRecord` instances.
-- Completely non-destructive to historical records.
-
----
-
 ## TESTS_ADDED
 
-File: `tests/test_unified_memory_model.py` (12 tests)
+File: `tests/test_unified_memory_model.py` (16 tests)
 - `test_01_one_canonical_record`: Verifies single canonical `MemoryRecord` resolution and dict serialization.
 - `test_02_type_tier_separation`: Verifies orthogonal nature of `MemoryType` and `MemoryLevel`.
 - `test_03_legacy_memory_record_compatibility`: Verifies positional and keyword constructor compatibility with pre-Phase-03 code.
@@ -230,16 +247,21 @@ File: `tests/test_unified_memory_model.py` (12 tests)
 - `test_07_global_non_project_memory`: Verifies representation and storage of global/non-project memories (`project_id=None`).
 - `test_08_status_structure`: Verifies `ACTIVE`, `SUPERSEDED`, `ARCHIVED` status representation without auto-mutations.
 - `test_09_supersedes_structure`: Verifies structural reference to older memories without conflict resolution side effects.
-- `test_10_consolidator_output_contract`: Verifies `MemoryConsolidator.consolidate_session_records` returns canonical records.
+- `test_10_consolidator_output_contract`: Verifies `MemoryConsolidator.consolidate_session_records` returns canonical records with conservative fallback.
 - `test_11_no_pipeline_side_effect`: Verifies consolidation does NOT write to SQLite database.
 - `test_12_validation_invariants`: Verifies validation rules for `memory_id`, `content`, `importance`, `confidence`, and `project_id`.
+- `test_13_audit1_l1_working_conservative_fallback`: Verifies `L1_working` does not claim `PROJECT` without explicit evidence.
+- `test_14_audit2_all_four_legacy_levels_preservation`: Verifies lossless roundtrip across all 4 legacy levels.
+- `test_15_audit3_reserved_canonical_metadata_rejected`: Verifies rejection of reserved `"__canonical__"` key in metadata.
+- `test_16_audit4_project_id_scope_consistency`: Verifies non-contradictory scope consistency for global and project memories.
 
 ---
 
 ## TESTS_RUN & TEST_RESULTS
 
-- **Targeted memory tests:** 21 passed in 0.64s (`test_unified_memory_model.py` + `test_memory_backend.py` + `test_memory_consolidation.py` + `test_memory_tools.py`).
-- **Full repository suite:** **733 passed in 13.67s** (721 baseline + 12 new Phase 03 tests). Zero failures, zero regressions.
+- **Targeted memory tests:** 25 passed in 0.75s (`test_unified_memory_model.py` + `test_memory_backend.py` + `test_memory_consolidation.py` + `test_memory_tools.py`).
+- **Full repository suite:** **737 passed in 14.52s** (721 baseline + 16 new Phase 03 tests). Zero failures, zero regressions.
+
 
 ---
 
