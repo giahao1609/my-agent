@@ -69,6 +69,50 @@ async def _read_file(
         if end_value < start_value:
             raise ValueError("end_line must be >= start_line")
 
+    max_chars = arguments.get("max_chars")
+    if max_chars is not None:
+        if type(max_chars) is not int or max_chars < 1 or end_value is None:
+            raise ValueError("bounded read requires positive max_chars and end_line")
+
+        def read_bounded() -> Mapping[str, object]:
+            # Stop at the requested range; never materialize the whole file.
+            # Whole lines only: a character cutoff could expose a partial secret.
+            selected_lines: list[str] = []
+            selected_chars = 0
+            actual_end = start_value - 1
+            with path.open(encoding="utf-8") as stream:
+                for _ in range(1, start_value):
+                    line = stream.readline()
+                    if not line:
+                        return {
+                            "status": "ok",
+                            "path": path.relative_to(root).as_posix(),
+                            "content": "",
+                            "start_line": start_value,
+                            "end_line": actual_end,
+                            "total_lines": None,
+                        }
+                for number in range(start_value, end_value + 1):
+                    remaining = max_chars - selected_chars
+                    line = stream.readline(remaining + 1)
+                    if not line:
+                        break
+                    selected_chars += len(line)
+                    if selected_chars > max_chars:
+                        raise ValueError("bounded source read exceeded scan budget")
+                    selected_lines.append(line)
+                    actual_end = number
+            return {
+                "status": "ok",
+                "path": path.relative_to(root).as_posix(),
+                "content": "".join(selected_lines),
+                "start_line": start_value,
+                "end_line": actual_end,
+                "total_lines": None,  # A bounded read does not count the file.
+            }
+
+        return await asyncio.to_thread(read_bounded)
+
     content = await asyncio.to_thread(path.read_text, encoding="utf-8")
     lines = content.splitlines(keepends=True)
     total_lines = len(lines)
@@ -584,6 +628,7 @@ def make_read_file_tool() -> ToolDefinition:
                     "type": "integer",
                     "minimum": 1,
                 },
+                "max_chars": {"type": "integer", "minimum": 1},
             },
             "required": ["path"],
         },
