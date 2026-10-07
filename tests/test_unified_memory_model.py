@@ -614,3 +614,116 @@ def test_16_audit4_project_id_scope_consistency() -> None:
     assert custom_scope_mem.project_id == "proj-omega"
     assert custom_scope_mem.scope == "workspace:ws-1"
 
+
+def test_17_canonical_semantic_equivalence_policy() -> None:
+    """Audit canonical semantic equivalence helper:
+
+    Verifies that are_canonically_equivalent audits all persistence-relevant canonical fields
+    and explicitly ignores operational lifecycle timestamps.
+    """
+    from core.memory import are_canonically_equivalent
+
+    base = MemoryRecord(
+        memory_id="eq-1",
+        content="Stable architecture invariant",
+        project_id="proj-1",
+        memory_type=MemoryType.PROJECT,
+        tier=MemoryLevel.L2,
+        importance=0.8,
+        confidence=0.95,
+        subject="system",
+        scope="project",
+        source="runtime",
+        status=MemoryStatus.ACTIVE,
+        supersedes=None,
+        metadata={"logical_key": "arch_key", "custom_meta": 42},
+        valid_from=datetime(2026, 1, 1, tzinfo=UTC),
+        valid_until=datetime(2027, 1, 1, tzinfo=UTC),
+    )
+
+    # Identical record is equivalent
+    dup = MemoryRecord(
+        memory_id="eq-1",
+        content="Stable architecture invariant",
+        project_id="proj-1",
+        memory_type=MemoryType.PROJECT,
+        tier=MemoryLevel.L2,
+        importance=0.8,
+        confidence=0.95,
+        subject="system",
+        scope="project",
+        source="runtime",
+        status=MemoryStatus.ACTIVE,
+        supersedes=None,
+        metadata={"logical_key": "arch_key", "custom_meta": 42},
+        valid_from=datetime(2026, 1, 1, tzinfo=UTC),
+        valid_until=datetime(2027, 1, 1, tzinfo=UTC),
+    )
+    assert are_canonically_equivalent(base, dup) is True
+
+    # Differing operational timestamps are EXCLUDED and still equivalent
+    op_diff = MemoryRecord(
+        memory_id="eq-1",
+        content="Stable architecture invariant",
+        project_id="proj-1",
+        memory_type=MemoryType.PROJECT,
+        tier=MemoryLevel.L2,
+        importance=0.8,
+        confidence=0.95,
+        subject="system",
+        scope="project",
+        source="runtime",
+        status=MemoryStatus.ACTIVE,
+        supersedes=None,
+        metadata={"logical_key": "arch_key", "custom_meta": 42, "__status_updated_at": "2026-10-06T12:00:00Z"},
+        created_at=datetime(2024, 1, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 10, 6, tzinfo=UTC),
+        last_accessed_at=datetime(2026, 10, 6, 12, 0, tzinfo=UTC),
+        valid_from=datetime(2026, 1, 1, tzinfo=UTC),
+        valid_until=datetime(2027, 1, 1, tzinfo=UTC),
+    )
+    assert are_canonically_equivalent(base, op_diff) is True
+
+    # Any canonical field mismatch evaluates False:
+    # 1. memory_id
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "memory_id": "eq-2"})) is False
+    # 2. project_id
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "project_id": "proj-2"})) is False
+    # 3. memory_type
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "memory_type": "lesson"})) is False
+    # 4. tier
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "tier": "l3"})) is False
+    # 5. content
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "content": "Changed content"})) is False
+    # 6. importance
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "importance": 0.5})) is False
+    # 7. confidence
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "confidence": 0.6})) is False
+    # 8. subject
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "subject": "user"})) is False
+    # 9. scope
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "scope": "global"})) is False
+    # 10. source
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "source": "user"})) is False
+    # 11. status
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "status": "archived"})) is False
+    # 12. supersedes
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "supersedes": "old-mem"})) is False
+    # 13. valid_from
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "valid_from": "2026-05-01T00:00:00+00:00"})) is False
+    # 14. valid_until
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "valid_until": "2028-01-01T00:00:00+00:00"})) is False
+    # 15. metadata
+    assert are_canonically_equivalent(base, MemoryRecord.from_dict({**base.to_dict(), "metadata": {"logical_key": "other_key"}})) is False
+
+    # 15a. Operational allowlist: only __status_updated_at is excluded, so differing values are equivalent
+    assert are_canonically_equivalent(
+        MemoryRecord.from_dict({**base.to_dict(), "metadata": {"logical_key": "arch_key", "custom_meta": 42, "__status_updated_at": "2026-10-06T10:00:00Z"}}),
+        MemoryRecord.from_dict({**base.to_dict(), "metadata": {"logical_key": "arch_key", "custom_meta": 42, "__status_updated_at": "2026-10-06T12:00:00Z"}}),
+    ) is True
+
+    # 15b. Arbitrary "__*" metadata (e.g. __business_flag) is SEMANTIC and must NOT be ignored
+    assert are_canonically_equivalent(
+        MemoryRecord.from_dict({**base.to_dict(), "metadata": {"logical_key": "arch_key", "custom_meta": 42, "__business_flag": "A"}}),
+        MemoryRecord.from_dict({**base.to_dict(), "metadata": {"logical_key": "arch_key", "custom_meta": 42, "__business_flag": "B"}}),
+    ) is False

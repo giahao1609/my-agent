@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from uuid import uuid4
 
 from mcp.server import MCPServer
@@ -54,7 +54,9 @@ from core.ui_design_style_engine import (
 )
 from core.design_md_generator import DesignMdGenerator
 from core.prompt_rewriter import PromptRewriter
+from core.durable_memory_service import DurableMemoryService
 from core.memory_consolidation import MemoryConsolidator
+from persistence.sqlite_memory_store import SQLiteMemoryStore
 from core.security_scanner import SecurityScannerRegistry
 from core.test_runner import TestRunnerRegistry
 from core.verification_gate_coordinator import VerificationGateCoordinator
@@ -102,6 +104,8 @@ _decision_service = DecisionService(decisions)
 agent_runs = SQLiteAgentRunStore(DB_PATH)
 _agent_run_service = AgentRunService(agent_runs)
 _handoff_context_builder = AgentHandoffContextBuilder(agent_runs)
+memory_store = SQLiteMemoryStore(DB_PATH)
+_memory_service = DurableMemoryService(memory_store)
 
 
 
@@ -162,6 +166,7 @@ async def _initialize() -> None:
     await plans.initialize()
     await decisions.initialize()
     await agent_runs.initialize()
+    await memory_store.initialize()
     # Bootstrap docs knowledge backend for active project workspace
     if _docs_knowledge is None:
         active = await projects.get_active()
@@ -1521,38 +1526,63 @@ async def sanitize_pii(
 async def consolidate_memory(
     session_id: str,
     project_id: str | None = None,
+    messages: Sequence[dict[str, str]] | None = None,
 ) -> dict[str, object]:
     """Consolidate short-term session messages (L0) into L1 working memory.
 
     Call after a coder session ends to persist session knowledge.
+    Persists consolidated canonical records durably into SQLite via DurableMemoryService.
     """
+    await _initialize()
+    if project_id == "__global__":
+        raise ValueError(
+            "RESERVED_SENTINEL: project_id='__global__' is a reserved legacy sentinel "
+            "and cannot be used for new durable writes. Pass project_id=None or omit it "
+            "to use the active project context."
+        )
+    target_project_id = project_id
+    if not target_project_id:
+        active = await projects.get_active()
+        if active and active.project_id:
+            target_project_id = active.project_id
+        else:
+            raise ValueError(
+                "PROJECT_CONTEXT_REQUIRED: consolidate_memory requires an explicit project_id "
+                "or an active registered project. Fabricating project_id from session_id is forbidden."
+            )
+
     context = ExecutionContext(
         workspace_id=session_id,
         session_id=session_id,
-        project_id=project_id or session_id,
+        project_id=target_project_id,
     )
-    # Retrieve last session messages for consolidation
-    if project_id:
-        conversation = await conversations.get(project_id, session_id)
-    else:
-        conversation = None
 
-    messages: list[dict[str, str]] = []
-    if conversation is not None:
-        conv_messages = await conversations.history(project_id or session_id, session_id, limit=200)
-        messages = [
-            {"role": m.role.value, "content": m.content}
-            for m in conv_messages
-        ]
+    resolved_messages: list[dict[str, str]] = list(messages) if messages is not None else []
+    if not resolved_messages:
+        conversation = await conversations.get(target_project_id, session_id)
+        if conversation is not None:
+            conv_messages = await conversations.history(target_project_id, session_id, limit=200)
+            resolved_messages = [
+                {"role": m.role.value, "content": m.content}
+                for m in conv_messages
+            ]
 
-    memories = _memory_consolidator.consolidate_session(context, messages)
-    promoted = _memory_consolidator.promote_memories(memories, min_recall_for_promotion=3)
+    # Explicit durable persistence path: consolidate canonical records and persist
+    persisted_ids = await _memory_service.consolidate_and_persist(
+        _memory_consolidator, context, resolved_messages
+    )
+
+    # Legacy entries for compatibility
+    entries = _memory_consolidator.consolidate_session(context, resolved_messages)
+    promoted = _memory_consolidator.promote_memories(entries, min_recall_for_promotion=3)
 
     return {
         "session_id": session_id,
-        "memories_created": len(memories),
+        "project_id": target_project_id,
+        "memories_created": len(persisted_ids),
+        "persisted_ids": list(persisted_ids),
         "memories_promoted": len(promoted),
-        "entries": [m.to_dict() for m in memories],
+        "entries": [m.to_dict() for m in entries],
     }
 
 
