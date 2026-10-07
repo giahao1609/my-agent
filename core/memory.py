@@ -439,3 +439,76 @@ def memory_record_to_legacy_entry(record: MemoryRecord) -> Any:
         updated_at=updated_iso,
     )
 
+
+NON_SEMANTIC_OPERATIONAL_METADATA_KEYS: frozenset[str] = frozenset({
+    "__status_updated_at",
+})
+"""Explicit allowlist of persistence-operational metadata keys excluded from canonical equivalence comparison.
+
+Only keys explicitly listed here are treated as non-semantic operational metadata.
+Arbitrary caller metadata (including keys starting with '__') is treated as semantic
+and must match for idempotent equivalence.
+"""
+
+
+def are_canonically_equivalent(a: MemoryRecord, b: MemoryRecord) -> bool:
+    """Evaluate whether two MemoryRecord instances share identical persistence-relevant canonical semantics.
+
+    Audit criteria:
+    - memory_id (must match)
+    - project_id (must match, including None for global)
+    - memory_type (canonical semantic type)
+    - tier / level (canonical retention tier)
+    - content (exact string match)
+    - importance (float tolerance 1e-6)
+    - confidence (float tolerance 1e-6)
+    - subject (exact string match)
+    - scope (exact string match)
+    - source (exact string match)
+    - status (canonical lifecycle status)
+    - supersedes (exact reference or None)
+    - valid_from (datetime equality)
+    - valid_until (datetime equality)
+    - relevant metadata (including logical_key; only keys explicitly in
+      NON_SEMANTIC_OPERATIONAL_METADATA_KEYS={'__status_updated_at'} are excluded).
+
+    Explicitly excluded operational lifecycle timestamps:
+    - created_at, updated_at, last_accessed_at (operational lifecycle timestamps
+      generated during write/access transitions that do not alter memory semantic content).
+    """
+    if a.memory_id != b.memory_id:
+        return False
+    if a.project_id != b.project_id:
+        return False
+    if a.memory_type != b.memory_type:
+        return False
+    if a.tier != b.tier:
+        return False
+    if a.content != b.content:
+        return False
+    if abs(a.importance - b.importance) > 1e-6:
+        return False
+    if abs(a.confidence - b.confidence) > 1e-6:
+        return False
+    if a.subject != b.subject:
+        return False
+    if a.scope != b.scope:
+        return False
+    if a.source != b.source:
+        return False
+    if a.status != b.status:
+        return False
+    if a.supersedes != b.supersedes:
+        return False
+    if a.valid_from != b.valid_from:
+        return False
+    if a.valid_until != b.valid_until:
+        return False
+
+    meta_a = {k: v for k, v in a.metadata.items() if k not in NON_SEMANTIC_OPERATIONAL_METADATA_KEYS}
+    meta_b = {k: v for k, v in b.metadata.items() if k not in NON_SEMANTIC_OPERATIONAL_METADATA_KEYS}
+    if meta_a != meta_b:
+        return False
+
+    return True
+

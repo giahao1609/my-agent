@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import uuid
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
+
+if TYPE_CHECKING:
+    from core.status import CapabilityStatus
 
 from core.browser_backend import BrowserActionResult, BrowserBackend, BrowserPolicy, BrowserSession
 

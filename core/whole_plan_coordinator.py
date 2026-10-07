@@ -3,7 +3,11 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from .agent_role import AgentRole
+    from .status import CapabilityStatus
 
 from .error_reflexion import ErrorReflexionEngine
 from .goal_drift_monitor import GoalDriftMonitor
