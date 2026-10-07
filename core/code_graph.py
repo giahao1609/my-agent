@@ -157,6 +157,7 @@ class CodeGraphBackend(Protocol):
         node_id: str,
         *,
         depth: int = 1,
+        limit: int | None = None,
     ) -> tuple[CodeNode, ...]: ...
 
     async def semantic_dependents(
@@ -165,6 +166,7 @@ class CodeGraphBackend(Protocol):
         node_id: str,
         *,
         depth: int = 1,
+        limit: int | None = None,
     ) -> tuple[CodeNode, ...]: ...
 
     async def impact(

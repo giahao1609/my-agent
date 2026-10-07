@@ -221,16 +221,18 @@ class SQLiteCodeGraphStore:
                     if row:
                         result.append(self._row_to_node(row))
         return tuple(result)
-    async def semantic_dependencies(self, project_id: str, node_id: str, *, depth: int = 1):
-        return await asyncio.to_thread(self._semantic_walk_sync, project_id, node_id, depth, False)
+    async def semantic_dependencies(self, project_id: str, node_id: str, *, depth: int = 1, limit: int | None = None):
+        return await asyncio.to_thread(self._semantic_walk_sync, project_id, node_id, depth, False, limit)
 
-    async def semantic_dependents(self, project_id: str, node_id: str, *, depth: int = 1):
-        return await asyncio.to_thread(self._semantic_walk_sync, project_id, node_id, depth, True)
+    async def semantic_dependents(self, project_id: str, node_id: str, *, depth: int = 1, limit: int | None = None):
+        return await asyncio.to_thread(self._semantic_walk_sync, project_id, node_id, depth, True, limit)
 
-    def _semantic_walk_sync(self, project_id, node_id, depth, reverse):
+    def _semantic_walk_sync(self, project_id, node_id, depth, reverse, limit=None):
+        if limit is not None and (type(limit) is not int or limit < 0):
+            raise ValueError("limit must be a nonnegative integer")
         if depth.__lt__(0):
             raise ValueError("depth must be >= 0")
-        if depth == 0:
+        if depth == 0 or limit == 0:
             return ()
         src, dst = ("target_id", "source_id") if reverse else ("source_id", "target_id")
         placeholders = ",".join("?" for _ in SEMANTIC_EDGE_KINDS)
@@ -244,6 +246,9 @@ class SQLiteCodeGraphStore:
         JOIN w ON n.node_id=w.id
         WHERE n.project_id=?"""
         params = (project_id, node_id, *SEMANTIC_EDGE_KINDS, project_id, *SEMANTIC_EDGE_KINDS, depth, project_id)
+        if limit is not None:
+            sql += " ORDER BY n.node_id LIMIT ?"
+            params += (limit,)
         with self._connect() as c:
             rows = c.execute(sql, params).fetchall()
         return tuple(self._row_to_node(r) for r in rows)
@@ -387,4 +392,3 @@ class SQLiteCodeGraphStore:
                 bool(metadata.get("interface_method")),
             ))
         return result
-
