@@ -14,6 +14,7 @@ from integrations.sqlite_memory_backend import SQLiteMemoryBackend
 from persistence.sqlite_code_graph_store import SQLiteCodeGraphStore
 from persistence.sqlite_coder_session_store import SQLiteCoderSessionStore
 from persistence.sqlite_memory_store import SQLiteMemoryStore
+from persistence.sqlite_pending_approval_store import SqlitePendingApprovalStore
 from tools.coder_tools import build_coder_tool_registry
 
 from .coder_agent import CoderAgent
@@ -28,20 +29,25 @@ class CoderAgentStack:
     session_store: SQLiteCoderSessionStore
     tool_registry: ToolRegistry
     orchestrator: Orchestrator
+    approval_store: SqlitePendingApprovalStore | None = None
 
 
 async def build_coder_agent_stack(
     database_path: str | Path,
     *,
     sandbox_runtime: SandboxRuntime | None = None,
+    approval_store: SqlitePendingApprovalStore | None = None,
 ) -> CoderAgentStack:
     memory_store = SQLiteMemoryStore(database_path)
     code_graph_store = SQLiteCodeGraphStore(database_path)
     session_store = SQLiteCoderSessionStore(database_path)
+    if approval_store is None:
+        approval_store = SqlitePendingApprovalStore(database_path)
 
     await memory_store.initialize()
     await code_graph_store.initialize()
     await session_store.initialize()
+    await approval_store.initialize()
 
     runtime = RuntimeBridge()
     memory = SQLiteMemoryBackend(memory_store)
@@ -63,7 +69,7 @@ async def build_coder_agent_stack(
         sandbox_runtime=sandbox_runtime,
     )
 
-    agent = CoderAgent(orchestrator)
+    agent = CoderAgent(orchestrator, approval_store=approval_store)
 
     return CoderAgentStack(
         agent=agent,
@@ -73,4 +79,5 @@ async def build_coder_agent_stack(
         session_store=session_store,
         tool_registry=tool_registry,
         orchestrator=orchestrator,
+        approval_store=approval_store,
     )

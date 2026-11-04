@@ -88,6 +88,9 @@ from core.agent_work_result import AgentWorkResult
 from core.agent_handoff_context import AgentHandoffContextBuilder
 from core.agent_handoff_message import AgentHandoffMessage
 from persistence.sqlite_agent_run_store import SQLiteAgentRunStore
+from persistence.sqlite_handoff_history_store import SqliteHandoffHistoryStore
+from persistence.sqlite_pending_approval_store import SqlitePendingApprovalStore
+from core.resume_assembler import ResumeAssembler
 from core.git_review_coordinator import GitReviewCoordinator, parse_github_remote
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -103,7 +106,15 @@ decisions = SQLiteDecisionStore(DB_PATH)
 _decision_service = DecisionService(decisions)
 agent_runs = SQLiteAgentRunStore(DB_PATH)
 _agent_run_service = AgentRunService(agent_runs)
-_handoff_context_builder = AgentHandoffContextBuilder(agent_runs)
+_handoff_context_builder = AgentHandoffContextBuilder(agent_runs, require_project_id=True)
+pending_approvals = SqlitePendingApprovalStore(DB_PATH)
+_handoff_history_store = SqliteHandoffHistoryStore(DB_PATH)
+_resume_assembler = ResumeAssembler(
+    conversation_store=conversations,
+    checkpoint_store=checkpoints,
+    task_store=tasks,
+    handoff_builder=_handoff_context_builder,
+)
 memory_store = SQLiteMemoryStore(DB_PATH)
 _memory_service = DurableMemoryService(memory_store)
 
@@ -137,7 +148,8 @@ _release_approval_coordinator = ReleaseApprovalCoordinator(
     sbom_generator=_sbom_generator,
 )
 _handoff_coordinator = HandoffCoordinator(
-    guardrail_engine=None  # Uses default HandoffGuardrailEngine with PromptInjectionDefense
+    guardrail_engine=None,  # Uses default HandoffGuardrailEngine with PromptInjectionDefense
+    history_store=_handoff_history_store,
 )
 _git_review_coordinator = GitReviewCoordinator()
 
@@ -167,6 +179,8 @@ async def _initialize() -> None:
     await decisions.initialize()
     await agent_runs.initialize()
     await memory_store.initialize()
+    await pending_approvals.initialize()
+    await _handoff_history_store.initialize()
     # Bootstrap docs knowledge backend for active project workspace
     if _docs_knowledge is None:
         active = await projects.get_active()
@@ -1794,7 +1808,7 @@ async def _get_coder_stack() -> CoderAgentStack:
     global _coder_stack
 
     if _coder_stack is None:
-        _coder_stack = await build_coder_agent_stack(DB_PATH)
+        _coder_stack = await build_coder_agent_stack(DB_PATH, approval_store=pending_approvals)
 
     return _coder_stack
 
@@ -2319,20 +2333,13 @@ async def resume_coder_session(
         session_id,
     )
 
-    history_records: tuple[MessageRecord, ...] = ()
-    if conversation is not None:
-        history_records = await conversations.history(
-            project.project_id,
-            session_id,
-        )
-
-    durable_history = tuple(
-        {
-            "role": record.role.value,
-            "content": record.content,
-            "metadata": dict(record.metadata),
-        }
-        for record in history_records
+    durable_history = await _resume_assembler.assemble_resume_history(
+        project_id=project.project_id,
+        session_id=session_id,
+        task_id=durable.context.task_id if durable.context else None,
+        conversation_store=conversations,
+        checkpoint_store=checkpoints,
+        task_store=tasks,
     )
 
     await stack.orchestrator.resume_session(
@@ -2393,25 +2400,14 @@ async def set_coder_execution_target(
 
     session = stack.orchestrator.get_session(session_id)
 
-    history_records: tuple[MessageRecord, ...] = ()
-    if session.project_id is not None:
-        conversation = await conversations.get(
-            session.project_id,
-            session_id,
-        )
-        if conversation is not None:
-            history_records = await conversations.history(
-                session.project_id,
-                session_id,
-            )
-
-    durable_history = tuple(
-        {
-            "role": record.role.value,
-            "content": record.content,
-            "metadata": dict(record.metadata),
-        }
-        for record in history_records
+    task_id = session.context.task_id if (session and session.context) else None
+    durable_history = await _resume_assembler.assemble_resume_history(
+        project_id=session.project_id,
+        session_id=session_id,
+        task_id=task_id,
+        conversation_store=conversations,
+        checkpoint_store=checkpoints,
+        task_store=tasks,
     )
 
     await stack.orchestrator.set_execution_target(
@@ -2922,6 +2918,7 @@ async def front_agent_request(
         plan_service=PlanService(plan_store=plans, task_store=tasks),
         decision_service=_decision_service,
         agent_run_service=_agent_run_service,
+        approval_store=pending_approvals,
     )
     front_agent = FrontAgent(control_plane=control_plane)
 
@@ -3001,7 +2998,16 @@ async def complete_agent_run(
     """Record terminal completion of an AgentRun with machine-readable AgentWorkResult."""
     await _initialize()
     try:
-        work_res = AgentWorkResult.from_dict(result)
+        # Mark client/external-supplied execution evidence as untrusted
+        # so external MCP callers cannot forge SYSTEM_VERIFIED_EXECUTION
+        cleaned_result = dict(result)
+        meta = dict(cleaned_result.get("metadata", {})) if isinstance(cleaned_result.get("metadata"), dict) else {}
+        ev = dict(meta.get("execution_evidence", {})) if isinstance(meta.get("execution_evidence"), dict) else {}
+        ev["untrusted_client_submission"] = True
+        meta["execution_evidence"] = ev
+        cleaned_result["metadata"] = meta
+
+        work_res = AgentWorkResult.from_dict(cleaned_result)
         completed = await _agent_run_service.complete_run(run_id, work_res)
 
         # Also emit a conversation handoff projection message for visibility
@@ -3101,6 +3107,7 @@ async def get_agent_handoff_context(
     target_role: str = "backend_coder",
     plan_id: str | None = None,
     step_id: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, object]:
     """Retrieve prioritized, bounded handoff context from previous agents for the incoming agent."""
     await _initialize()
@@ -3109,12 +3116,31 @@ async def get_agent_handoff_context(
     except ValueError:
         role = AgentRole.BACKEND_CODER
 
-    ctx = await _handoff_context_builder.build_context(
-        task_id=task_id,
-        target_role=role,
-        plan_id=plan_id,
-        step_id=step_id,
-    )
+    project = await _resolve_project(project_id)
+    if not project:
+        return {"status": "error", "error": "Active project could not be resolved."}
+
+    task = await tasks.get(task_id)
+    if task:
+        if task.project_id != project.project_id:
+            return {"status": "error", "error": "Task not found in active project scope."}
+    else:
+        task_runs = await agent_runs.list_for_task(task_id)
+        matching_runs = [r for r in task_runs if r.project_id == project.project_id]
+        if not matching_runs:
+            return {"status": "error", "error": "Task not found in active project scope."}
+
+    try:
+        ctx = await _handoff_context_builder.build_context(
+            project_id=project.project_id,
+            task_id=task_id,
+            target_role=role,
+            plan_id=plan_id,
+            step_id=step_id,
+        )
+    except ValueError:
+        return {"status": "error", "error": "Project scope validation failed."}
+
     return {
         "status": "ok",
         "handoff_context": ctx.to_dict(),
@@ -3310,6 +3336,67 @@ async def submit_pr_review(
         "html_url": result.get("html_url"),
         "message": f"Successfully submitted {event.upper()} review on PR #{pull_number}.",
     }
+
+
+@mcp.tool()
+async def package_targeted_error(
+    file_path: str,
+    symbol_name: str | None = None,
+    line_number: int | None = None,
+    error_description: str = "",
+    context_lines: int = 40,
+) -> dict[str, object]:
+    """Surgically package minimal, safe error context for a specific file, function or line to paste into Gemini Pro Web."""
+    from tools.error_context_packager import package_targeted_error as _pkg_targeted
+
+    try:
+        md = _pkg_targeted(
+            file_path=file_path,
+            symbol_name=symbol_name,
+            line_number=line_number,
+            error_description=error_description,
+            context_lines=context_lines,
+            workspace_root=ROOT,
+        )
+        return {
+            "status": "ok",
+            "file_path": file_path,
+            "char_count": len(md),
+            "error_context_markdown": md,
+        }
+    except (ValueError, BridgeError, OSError, RuntimeError, FileNotFoundError) as ex:
+        return {
+            "status": "error",
+            "message": str(ex),
+        }
+
+
+@mcp.tool()
+async def package_last_test_failure(
+    test_output: str | None = None,
+    log_file: str | None = None,
+    context_lines: int = 40,
+) -> dict[str, object]:
+    """Parse the most recent test failure and surgically package its context to paste into Gemini Pro Web."""
+    from tools.error_context_packager import package_last_test_failure as _pkg_test
+
+    try:
+        md = _pkg_test(
+            test_output=test_output,
+            log_file=log_file,
+            context_lines=context_lines,
+            workspace_root=ROOT,
+        )
+        return {
+            "status": "ok",
+            "char_count": len(md),
+            "error_context_markdown": md,
+        }
+    except (ValueError, BridgeError, OSError, RuntimeError, FileNotFoundError) as ex:
+        return {
+            "status": "error",
+            "message": str(ex),
+        }
 
 
 # ─── MCP Prompt Templates (Registered for Slash Commands in IDE) ─────────────
