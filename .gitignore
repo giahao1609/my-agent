@@ -42,6 +42,8 @@ logs/
 *.db-wal
 *.db-shm
 data/*.db
+data/*.key
+*.key
 
 # Coverage reports
 coverage.json

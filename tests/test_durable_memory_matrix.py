@@ -1000,9 +1000,38 @@ def test_27_no_automatic_context_builder_injection() -> None:
 
 
 def test_28_no_user_model_side_effect() -> None:
-    """Verify PREFERENCE memory is merely a MemoryRecord and does not instantiate UserModel."""
+    """Verify PREFERENCE memory is merely a MemoryRecord and does not instantiate UserModel.
+
+    Verified via an isolated Python subprocess to ensure zero pollution from
+    sibling test modules in the same pytest runner process.
+    """
+    import subprocess
     import sys
+
+    # In-process structural check
     rec = _make_record("User preference", memory_type=MemoryType.PREFERENCE)
     assert isinstance(rec, MemoryRecord)
-    assert "core.user_model" not in sys.modules
     assert not hasattr(rec, "user_model")
+
+    # Isolated subprocess check verifying Phase 04 memory pipeline does not import core.user_model
+    script = """
+import sys
+from core.memory import MemoryRecord, MemoryType
+rec = MemoryRecord(
+    memory_id="test_pref",
+    content="User preference",
+    memory_type=MemoryType.PREFERENCE,
+)
+assert isinstance(rec, MemoryRecord)
+assert "core.user_model" not in sys.modules, "MemoryRecord must not import core.user_model"
+assert not hasattr(rec, "user_model"), "MemoryRecord must not have user_model attribute"
+
+from core.durable_memory_service import DurableMemoryService
+assert "core.user_model" not in sys.modules, "DurableMemoryService must not import core.user_model"
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"Subprocess guardrail failed:\n{result.stderr}"

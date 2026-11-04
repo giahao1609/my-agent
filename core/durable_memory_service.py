@@ -39,16 +39,16 @@ Design constraints honoured:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any
 
 from core.memory import (
     MemoryLevel,
     MemoryRecord,
     MemoryStatus,
     MemoryType,
-    are_canonically_equivalent,
 )
 from persistence.sqlite_memory_store import SQLiteMemoryStore
 
@@ -194,8 +194,6 @@ class DurableMemoryService:
         if not records:
             return ()
 
-        persisted_ids: list[str] = []
-
         for record in records:
             if record.project_id == "__global__":
                 raise ValueError(
@@ -204,61 +202,9 @@ class DurableMemoryService:
                     "scope='global' for canonical global memories."
                 )
 
-            # Idempotency check: verify if record with this memory_id already exists.
-            existing_by_id = await self._store.get_by_id(record.memory_id)
-            if existing_by_id is not None:
-                if are_canonically_equivalent(existing_by_id, record):
-                    # CASE A: same ID + identical canonical semantics -> idempotent success.
-                    persisted_ids.append(record.memory_id)
-                    continue
-                # CASE B: same ID + different canonical semantics without explicit replacement.
-                # Silent overwrite forbidden -> reject/conflict.
-                raise ValueError(
-                    f"Conflict: memory record '{record.memory_id}' already exists with different "
-                    "canonical semantics. Silent overwrite is forbidden; explicit replacement/supersede required."
-                )
-
-            logical_key: str | None = None
-            if isinstance(record.metadata.get("logical_key"), str):
-                lk = record.metadata["logical_key"].strip()
-                if lk:
-                    logical_key = lk
-
-            if resolve_conflicts and logical_key and record.project_id:
-                # Composite conflict identity: subject + scope + type + logical_key.
-                existing = await self._store.get_by_conflict_identity(
-                    project_id=record.project_id,
-                    logical_key=logical_key,
-                    subject=record.subject,
-                    scope=record.scope,
-                    memory_type=record.memory_type,
-                    status_filter=MemoryStatus.ACTIVE,
-                )
-
-                if existing:
-                    target = existing[0]
-
-                    if target.memory_id == record.memory_id:
-                        # Same ID re-written: check equivalence.
-                        if are_canonically_equivalent(target, record):
-                            persisted_ids.append(record.memory_id)
-                            continue
-                        raise ValueError(
-                            f"Conflict: memory record '{record.memory_id}' already exists with different "
-                            "canonical semantics. Silent overwrite is forbidden; explicit replacement/supersede required."
-                        )
-
-                    # Build superseding record referencing the old one.
-                    superseding = _rebuild_with_supersedes(record, target.memory_id)
-                    await self._store.supersede(target.memory_id, superseding)
-                    persisted_ids.append(superseding.memory_id)
-                    continue
-
-            # No conflict path: plain write.
-            await self._store.add_many((record,))
-            persisted_ids.append(record.memory_id)
-
-        return tuple(persisted_ids)
+        return await self._store.write_records_atomic(
+            tuple(records), resolve_conflicts=resolve_conflicts
+        )
 
     # ------------------------------------------------------------------
     # Retrieve
@@ -349,22 +295,72 @@ class DurableMemoryService:
             for m in project_matches[:limit]
         )
 
+    async def retrieve_global(
+        self,
+        query: str = "",
+        *,
+        limit: int = 10,
+        status_filter: MemoryStatus | None = MemoryStatus.ACTIVE,
+        tier_filter: MemoryLevel | None = None,
+        memory_type_filter: MemoryType | None = None,
+        min_importance: float = 0.0,
+    ) -> tuple[MemoryMatch, ...]:
+        """Retrieve purely global memory records (project_id is None / global scope)."""
+        matches = await self._store.retrieve_scored(
+            None,
+            query,
+            limit=limit,
+            status_filter=status_filter,
+            tier_filter=tier_filter,
+            memory_type_filter=memory_type_filter,
+            min_importance=min_importance,
+        )
+        return tuple(
+            MemoryMatch(
+                record=m.record,
+                score=m.score,
+                reasons=m.reasons + ("global_scope",),
+            )
+            for m in matches
+        )
+
+    async def get_by_id(self, memory_id: str) -> MemoryRecord | None:
+        """Fetch a single record by memory_id, or None if not found."""
+        return await self._store.get_by_id(memory_id)
+
     # ------------------------------------------------------------------
     # Archive
     # ------------------------------------------------------------------
 
     async def archive(
         self,
-        project_id: str,
+        project_id: str | None,
         memory_id: str,
     ) -> None:
         """Explicitly transition a memory record to ARCHIVED status.
 
-        ARCHIVED records are preserved for audit but excluded from active
-        retrieval (status_filter=ACTIVE is the default in retrieve()).
+        Supports both project-scoped records (project_id is str) and
+        global records (project_id is None), enforcing project isolation.
         """
+        target = await self._store.get_by_id(memory_id)
+        if target is None:
+            raise KeyError(f"Memory record '{memory_id}' not found.")
+
+        if project_id is not None:
+            if target.project_id is not None and target.project_id != project_id:
+                raise PermissionError(
+                    f"Project isolation violation: cannot archive record '{memory_id}' belonging to "
+                    f"project '{target.project_id}' from project '{project_id}'."
+                )
+        else:
+            if target.project_id is not None:
+                raise PermissionError(
+                    f"Project isolation violation: cannot archive project-scoped record '{memory_id}' "
+                    f"belonging to project '{target.project_id}' with global scope (project_id=None)."
+                )
+
         updated_at = datetime.now(UTC).isoformat()
-        await self._store._archive_record(project_id, memory_id, updated_at)  # noqa: SLF001
+        await self._store._archive_record(project_id, memory_id, updated_at)
 
     # ------------------------------------------------------------------
     # Consolidate and persist (explicit durable path)
@@ -413,11 +409,11 @@ def _rebuild_with_supersedes(
     if record.supersedes == old_memory_id:
         return record
 
-    new_id = f"mem-{uuid.uuid4().hex}"
+    rec_id = record.memory_id if record.memory_id else f"mem-{uuid.uuid4().hex}"
     meta = dict(record.metadata)
 
     return MemoryRecord(
-        memory_id=new_id,
+        memory_id=rec_id,
         content=record.content,
         project_id=record.project_id,
         memory_type=record.memory_type,
