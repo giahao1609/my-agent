@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 import json
 from pathlib import Path
 from typing import Any, Sequence
@@ -57,6 +58,29 @@ from core.prompt_rewriter import PromptRewriter
 from core.durable_memory_service import DurableMemoryService
 from core.memory_consolidation import MemoryConsolidator
 from persistence.sqlite_memory_store import SQLiteMemoryStore
+from core.memory import MemoryStatus
+from core.user_model import (
+    EffectiveUserProfile,
+    PreferenceCategory,
+    PreferenceItem,
+    PreferenceSourceType,
+    PreferenceSpec,
+    ProvenanceStatus,
+    ServerBoundaryToken,
+    TrustedProvenanceAuthority,
+    normalize_preference_category,
+    normalize_preference_source_type,
+)
+from core.user_model_engine import (
+    DEFAULT_USER_ID,
+    InvalidPreferenceSourceError,
+    PersistenceContractBlockedError,
+    SecurityPolicyViolationError,
+    TruncatedRetrievalError,
+    UntrustedProvenanceError,
+    UserModelEngine,
+    UserModelEngineError,
+)
 from core.security_scanner import SecurityScannerRegistry
 from core.test_runner import TestRunnerRegistry
 from core.verification_gate_coordinator import VerificationGateCoordinator
@@ -117,6 +141,7 @@ _resume_assembler = ResumeAssembler(
 )
 memory_store = SQLiteMemoryStore(DB_PATH)
 _memory_service = DurableMemoryService(memory_store)
+_user_model_engine = UserModelEngine(_memory_service, store=memory_store)
 
 
 
@@ -1639,6 +1664,263 @@ async def search_docs(
     }
 
 
+# ─── UserModel & Preference Specialization Tools (Phase 05D) ─────────────────
+
+
+@mcp.tool()
+async def get_user_profile(
+    project_id: str | None = None,
+    user_id: str = "default_user",
+    exclude_unverified: bool = True,
+) -> dict[str, object]:
+    """Retrieve effective user profile and active preferences with provenance verification."""
+    await _initialize()
+    target_project_id = project_id
+    if target_project_id is None:
+        active = await projects.get_active()
+        target_project_id = active.project_id if active else None
+
+    try:
+        profile = await _user_model_engine.get_effective_profile(
+            user_id=user_id,
+            project_id=target_project_id,
+            exclude_unverified=exclude_unverified,
+        )
+        return {
+            "status": "ok",
+            "profile": {
+                "user_id": profile.user_id,
+                "project_id": profile.project_id,
+                "active_preferences_count": len(profile.active_preferences),
+                "active_preferences": [
+                    {
+                        "preference_id": item.preference_id,
+                        "logical_key": item.logical_key,
+                        "category": item.category.value,
+                        "content": item.content,
+                        "project_id": item.project_id,
+                        "scope": item.scope,
+                        "source_type": item.source_type.value,
+                        "confidence": item.confidence,
+                        "importance": item.importance,
+                        "provenance_status": item.provenance_status.value,
+                        "status": item.status.value,
+                        "created_at": item.created_at.isoformat(),
+                    }
+                    for item in profile.active_preferences
+                ],
+                "categorized_preferences": {
+                    cat: [
+                        {
+                            "preference_id": item.preference_id,
+                            "logical_key": item.logical_key,
+                            "content": item.content,
+                            "scope": item.scope,
+                            "importance": item.importance,
+                        }
+                        for item in items
+                    ]
+                    for cat, items in profile.categorized_preferences.items()
+                },
+                "resolution_reasons": dict(profile.resolution_reasons),
+                "as_of": datetime.now(UTC).isoformat(),
+            },
+        }
+    except TruncatedRetrievalError as ex:
+        return {
+            "status": "error",
+            "error_type": "TruncatedRetrievalError",
+            "message": str(ex),
+        }
+    except Exception as ex:
+        return {
+            "status": "error",
+            "error_type": type(ex).__name__,
+            "message": str(ex),
+        }
+
+
+@mcp.tool()
+async def list_user_preferences(
+    project_id: str | None = None,
+    category: str | None = None,
+    status: str = "active",
+    source_type: str | None = None,
+    include_global: bool = True,
+    limit: int = 100,
+) -> dict[str, object]:
+    """List stored preferences matching criteria across active project and global scope."""
+    await _initialize()
+    target_project_id = project_id
+    if target_project_id is None:
+        active = await projects.get_active()
+        target_project_id = active.project_id if active else None
+
+    cat_enum = None
+    if category:
+        try:
+            cat_enum = normalize_preference_category(category)
+        except ValueError as ex:
+            return {"status": "error", "message": f"Invalid category: {ex}"}
+
+    src_enum = None
+    if source_type:
+        try:
+            src_enum = normalize_preference_source_type(source_type)
+        except ValueError as ex:
+            return {"status": "error", "message": f"Invalid source_type: {ex}"}
+
+    status_enum = None
+    if status and status.lower() != "all":
+        try:
+            status_enum = MemoryStatus(status.lower())
+        except ValueError:
+            return {"status": "error", "message": f"Invalid status: {status}"}
+
+    try:
+        items = await _user_model_engine.list_preferences(
+            project_id=target_project_id,
+            category=cat_enum,
+            status=status_enum,
+            source_type=src_enum,
+            include_global=include_global,
+            limit=limit,
+        )
+        return {
+            "status": "ok",
+            "count": len(items),
+            "preferences": [
+                {
+                    "preference_id": item.preference_id,
+                    "logical_key": item.logical_key,
+                    "category": item.category.value,
+                    "content": item.content,
+                    "project_id": item.project_id,
+                    "scope": item.scope,
+                    "source_type": item.source_type.value,
+                    "confidence": item.confidence,
+                    "importance": item.importance,
+                    "provenance_status": item.provenance_status.value,
+                    "status": item.status.value,
+                    "created_at": item.created_at.isoformat(),
+                }
+                for item in items
+            ],
+        }
+    except Exception as ex:
+        return {
+            "status": "error",
+            "error_type": type(ex).__name__,
+            "message": str(ex),
+        }
+
+
+@mcp.tool()
+async def set_user_preference(
+    logical_key: str,
+    content: str,
+    category: str = "unclassified",
+    project_id: str | None = None,
+    scope: str = "project",
+    confidence: float = 1.0,
+    importance: float = 0.5,
+) -> dict[str, object]:
+    """Store an explicit user preference with atomic Trusted Provenance attestation."""
+    await _initialize()
+    target_project_id = project_id
+    if target_project_id is None and scope != "global":
+        active = await projects.get_active()
+        target_project_id = active.project_id if active else None
+
+    if scope == "global":
+        target_project_id = None
+
+    try:
+        cat_enum = normalize_preference_category(category)
+    except ValueError as ex:
+        return {"status": "error", "message": f"Invalid category: {ex}"}
+
+    try:
+        token = TrustedProvenanceAuthority.issue_token(issuer="houhou_front_agent")
+        spec = PreferenceSpec(
+            logical_key=logical_key,
+            content=content,
+            category=cat_enum,
+            project_id=target_project_id,
+            scope=scope,
+            confidence=confidence,
+            importance=importance,
+            source_type=PreferenceSourceType.EXPLICIT_USER,
+        )
+        item = await _user_model_engine.set_explicit_preference(
+            spec=spec,
+            boundary_token=token,
+        )
+        return {
+            "status": "ok",
+            "preference": {
+                "preference_id": item.preference_id,
+                "logical_key": item.logical_key,
+                "category": item.category.value,
+                "content": item.content,
+                "project_id": item.project_id,
+                "scope": item.scope,
+                "source_type": item.source_type.value,
+                "provenance_status": item.provenance_status.value,
+                "status": item.status.value,
+            },
+        }
+    except (SecurityPolicyViolationError, InvalidPreferenceSourceError, UntrustedProvenanceError) as ex:
+        return {
+            "status": "error",
+            "error_type": type(ex).__name__,
+            "message": str(ex),
+        }
+    except Exception as ex:
+        return {
+            "status": "error",
+            "error_type": type(ex).__name__,
+            "message": str(ex),
+        }
+
+
+@mcp.tool()
+async def retract_user_preference(
+    preference_id: str,
+    project_id: str | None = None,
+) -> dict[str, object]:
+    """Retract a preference by transitioning it to ARCHIVED status (soft tombstone)."""
+    await _initialize()
+    target_project_id = project_id
+    if target_project_id is None:
+        active = await projects.get_active()
+        target_project_id = active.project_id if active else None
+
+    try:
+        item = await _user_model_engine.retract_preference(
+            preference_id=preference_id,
+            project_id=target_project_id,
+        )
+        return {
+            "status": "ok",
+            "retracted_preference_id": item.preference_id,
+            "logical_key": item.logical_key,
+            "preference_status": item.status.value,
+        }
+    except (KeyError, PermissionError, ValueError) as ex:
+        return {
+            "status": "error",
+            "error_type": type(ex).__name__,
+            "message": str(ex),
+        }
+    except Exception as ex:
+        return {
+            "status": "error",
+            "error_type": type(ex).__name__,
+            "message": str(ex),
+        }
+
+
 @mcp.tool()
 async def evaluate_execution(
     task_id: str,
@@ -2919,8 +3201,12 @@ async def front_agent_request(
         decision_service=_decision_service,
         agent_run_service=_agent_run_service,
         approval_store=pending_approvals,
+        user_model_engine=_user_model_engine,
     )
-    front_agent = FrontAgent(control_plane=control_plane)
+    front_agent = FrontAgent(
+        control_plane=control_plane,
+        user_model_engine=_user_model_engine,
+    )
 
     req = FrontAgentRequest(
         user_input=user_input,
@@ -3347,6 +3633,7 @@ async def package_targeted_error(
     context_lines: int = 40,
 ) -> dict[str, object]:
     """Surgically package minimal, safe error context for a specific file, function or line to paste into Gemini Pro Web."""
+    from core.context_disclosure import BridgeError
     from tools.error_context_packager import package_targeted_error as _pkg_targeted
 
     try:
@@ -3378,6 +3665,7 @@ async def package_last_test_failure(
     context_lines: int = 40,
 ) -> dict[str, object]:
     """Parse the most recent test failure and surgically package its context to paste into Gemini Pro Web."""
+    from core.context_disclosure import BridgeError
     from tools.error_context_packager import package_last_test_failure as _pkg_test
 
     try:

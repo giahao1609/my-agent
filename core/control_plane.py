@@ -1,31 +1,28 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from .agent_role import AgentRole
+if TYPE_CHECKING:
+    from .user_model_engine import UserModelEngine
+
+from .agent_handoff_context import AgentHandoffContextBuilder
 from .agent_run_service import AgentRunService
-from .agent_handoff_context import AgentHandoffContext, AgentHandoffContextBuilder
-from .agent_work_result import AgentWorkResult
-from .context import ExecutionContext
-from .decision import DecisionOption, DecisionRecord, DecisionSeverity, DecisionState
+from .decision import DecisionOption, DecisionRecord, DecisionSeverity
 from .decision_service import DecisionService
 from .front_agent import (
     FrontAgentProgress,
     FrontAgentProgressStep,
     FrontAgentRequest,
     FrontAgentResultSummary,
-    PresentationLevel,
     ResponseKind,
 )
-from .handoff_contracts import DecisionRequiredResult
-from .plan import PlanRecord, PlanState, PlanStepRecord, PlanStepState
+from .plan import PlanRecord, PlanStepState
 from .plan_service import PlanService
 from .plan_step_execution_coordinator import PlanStepExecutionCoordinator
 from .plan_store import PlanStore
 from .planning_coordinator import PlanningCoordinator
 from .specialist_execution import (
-    SpecialistExecutionRequest,
     SpecialistExecutionResult,
     SpecialistRouter,
 )
@@ -94,6 +91,7 @@ class MyAgentControlPlane:
         execution_coordinator: PlanStepExecutionCoordinator | None = None,
         specialist_router: SpecialistRouter | None = None,
         approval_store: PendingApprovalStore | None = None,
+        user_model_engine: UserModelEngine | None = None,
     ) -> None:
         self._task_store = task_store
         self._task_service = task_service
@@ -108,6 +106,11 @@ class MyAgentControlPlane:
         # Durable approval store — defaults to in-memory for backwards compat.
         # Inject SqlitePendingApprovalStore in production for restart-survival.
         self._approval_store: PendingApprovalStore = approval_store or InMemoryPendingApprovalStore()
+        self._user_model_engine = user_model_engine
+
+    @property
+    def user_model_engine(self) -> UserModelEngine | None:
+        return self._user_model_engine
 
     async def submit_user_request(
         self,
