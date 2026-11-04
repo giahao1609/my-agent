@@ -53,6 +53,7 @@ from core.ui_design_style_engine import (
     UiDesignStyleEngine,
     DesignAntiPatternDetector,
 )
+from core.ui_remediation_generator import UiRemediationGenerator
 from core.design_md_generator import DesignMdGenerator
 from core.prompt_rewriter import PromptRewriter
 from core.durable_memory_service import DurableMemoryService
@@ -150,6 +151,7 @@ _prompt_defense = PromptInjectionDefense()
 _red_team_orchestrator = RedTeamOrchestrator()
 _ui_design_engine = UiDesignStyleEngine()
 _ui_anti_pattern_detector = DesignAntiPatternDetector()
+_ui_remediation_generator = UiRemediationGenerator(_ui_design_engine)
 _design_md_generator = DesignMdGenerator()
 _prompt_rewriter = PromptRewriter()
 _memory_consolidator = MemoryConsolidator()
@@ -1292,9 +1294,14 @@ async def generate_ui_design_profile(
     sector: str = "saas_b2b",
     audience: str = "general",
     mood_keywords: list[str] | None = None,
+    surface_mode: str = "earn",
+    layout_paradigm: str | None = None,
     workspace_path: str | None = None,
 ) -> dict[str, object]:
     """Generate an opinionated, creative UI design style profile and persist DESIGN contract.
+
+    Supports Surface Modes (earn, persuade, operate, read) and Spatial Layout Paradigms
+    (bento_asymmetric, master_detail, split_hero, feed_stream).
 
     Enforces the Zero-Pollution Policy: The contract file is strictly stored inside MyAgent's
     internal repository (data/designs/), never polluting the user's project workspace.
@@ -1304,6 +1311,8 @@ async def generate_ui_design_profile(
         sector=sector,
         audience=audience,
         mood_keywords=mood_keywords or [],
+        surface_mode=surface_mode,
+        layout_paradigm=layout_paradigm,
     )
     profile = _ui_design_engine.generate_style_profile(ctx)
 
@@ -1329,13 +1338,43 @@ async def generate_ui_design_profile(
 async def audit_ui_design(
     code: str,
 ) -> dict[str, object]:
-    """Audit UI code against 12 anti-pattern rules to detect generic AI aesthetic signatures.
+    """Audit UI code against 35 anti-pattern & mechanical rules to detect generic AI aesthetic signatures and robotic formulaic layouts.
 
     Returns originality score (0.0-1.0), verdict (ORIGINAL, ACCEPTABLE, GENERIC, AI_SLOP),
     penalty total, and detected anti-pattern violations with code snippets.
     """
     score = _ui_anti_pattern_detector.score_originality(code)
     return score.to_dict()
+
+
+@mcp.tool()
+async def generate_ui_remediation_prompt(
+    code: str,
+    sector: str = "edtech_ai",
+    surface_mode: str = "earn",
+    layout_paradigm: str | None = None,
+    dial: str = "diversify",
+    project_name: str = "Project",
+    target_file: str | None = None,
+    mood_keywords: list[str] | None = None,
+) -> dict[str, object]:
+    """Audit UI code and generate an authoritative, load-bearing LLM prompt to refactor it.
+
+    Detects 35 anti-patterns (WCAG accessibility, touch targets, AI-slop signatures,
+    symmetrical card clones, missing living states), binds to target sector archetype
+    and surface mode (earn/persuade/operate/read), and applies design dials (diversify/harden/polish/bolder/quieter).
+    """
+    result = _ui_remediation_generator.generate(
+        code=code,
+        sector=sector,
+        surface_mode=surface_mode,
+        layout_paradigm=layout_paradigm,
+        dial=dial,
+        project_name=project_name,
+        target_file=target_file,
+        mood_keywords=mood_keywords or [],
+    )
+    return result.to_dict()
 
 
 @mcp.tool()
