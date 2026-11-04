@@ -23,6 +23,7 @@ class HandoffRequest:
     target_role: AgentRole
     task_id: str
     step_id: str | None = None
+    project_id: str | None = None
     payload: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     handoff_id: str = field(default_factory=lambda: f"handoff-{uuid4().hex[:8]}")
@@ -35,6 +36,7 @@ class HandoffRequest:
             "target_role": self.target_role.value,
             "task_id": self.task_id,
             "step_id": self.step_id,
+            "project_id": self.project_id,
             "payload": self.payload,
             "reason": self.reason,
             "timestamp": self.timestamp,
@@ -49,6 +51,7 @@ class HandoffDecision:
     target_role: AgentRole
     task_id: str
     sanitized_payload: dict[str, Any]
+    project_id: str | None = None
     reasons: tuple[str, ...] = field(default_factory=tuple)
     guardrail_results: dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
@@ -60,6 +63,7 @@ class HandoffDecision:
             "source_role": self.source_role.value,
             "target_role": self.target_role.value,
             "task_id": self.task_id,
+            "project_id": self.project_id,
             "sanitized_payload": self.sanitized_payload,
             "reasons": list(self.reasons),
             "guardrail_results": self.guardrail_results,
@@ -273,10 +277,18 @@ class HandoffGuardrailEngine:
 
 
 class _HandoffHistoryStore(Protocol):
-    """Minimal async protocol for durable handoff history persistence."""
+    """Protocol for durable handoff history persistence."""
     async def save(self, decision: dict[str, Any]) -> None: ...
+    def save_sync(self, decision: dict[str, Any]) -> None: ...
     async def list_by_task(self, task_id: str) -> list[dict[str, Any]]: ...
+    async def list_by_project(self, project_id: str) -> list[dict[str, Any]]: ...
     async def list_stale(self, accepted_before_timestamp: float) -> list[dict[str, Any]]: ...
+    def list_history(
+        self,
+        *,
+        task_id: str | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]: ...
 
 
 class HandoffCoordinator:
@@ -299,6 +311,8 @@ class HandoffCoordinator:
         step_id: str | None = None,
         payload: dict[str, Any] | None = None,
         reason: str = "",
+        *,
+        project_id: str | None = None,
     ) -> HandoffDecision:
         src = AgentRole(source_role) if isinstance(source_role, str) else source_role
         tgt = AgentRole(target_role) if isinstance(target_role, str) else target_role
@@ -308,6 +322,7 @@ class HandoffCoordinator:
             target_role=tgt,
             task_id=task_id,
             step_id=step_id,
+            project_id=project_id,
             payload=payload or {},
             reason=reason,
         )
@@ -320,33 +335,54 @@ class HandoffCoordinator:
             source_role=src,
             target_role=tgt,
             task_id=task_id,
+            project_id=project_id,
             sanitized_payload=sanitized_payload,
-            reasons=tuple(reasons),
+            reasons=tuple(reasons) if reasons else ((req.reason,) if req.reason else ()),
             guardrail_results=guardrails,
         )
 
         self._history.append(decision)
-        # Persist durably if a store is wired in (fire-and-forget in sync context)
+        # Persist durably if a store is wired in (synchronous authoritative save preferred)
         if self._history_store is not None:
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self._history_store.save(decision.to_dict()))
-                else:
-                    loop.run_until_complete(self._history_store.save(decision.to_dict()))
-            except Exception:
-                pass  # Never let persistence failure break handoff logic
+            if hasattr(self._history_store, "save_sync"):
+                self._history_store.save_sync(decision.to_dict())
+            else:
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(self._history_store.save(decision.to_dict()))
+                    else:
+                        loop.run_until_complete(self._history_store.save(decision.to_dict()))
+                except Exception:
+                    pass
         return decision
 
     def get_allowed_targets(self, role: AgentRole | str) -> list[str]:
         r = AgentRole(role) if isinstance(role, str) else role
         return [target.value for target in HandoffTransitionMatrix.get_allowed_targets(r)]
 
-    def get_handoff_history(self, task_id: str | None = None) -> list[dict[str, Any]]:
+    def get_handoff_history(
+        self,
+        task_id: str | None = None,
+        *,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if self._history_store is not None:
+            if hasattr(self._history_store, "list_history"):
+                return self._history_store.list_history(task_id=task_id, project_id=project_id)
+            elif hasattr(self._history_store, "list_all_sync"):
+                results = self._history_store.list_all_sync()
+            else:
+                results = []
+        else:
+            results = [d.to_dict() for d in self._history]
+
+        if project_id is not None:
+            results = [r for r in results if r.get("project_id") == project_id]
         if task_id is not None:
-            return [d.to_dict() for d in self._history if d.task_id == task_id]
-        return [d.to_dict() for d in self._history]
+            results = [r for r in results if r.get("task_id") == task_id]
+        return results
 
     def get_stale_handoffs(
         self,

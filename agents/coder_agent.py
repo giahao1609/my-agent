@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
+from typing import Any
 
 from core.context import ExecutionContext
 from core.events import AgentEvent, EventType
@@ -11,8 +11,14 @@ from core.orchestrator import Orchestrator
 
 
 class CoderAgent:
-    def __init__(self, orchestrator: Orchestrator) -> None:
+    def __init__(
+        self,
+        orchestrator: Orchestrator,
+        *,
+        approval_store: Any | None = None,
+    ) -> None:
         self._orchestrator = orchestrator
+        self._approval_store = approval_store
         self._pending_approvals: dict[
             tuple[str, str],
             tuple[str, Mapping[str, object], ExecutionContext],
@@ -130,6 +136,23 @@ class CoderAgent:
                     dict(arguments),
                     session_context,
                 )
+                if self._approval_store is not None:
+                    approval_rec = {
+                        "tool_call_id": tool_call_id,
+                        "session_id": session_id,
+                        "task_id": session_context.task_id,
+                        "project_id": getattr(session_context, "project_id", None),
+                        "tool_name": tool_name,
+                        "arguments": dict(arguments),
+                        "reason": result.get("reason", ""),
+                        "risk_explanation": result.get("risk_explanation", ""),
+                        "prompt": result.get("prompt", "May MyAgent perform this sensitive action?"),
+                        "status": "PENDING",
+                    }
+                    if hasattr(self._approval_store, "save"):
+                        await self._approval_store.save(approval_rec)
+                    elif hasattr(self._approval_store, "_save_sync"):
+                        self._approval_store._save_sync(approval_rec)
 
             event_type = (
                 EventType.TOOL_CONFIRM
@@ -164,7 +187,13 @@ class CoderAgent:
         history: tuple[Mapping[str, object], ...],
         context: ExecutionContext,
     ) -> tuple[str, ...]:
-        """Rebuild unresolved approval state from durable tool history."""
+        """Rebuild unresolved approval state.
+
+        Prefers the durable approval store (scoped by session and project,
+        filtering out resolved, rejected, and expired approvals).
+        Falls back to scanning durable tool history only for backward compatibility
+        with legacy pre-hardening sessions.
+        """
         if not session_id.strip():
             raise ValueError("session_id must not be empty")
 
@@ -174,6 +203,59 @@ class CoderAgent:
             tuple[str, Mapping[str, object], ExecutionContext],
         ] = {}
 
+        # 1. Query all durable records for the session (active records and tombstones)
+        known_durable_tool_ids: set[str] = set()
+        if self._approval_store is not None:
+            records = []
+            if hasattr(self._approval_store, "_list_by_session_sync"):
+                records = self._approval_store._list_by_session_sync(
+                    session_id,
+                    active_only=False,
+                )
+            elif hasattr(self._approval_store, "list_by_session_sync"):
+                records = self._approval_store.list_by_session_sync(
+                    session_id,
+                    active_only=False,
+                )
+
+            context_project_id = getattr(context, "project_id", None)
+            for rec in records:
+                tool_call_id = rec.get("tool_call_id")
+                if not tool_call_id:
+                    continue
+                known_durable_tool_ids.add(tool_call_id)
+
+                status = rec.get("status")
+                is_exp = (
+                    self._approval_store.is_expired(rec)
+                    if hasattr(self._approval_store, "is_expired")
+                    else False
+                )
+                rec_project_id = rec.get("project_id")
+                scope_mismatch = bool(
+                    context_project_id
+                    and rec_project_id
+                    and rec_project_id != context_project_id
+                )
+
+                if status == "PENDING" and not is_exp and not scope_mismatch:
+                    name = rec.get("tool_name", "")
+                    arguments = rec.get("arguments", {})
+                    pending[tool_call_id] = (
+                        name,
+                        dict(arguments) if isinstance(arguments, Mapping) else {},
+                        session_context,
+                    )
+                else:
+                    # Durable record exists but is expired, approved, rejected, or scope mismatch.
+                    # It acts as an authoritative tombstone and MUST NOT be restored.
+                    pass
+
+        # 2. History fallback: reconstruct ONLY legacy tool_call_ids for which NO durable row exists
+        legacy_pending: dict[
+            str,
+            tuple[str, Mapping[str, object], ExecutionContext],
+        ] = {}
         for item in history:
             metadata = item.get("metadata", {})
             if not isinstance(metadata, Mapping):
@@ -182,17 +264,34 @@ class CoderAgent:
             event_type = metadata.get("event_type")
             tool_call_id = metadata.get("tool_call_id")
 
-            if (
-                not isinstance(tool_call_id, str)
-                or not tool_call_id.strip()
-            ):
+            if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+                continue
+
+            # If a durable record exists for this tool_call_id, durable store is authoritative
+            if tool_call_id in known_durable_tool_ids:
                 continue
 
             if event_type == EventType.TOOL_RESULT.value:
-                pending.pop(tool_call_id, None)
+                legacy_pending.pop(tool_call_id, None)
                 continue
 
             if event_type != EventType.TOOL_USE.value:
+                continue
+
+            # Provenance validation: only model/assistant messages can initiate tool calls
+            msg_role = metadata.get("role") or item.get("role")
+            if msg_role not in {"assistant", "model", None}:
+                continue
+
+            # Scope validation: cannot adopt tool calls with conflicting session or project metadata
+            if metadata.get("session_id") and metadata.get("session_id") != session_id:
+                continue
+            context_project_id = getattr(context, "project_id", None)
+            if (
+                context_project_id
+                and metadata.get("project_id")
+                and metadata.get("project_id") != context_project_id
+            ):
                 continue
 
             name = metadata.get("name")
@@ -215,11 +314,29 @@ class CoderAgent:
             if not isinstance(arguments, Mapping):
                 continue
 
-            pending[tool_call_id] = (
+            legacy_pending[tool_call_id] = (
                 name,
                 dict(arguments),
                 session_context,
             )
+
+        for tool_call_id, val in legacy_pending.items():
+            if tool_call_id not in known_durable_tool_ids:
+                pending[tool_call_id] = val
+                # Bring legacy approval immediately into durable store governance if store is active
+                if self._approval_store is not None and hasattr(self._approval_store, "_save_sync"):
+                    try:
+                        self._approval_store._save_sync({
+                            "tool_call_id": tool_call_id,
+                            "session_id": session_id,
+                            "project_id": getattr(context, "project_id", None),
+                            "task_id": getattr(context, "task_id", None),
+                            "tool_name": val[0],
+                            "arguments": val[1],
+                            "status": "PENDING",
+                        })
+                    except Exception:
+                        pass
 
         for key in tuple(self._pending_approvals):
             if key[0] == session_id:
@@ -246,6 +363,36 @@ class CoderAgent:
                 f"no pending approval for tool call: {tool_call_id}"
             ) from exc
 
+        # Pre-execution durable state validation, atomic claim & TTL enforcement
+        if self._approval_store is not None:
+            new_status = "APPROVED" if approved else "REJECTED"
+            note = f"Resolved with approved={approved}"
+            context_project_id = getattr(context, "project_id", None)
+            if hasattr(self._approval_store, "claim_and_resolve"):
+                await self._approval_store.claim_and_resolve(
+                    tool_call_id,
+                    status=new_status,
+                    session_id=session_id,
+                    project_id=context_project_id,
+                    note=note,
+                )
+            elif hasattr(self._approval_store, "resolve"):
+                await self._approval_store.resolve(
+                    tool_call_id,
+                    status=new_status,
+                    session_id=session_id,
+                    project_id=context_project_id,
+                    note=note,
+                )
+            elif hasattr(self._approval_store, "_resolve_sync"):
+                self._approval_store._resolve_sync(
+                    tool_call_id,
+                    status=new_status,
+                    session_id=session_id,
+                    project_id=context_project_id,
+                    note=note,
+                )
+
         if approved:
             try:
                 result = await self._orchestrator.execute_tool(
@@ -254,12 +401,21 @@ class CoderAgent:
                     context,
                     approved=True,
                 )
+                exec_success = True if (isinstance(result, dict) and result.get("status") != "error") else False
             except Exception as exc:  # noqa: BLE001
+                exec_success = False
                 result = {
                     "status": "error",
                     "error_type": type(exc).__name__,
                     "message": str(exc),
                 }
+
+            if self._approval_store is not None and hasattr(self._approval_store, "record_execution"):
+                await self._approval_store.record_execution(
+                    tool_call_id,
+                    execution_success=exec_success,
+                    result=result if isinstance(result, dict) else {},
+                )
         else:
             result = {
                 "status": "rejected",

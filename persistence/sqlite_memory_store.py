@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Sequence
 
 from core.memory import (
     MemoryLevel,
@@ -354,6 +355,18 @@ class SQLiteMemoryStore:
             base_conditions.append("importance >= ?")
             base_params.append(min_importance)
 
+        if memory_type_filter is not None:
+            base_conditions.append(
+                """(
+                    (json_valid(metadata_json) AND json_extract(metadata_json, '$.__canonical__.memory_type') IS NOT NULL
+                     AND json_extract(metadata_json, '$.__canonical__.memory_type') = ?)
+                    OR
+                    ((NOT json_valid(metadata_json) OR json_extract(metadata_json, '$.__canonical__.memory_type') IS NULL)
+                     AND kind = ?)
+                )"""
+            )
+            base_params.extend([memory_type_filter.value, memory_type_filter.value])
+
         base_where = " AND ".join(base_conditions)
         query_lower = query.strip().lower()
         query_terms = set(query_lower.split()) if query_lower else set()
@@ -400,7 +413,7 @@ class SQLiteMemoryStore:
                 ]
             else:
                 # Browse/filter mode: no lexical filter.
-                fetch_limit = min(limit * 4, 200)
+                fetch_limit = max(limit, 200) if limit > 50 else min(limit * 4, 200)
                 merged_rows = connection.execute(
                     f"""
                     SELECT *
@@ -520,6 +533,201 @@ class SQLiteMemoryStore:
                 ),
             )
 
+    async def write_record_atomic(
+        self,
+        record: MemoryRecord,
+        *,
+        resolve_conflicts: bool = True,
+    ) -> str:
+        """Atomic write of a single record within a BEGIN IMMEDIATE transaction."""
+        res = await asyncio.to_thread(
+            self._write_records_atomic_sync, (record,), resolve_conflicts
+        )
+        return res[0]
+
+    async def write_records_atomic(
+        self,
+        records: Sequence[MemoryRecord],
+        *,
+        resolve_conflicts: bool = True,
+    ) -> tuple[str, ...]:
+        """Atomic write of multiple records within a single BEGIN IMMEDIATE transaction."""
+        return await asyncio.to_thread(
+            self._write_records_atomic_sync, tuple(records), resolve_conflicts
+        )
+
+    def _write_records_atomic_sync(
+        self,
+        records: tuple[MemoryRecord, ...],
+        resolve_conflicts: bool = True,
+    ) -> tuple[str, ...]:
+        if not records:
+            return ()
+
+        for record in records:
+            if record.project_id == "__global__":
+                raise ValueError(
+                    "RESERVED_SENTINEL: project_id='__global__' is a reserved legacy sentinel "
+                    "and cannot be used for new durable writes. Use project_id=None with "
+                    "scope='global' for canonical global memories."
+                )
+
+        persisted_ids: list[str] = []
+
+        connection = sqlite3.connect(self._database_path, timeout=30.0, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+
+            for record in records:
+                # 1. Idempotency check: verify if record with this memory_id already exists
+                row = connection.execute(
+                    "SELECT * FROM memories WHERE memory_id = ?",
+                    (record.memory_id,),
+                ).fetchone()
+
+                if row is not None:
+                    existing_by_id = self._row_to_memory(row)
+                    if are_canonically_equivalent(existing_by_id, record):
+                        persisted_ids.append(record.memory_id)
+                        continue
+                    raise ValueError(
+                        f"Conflict: memory record '{record.memory_id}' already exists with different "
+                        "canonical semantics. Silent overwrite is forbidden; explicit replacement/supersede required."
+                    )
+
+                # 2. Extract logical_key
+                logical_key: str | None = None
+                if isinstance(record.metadata.get("logical_key"), str):
+                    lk = record.metadata["logical_key"].strip()
+                    if lk:
+                        logical_key = lk
+
+                # 3. Composite conflict identity check within the SAME transaction
+                if resolve_conflicts and logical_key:
+                    if record.project_id is None or record.project_id == "":
+                        rows = connection.execute(
+                            """
+                            SELECT * FROM memories
+                            WHERE (project_id = '' OR project_id IS NULL OR project_id = '__global__')
+                              AND logical_key = ?
+                              AND status = ?
+                            ORDER BY created_at DESC, rowid DESC
+                            """,
+                            (logical_key, MemoryStatus.ACTIVE.value),
+                        ).fetchall()
+                    else:
+                        rows = connection.execute(
+                            """
+                            SELECT * FROM memories
+                            WHERE project_id = ?
+                              AND logical_key = ?
+                              AND status = ?
+                            ORDER BY created_at DESC, rowid DESC
+                            """,
+                            (record.project_id, logical_key, MemoryStatus.ACTIVE.value),
+                        ).fetchall()
+
+                    candidates = [self._row_to_memory(r) for r in rows]
+                    existing = [
+                        c for c in candidates
+                        if c.subject == record.subject
+                        and c.scope == record.scope
+                        and c.memory_type == record.memory_type
+                    ]
+
+                    if existing:
+                        target = existing[0]
+
+                        if target.memory_id == record.memory_id:
+                            if are_canonically_equivalent(target, record):
+                                persisted_ids.append(record.memory_id)
+                                continue
+                            raise ValueError(
+                                f"Conflict: memory record '{record.memory_id}' already exists with different "
+                                "canonical semantics. Silent overwrite is forbidden; explicit replacement/supersede required."
+                            )
+
+                        # Reconcile all matching active records by setting them to SUPERSEDED
+                        updated_at = datetime.now(UTC).isoformat()
+                        target_ids = [e.memory_id for e in existing]
+                        placeholders = ",".join("?" for _ in target_ids)
+                        connection.execute(
+                            f"""
+                            UPDATE memories
+                            SET status = ?, metadata_json = json_patch(
+                                metadata_json,
+                                json_object('__status_updated_at', ?)
+                            )
+                            WHERE memory_id IN ({placeholders})
+                            """,
+                            (MemoryStatus.SUPERSEDED.value, updated_at, *target_ids),
+                        )
+
+                        superseding = _rebuild_with_supersedes(record, target.memory_id)
+                        connection.execute(
+                            """
+                            INSERT INTO memories (
+                                memory_id, project_id, level, kind, content,
+                                importance, metadata_json, created_at, status, logical_key
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                superseding.memory_id,
+                                superseding.project_id if superseding.project_id is not None else "",
+                                superseding.level.value,
+                                superseding.kind,
+                                superseding.content,
+                                superseding.importance,
+                                json.dumps(
+                                    self._serialize_metadata(superseding),
+                                    ensure_ascii=False,
+                                ),
+                                superseding.created_at.isoformat(),
+                                superseding.status.value,
+                                superseding.metadata.get("logical_key"),
+                            ),
+                        )
+                        persisted_ids.append(superseding.memory_id)
+                        continue
+
+                # 4. No conflict: plain insert
+                connection.execute(
+                    """
+                    INSERT INTO memories (
+                        memory_id, project_id, level, kind, content,
+                        importance, metadata_json, created_at, status, logical_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.memory_id,
+                        record.project_id if record.project_id is not None else "",
+                        record.level.value,
+                        record.kind,
+                        record.content,
+                        record.importance,
+                        json.dumps(
+                            self._serialize_metadata(record),
+                            ensure_ascii=False,
+                        ),
+                        record.created_at.isoformat(),
+                        record.status.value,
+                        record.metadata.get("logical_key"),
+                    ),
+                )
+                persisted_ids.append(record.memory_id)
+
+            connection.execute("COMMIT")
+            return tuple(persisted_ids)
+        except Exception:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            connection.close()
+
     async def get_by_logical_key(
         self,
         project_id: str | None,
@@ -603,7 +811,10 @@ class SQLiteMemoryStore:
 
     @staticmethod
     def _row_to_memory(row: sqlite3.Row) -> MemoryRecord:
-        raw_meta = json.loads(str(row["metadata_json"]))
+        try:
+            raw_meta = json.loads(str(row["metadata_json"]))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            raw_meta = {}
         canonical = raw_meta.pop("__canonical__", None) if isinstance(raw_meta, dict) else None
 
         row_keys = row.keys() if hasattr(row, "keys") else ()
@@ -708,3 +919,35 @@ class SQLiteMemoryStore:
                     (MemoryStatus.ARCHIVED.value, updated_at, memory_id, project_id),
                 )
 
+
+def _rebuild_with_supersedes(
+    record: MemoryRecord,
+    old_memory_id: str,
+) -> MemoryRecord:
+    """Return a new MemoryRecord identical to record but with supersedes set."""
+    if record.supersedes == old_memory_id:
+        return record
+
+    rec_id = record.memory_id if record.memory_id else f"mem-{uuid.uuid4().hex}"
+    meta = dict(record.metadata)
+
+    return MemoryRecord(
+        memory_id=rec_id,
+        content=record.content,
+        project_id=record.project_id,
+        memory_type=record.memory_type,
+        tier=record.tier,
+        importance=record.importance,
+        confidence=record.confidence,
+        subject=record.subject,
+        scope=record.scope,
+        source=record.source,
+        status=record.status,
+        supersedes=old_memory_id,
+        metadata=meta,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        last_accessed_at=record.last_accessed_at,
+        valid_from=record.valid_from,
+        valid_until=record.valid_until,
+    )
