@@ -819,6 +819,20 @@ class EffectiveUserProfile:
         """Convenience method returning all active CONSTRAINT preferences."""
         return self.get_by_category(PreferenceCategory.CONSTRAINT)
 
+    @property
+    def active_preferences(self) -> tuple[PreferenceItem, ...]:
+        """All active, conflict-resolved preferences."""
+        return tuple(self.preferences_by_key.values())
+
+    @property
+    def categorized_preferences(self) -> dict[str, list[PreferenceItem]]:
+        """Categorized mapping of active preferences."""
+        result: dict[str, list[PreferenceItem]] = {}
+        for item in self.preferences_by_key.values():
+            cat = item.category.value if isinstance(item.category, PreferenceCategory) else str(item.category)
+            result.setdefault(cat, []).append(item)
+        return result
+
 
 def build_effective_profile(
     items: Sequence[PreferenceItem],

@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from .user_model_engine import UserModelEngine
 
 from .agent_role import AgentRole
-from .decision import DecisionOption, DecisionRecord, DecisionState
-from .model import ModelMessage
+from .decision import DecisionRecord
 from .protocols import ModelBackend
 
 
@@ -387,9 +389,11 @@ class FrontAgent:
         self,
         control_plane: ControlPlaneInterface,
         model_backend: ModelBackend | None = None,
+        user_model_engine: UserModelEngine | None = None,
     ) -> None:
         self._control_plane = control_plane
         self._model_backend = model_backend
+        self._user_model_engine = user_model_engine
 
     async def handle_user_request(self, request: FrontAgentRequest) -> FrontAgentResponse:
         """Processes incoming user input, delegates to Control Plane facade, and formats output."""
@@ -422,16 +426,43 @@ class FrontAgent:
             approval_view=approval_view,
         )
 
+        effective_level = request.level
+        metadata: dict[str, Any] = {"agent_id": self.AGENT_ID, "role": self.ROLE.value}
+
+        # Phase 05D: Preference Awareness & Presentation Adaptivity
+        engine = self._user_model_engine or getattr(self._control_plane, "user_model_engine", None)
+        if engine and request.project_id:
+            try:
+                profile = await engine.get_effective_profile(
+                    project_id=request.project_id,
+                    user_id=getattr(request, "user_id", "default_user"),
+                )
+                metadata["user_profile"] = {
+                    "user_id": profile.user_id,
+                    "project_id": profile.project_id,
+                    "active_preferences_count": len(profile.active_preferences),
+                }
+                # If level is default NORMAL, adapt to verified preference
+                if request.level == PresentationLevel.NORMAL:
+                    pref_level = profile.get("presentation_level") or profile.get("detail_level")
+                    if pref_level:
+                        try:
+                            effective_level = PresentationLevel(pref_level.strip().lower())
+                        except ValueError:
+                            pass
+            except (KeyError, ValueError, AttributeError, OSError, RuntimeError):
+                pass
+
         return FrontAgentResponse(
             kind=kind,
             message=message,
             task_id=request.task_id or (progress.task_id if progress else None),
-            presentation_level=request.level,
+            presentation_level=effective_level,
             progress=progress,
             decision_view=decision_view,
             approval_view=approval_view,
             result_summary=result_summary,
-            metadata={"agent_id": self.AGENT_ID, "role": self.ROLE.value},
+            metadata=metadata,
         )
 
     def _ground_response_message(
