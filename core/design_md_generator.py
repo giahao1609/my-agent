@@ -106,12 +106,19 @@ class DesignMdGenerator:
         if content is None:
             return None
 
-        # Extract visual language from "**Visual Language Name**" line
-        vl_match = re.search(r"\*\*([^\*]+)\*\*", content)
+        # Extract visual language from DESIGN.md
+        vl_match = re.search(r"(?:\*\*Visual Language:\*\*\s*([^\n\r]+)|Visual Language:\s*\*\*([^\*]+)\*\*|\*\*([^\*]+)\*\*)", content)
         if not vl_match:
             return None
 
-        visual_language = vl_match.group(1).strip()
+        visual_language = (vl_match.group(1) or vl_match.group(2) or vl_match.group(3) or "").strip()
+
+        # Extract surface mode and layout paradigm if present
+        sm_match = re.search(r"\*\*Surface Mode:\*\*\s*([^\n\r]+)", content)
+        surface_mode = sm_match.group(1).strip() if sm_match else "earn"
+
+        lp_match = re.search(r"\*\*Layout Paradigm:\*\*\s*([^\n\r]+)", content)
+        layout_paradigm = lp_match.group(1).strip() if lp_match else None
 
         # Map visual language back to a representative sector
         _VL_TO_SECTOR = {
@@ -125,11 +132,16 @@ class DesignMdGenerator:
             "Kinetic Playful": "startup_consumer",
             "Warm Academic": "education",
             "Precision Dashboard": "data_analytics",
+            "Cognitive Focus & Modern Clarity": "edtech_ai",
+            "Cyber Dark & Neon Accent": "web3_crypto",
+            "Expressive Social": "social_community",
         }
         sector = _VL_TO_SECTOR.get(visual_language, fallback_sector)
 
         context = engine.analyze_context(
             description=f"Reconstructed from DESIGN.md (visual language: {visual_language})",
             sector=sector,
+            surface_mode=surface_mode,
+            layout_paradigm=layout_paradigm,
         )
         return engine.generate_style_profile(context)
