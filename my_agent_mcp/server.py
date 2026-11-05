@@ -1498,6 +1498,8 @@ async def run_whole_plan(
         test_runner_registry=_test_runner_registry,
         security_scanner_registry=_security_scanner_registry,
         verification_coordinator=_verification_gate_coordinator,
+        decision_service=_decision_service,
+        max_auto_repair_attempts=3,
     )
     summary = await coordinator.execute_whole_plan(plan_id, Path(workspace_path))
     return {
@@ -1507,7 +1509,10 @@ async def run_whole_plan(
         "steps_completed": summary.steps_completed,
         "steps_failed": summary.steps_failed,
         "steps_skipped": summary.steps_skipped,
+        "steps_auto_repaired": summary.steps_auto_repaired,
+        "rollbacks_executed": summary.rollbacks_executed,
         "review_history": summary.review_history,
+        "step_telemetry": summary.step_telemetry,
     }
 
 

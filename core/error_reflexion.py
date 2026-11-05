@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -13,6 +14,7 @@ class ErrorCategory(str, Enum):
     TYPE_ATTRIBUTE_ERROR = "type_attribute_error"
     SECURITY_VIOLATION = "security_violation"
     TIMEOUT_ERROR = "timeout_error"
+    GOAL_DRIFT = "goal_drift"
     RUNTIME_EXCEPTION = "runtime_exception"
 
 
@@ -43,6 +45,82 @@ class ReflexionDiagnosis:
             f"[{self.category.value.upper()}] at {loc} — {self.root_cause_summary} | "
             f"Fix: {self.actionable_instruction}"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RepairAttemptRecord:
+    """Historical record of an individual repair attempt in the self-healing loop."""
+
+    attempt_number: int
+    diagnosis: ReflexionDiagnosis | None
+    rejection_reasons: tuple[str, ...] = field(default_factory=tuple)
+    comments: tuple[str, ...] = field(default_factory=tuple)
+    drift_detected: bool = False
+    timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt_number": self.attempt_number,
+            "diagnosis": self.diagnosis.to_dict() if self.diagnosis else None,
+            "rejection_reasons": list(self.rejection_reasons),
+            "comments": list(self.comments),
+            "drift_detected": self.drift_detected,
+            "timestamp": self.timestamp,
+        }
+
+
+class StepRepairJournal:
+    """Reflexion memory journal tracking attempts within a single plan step.
+
+    Implements the MetaGPT Reflexion protocol to prevent circular edits and
+    repetitive failure patterns across consecutive repair attempts.
+    """
+
+    def __init__(self, step_id: str) -> None:
+        self.step_id = step_id
+        self._history: list[RepairAttemptRecord] = []
+
+    def record_attempt(
+        self,
+        attempt_number: int,
+        diagnosis: ReflexionDiagnosis | None,
+        rejection_reasons: tuple[str, ...] = (),
+        comments: tuple[str, ...] = (),
+        drift_detected: bool = False,
+    ) -> RepairAttemptRecord:
+        record = RepairAttemptRecord(
+            attempt_number=attempt_number,
+            diagnosis=diagnosis,
+            rejection_reasons=rejection_reasons,
+            comments=comments,
+            drift_detected=drift_detected,
+        )
+        self._history.append(record)
+        return record
+
+    @property
+    def history(self) -> tuple[RepairAttemptRecord, ...]:
+        return tuple(self._history)
+
+    def build_anti_looping_section(self) -> str:
+        """Constructs an anti-looping advisory from prior failed attempts."""
+        if not self._history:
+            return ""
+
+        lines = [
+            "### [Reflexion Memory & Anti-Looping Protection]",
+            "The following repair attempt(s) have already failed for this step:",
+        ]
+        for rec in self._history:
+            diag_str = rec.diagnosis.format_brief() if rec.diagnosis else "Rejection without detailed diagnosis"
+            drift_str = " [DRIFT DETECTED]" if rec.drift_detected else ""
+            lines.append(f"- Attempt #{rec.attempt_number}{drift_str}: {diag_str}")
+
+        lines.append(
+            "CRITICAL INSTRUCTION: Do NOT repeat the identical edits, syntax, or patch strategies "
+            "that failed above. Formulate a fundamentally distinct, correct solution that satisfies all gates."
+        )
+        return "\n".join(lines)
 
 
 class ErrorReflexionEngine:
@@ -97,7 +175,8 @@ class ErrorReflexionEngine:
             category = ErrorCategory.ASSERTION_FAILURE
             # Extract assertion difference if possible
             assert_lines = [
-                line.strip() for line in text.splitlines()
+                line.strip()
+                for line in text.splitlines()
                 if line.strip().startswith("assert ") or "AssertionError" in line or line.strip().startswith("E   ")
             ]
             root_cause = "Test assertion condition evaluated to False"

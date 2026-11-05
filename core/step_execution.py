@@ -2,20 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
-from uuid import uuid4
+from typing import Any
 
 from core.agent_role import AgentRole
 from core.agent_run import AgentRunRecord
 from core.agent_run_service import AgentRunService
 from core.agent_work_result import AgentWorkResult, CommandExecution, FileChange
 from core.context import ExecutionContext
-from core.events import AgentEvent, EventType
+from core.events import EventType
 from core.handoff_contracts import ImplementationResult
 from core.orchestrator import Orchestrator
-from core.session import SessionState
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,10 +103,12 @@ class CoderRuntimeStepExecutor:
         step_role: AgentRole,
         repair_hint: str = "",
         step_instruction: str = "",
+        workspace_path: Path | str | None = None,
     ) -> ImplementationResult:
-        now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        now_utc = datetime.datetime.now(datetime.UTC).isoformat()
+        effective_workspace = Path(workspace_path) if workspace_path else self._workspace_path
         context = ExecutionContext(
-            workspace_id=str(self._workspace_path),
+            workspace_id=str(effective_workspace),
             agent_id="coder",
             user_id=self._user_id,
             task_id=self._task_id,
@@ -137,7 +138,7 @@ class CoderRuntimeStepExecutor:
             worker_task = await self._worker_task_launcher(session_id)
 
         if worker_task is None:
-            finished_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            finished_utc = datetime.datetime.now(datetime.UTC).isoformat()
             if agent_run is not None and self._agent_run_service is not None:
                 await self._agent_run_service.fail_run(
                     agent_run.run_id,
@@ -180,7 +181,7 @@ class CoderRuntimeStepExecutor:
                 )
                 if unified_ctx and getattr(unified_ctx, "formatted_prompt_section", None):
                     prompt += f"\n\n{unified_ctx.formatted_prompt_section}"
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 # Degrade gracefully without blocking step execution
                 pass
         if repair_hint:
@@ -250,12 +251,12 @@ class CoderRuntimeStepExecutor:
                     worker_task.cancel()
                     try:
                         await worker_task
-                    except (asyncio.CancelledError, Exception):
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110
                         pass
                 else:
                     try:
                         await asyncio.wait_for(asyncio.shield(worker_task), timeout=2.0)
-                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                    except (TimeoutError, asyncio.CancelledError):
                         pass
 
         except Exception as exc:
@@ -268,7 +269,7 @@ class CoderRuntimeStepExecutor:
                 )
             raise
 
-        finished_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        finished_utc = datetime.datetime.now(datetime.UTC).isoformat()
         summary = (
             f"[CoderRuntimeStepExecutor] Real execution of step '{step_title}'. "
             f"Tools invoked: {len(tool_calls)}. Files modified: {len(modified_files)}."
