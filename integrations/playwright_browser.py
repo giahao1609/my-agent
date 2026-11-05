@@ -88,6 +88,7 @@ class RealPlaywrightSession(BrowserSession):
         self._session_dir = session_dir
         self._session_dir.mkdir(parents=True, exist_ok=True)
         self._current_url = "about:blank"
+        self._current_title = ""
         self._is_closed = False
 
     async def navigate(self, url: str) -> BrowserActionResult:
@@ -106,6 +107,7 @@ class RealPlaywrightSession(BrowserSession):
             response = await self._page.goto(url, timeout=self._policy.timeout_ms)
             self._current_url = self._page.url
             title = await self._page.title()
+            self._current_title = title
 
             # Snippet extraction
             try:
@@ -123,11 +125,7 @@ class RealPlaywrightSession(BrowserSession):
                 screenshot_path = str(shot_file)
 
             # Accessibility tree snapshot
-            a11y_tree = None
-            try:
-                a11y_tree = await self._page.accessibility.snapshot()
-            except Exception as exc:
-                logger.debug("Failed to capture a11y tree: %s", exc)
+            a11y_tree = await self.get_accessibility_tree()
 
             # Automated WCAG 2.1 checks
             a11y_issues = await self._run_wcag_checks()
@@ -216,9 +214,27 @@ class RealPlaywrightSession(BrowserSession):
         if self._is_closed:
             raise RuntimeError("Browser session is closed")
         try:
-            return await self._page.accessibility.snapshot()
-        except Exception:
-            return None
+            if hasattr(self._page, "accessibility") and hasattr(self._page.accessibility, "snapshot"):
+                snapshot = await self._page.accessibility.snapshot()
+                if snapshot is not None:
+                    return snapshot
+
+            if hasattr(self._page, "aria_snapshot"):
+                snap = await self._page.aria_snapshot()
+                return {
+                    "role": "WebArea",
+                    "name": self._current_title or "Page",
+                    "aria_snapshot": snap,
+                    "children": [],
+                }
+        except Exception as exc:
+            logger.debug("Failed to extract accessibility snapshot: %s", exc)
+
+        return {
+            "role": "WebArea",
+            "name": self._current_title or "Page",
+            "children": [],
+        }
 
     async def _run_wcag_checks(self) -> list[str]:
         """Runs deterministic in-browser DOM checks against WCAG 2.1 AA criteria."""

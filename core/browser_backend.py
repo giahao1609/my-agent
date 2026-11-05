@@ -16,8 +16,8 @@ class BrowserPolicy:
     headless: bool = True
 
     def is_domain_allowed(self, url: str) -> bool:
-        if not self.allowed_domains:
-            return True  # If empty, all public domains allowed unless private network check fails
+        if url.startswith(("data:", "about:")):
+            return True
 
         from urllib.parse import urlparse
         parsed = urlparse(url)
@@ -26,6 +26,9 @@ class BrowserPolicy:
         if not self.allow_private_network:
             if host in ("localhost", "127.0.0.1", "0.0.0.0") or host.startswith("192.168.") or host.startswith("10."):
                 return False
+
+        if not self.allowed_domains or "*" in self.allowed_domains:
+            return True
 
         return any(host == domain or host.endswith(f".{domain}") for domain in self.allowed_domains)
 

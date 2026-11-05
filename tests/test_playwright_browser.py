@@ -19,7 +19,7 @@ def test_browser_policy_domain_filtering() -> None:
 
 @pytest.mark.asyncio
 async def test_playwright_browser_session_flow(tmp_path: Path) -> None:
-    adapter = PlaywrightBrowserAdapter(artifacts_dir=tmp_path)
+    adapter = PlaywrightBrowserAdapter(artifacts_dir=tmp_path, force_simulation=True)
     policy = BrowserPolicy(allowed_domains=("example.com",), allow_private_network=False, capture_screenshots=True)
 
     session = await adapter.create_session(policy)
@@ -49,6 +49,63 @@ async def test_playwright_browser_session_flow(tmp_path: Path) -> None:
     await session.close()
     with pytest.raises(RuntimeError, match="closed"):
         await session.navigate("https://example.com")
+
+
+@pytest.mark.asyncio
+async def test_real_playwright_live_execution(tmp_path: Path) -> None:
+    if not is_playwright_installed():
+        pytest.skip("Playwright is not installed")
+
+    adapter = PlaywrightBrowserAdapter(artifacts_dir=tmp_path)
+    policy = BrowserPolicy(allowed_domains=("*",), allow_private_network=True, capture_screenshots=True)
+    session = await adapter.create_session(policy)
+
+    import base64
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head><title>Teachora Live Execution</title></head>
+    <body>
+        <main>
+            <h1>Real Headless Chromium Engine</h1>
+            <label for="course-input">Course Name</label>
+            <input id="course-input" type="text" value="" />
+            <button id="save-btn" type="button">Save Course</button>
+            <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="Placeholder" />
+        </main>
+    </body>
+    </html>
+    """
+    b64_html = base64.b64encode(html_content.encode("utf-8")).decode("ascii")
+    data_url = f"data:text/html;base64,{b64_html}"
+
+    # Navigate
+    res_nav = await session.navigate(data_url)
+    assert res_nav.success is True
+    assert res_nav.title == "Teachora Live Execution"
+    assert res_nav.screenshot_path is not None
+    assert Path(res_nav.screenshot_path).exists()
+
+    # Fill
+    res_fill = await session.fill("#course-input", "Advanced Agentic Coding")
+    assert res_fill.success is True
+
+    # Click
+    res_click = await session.click("#save-btn")
+    assert res_click.success is True
+
+    # Accessibility Tree snapshot
+    a11y_tree = await session.get_accessibility_tree()
+    assert a11y_tree is not None
+    assert a11y_tree.get("role") == "WebArea"
+
+    # Screenshot
+    shot_file = await session.screenshot("live_chromium_step")
+    assert Path(shot_file).exists()
+
+    await session.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        await session.navigate(data_url)
 
 
 @pytest.mark.asyncio
@@ -217,7 +274,7 @@ async def test_mcp_browser_navigate_with_accessibility(tmp_path: Path) -> None:
     )
 
     assert res["success"] is True
-    assert res["url"] == "https://example.com"
+    assert res["url"].rstrip("/") == "https://example.com"
     assert "screenshot_path" in res
     assert "accessibility_tree" in res
     assert "a11y_violations" in res

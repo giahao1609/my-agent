@@ -27,13 +27,14 @@ from integrations.playwright_browser import PlaywrightBrowserAdapter
 
 
 # ===========================================================================
-# TEST 1 — Browser mock truth
+# TEST 1 — Browser mock & real truth
 # ===========================================================================
 
 @pytest.mark.asyncio
-async def test_browser_mock_truth() -> None:
+async def test_browser_mock_truth(monkeypatch: pytest.MonkeyPatch) -> None:
     """Mock browser implementation cannot report AVAILABLE."""
-    adapter = PlaywrightBrowserAdapter()
+    monkeypatch.setattr("integrations.playwright_browser.is_playwright_installed", lambda: False)
+    adapter = PlaywrightBrowserAdapter(force_simulation=True)
     caps = await adapter.capabilities()
 
     assert len(caps) >= 3
@@ -51,7 +52,7 @@ async def test_browser_mock_truth() -> None:
         )
         assert "no playwright" in cap.evidence.lower() or "synthetic" in cap.evidence.lower() or "writes" in cap.evidence.lower() or "without browser context" in cap.evidence.lower()
 
-    # Check registry truth
+    # Check registry truth when mocked
     reg = default_capability_registry
     browser_nav = reg.get("browser_navigation")
     assert browser_nav.state is Availability.MOCKED
@@ -60,6 +61,29 @@ async def test_browser_mock_truth() -> None:
     browser_shot = reg.get("browser_screenshot")
     assert browser_shot.state is Availability.MOCKED
     assert browser_shot.available is False
+
+
+@pytest.mark.asyncio
+async def test_browser_real_truth() -> None:
+    """Real browser implementation reports AVAILABLE when playwright is installed."""
+    adapter = PlaywrightBrowserAdapter()
+    caps = await adapter.capabilities()
+
+    assert len(caps) >= 3
+    for cap in caps:
+        assert isinstance(cap, CapabilityStatus)
+        assert cap.state is Availability.AVAILABLE
+        assert cap.available is True
+        assert cap.is_mocked is False
+
+    reg = default_capability_registry
+    browser_nav = reg.get("browser_navigation")
+    assert browser_nav.state is Availability.AVAILABLE
+    assert browser_nav.available is True
+
+    browser_shot = reg.get("browser_screenshot")
+    assert browser_shot.state is Availability.AVAILABLE
+    assert browser_shot.available is True
 
 
 # ===========================================================================
@@ -232,15 +256,15 @@ def test_unknown_behavior() -> None:
 def test_evidence_inspection() -> None:
     """Registry exposes evidence supporting capability status and serializes clearly."""
     reg = default_capability_registry
-    cap = reg.get("browser_screenshot")
+    cap = reg.get("container_isolation")
 
     assert cap.is_mocked is True
-    assert "PNG" in cap.evidence
+    assert "container" in cap.evidence.lower() or "simulated" in cap.evidence.lower()
     assert cap.verification_method == "source_inspection"
     assert cap.failure_reason is not None
 
     d = cap.to_dict()
-    assert d["name"] == "browser_screenshot"
+    assert d["name"] == "container_isolation"
     assert d["status"] == "mocked"
     assert d["available"] is False
     assert d["is_mocked"] is True
@@ -294,7 +318,7 @@ async def test_real_provider_requirement() -> None:
 
     # Requiring a mocked capability raises CapabilityMockedError
     with pytest.raises(CapabilityMockedError) as exc_info:
-        reg.require("browser_navigation")
+        reg.require("container_isolation")
     assert "MOCKED" in str(exc_info.value)
     assert issubclass(CapabilityMockedError, CapabilityUnavailableError)
 
