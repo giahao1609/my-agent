@@ -12,6 +12,12 @@ if TYPE_CHECKING:
     from .status import CapabilityStatus
 
 from .error_reflexion import ErrorReflexionEngine, ReflexionDiagnosis, StepRepairJournal
+from .git_worktree import (
+    GitWorktreeManager,
+    WorktreeAbortReport,
+    WorktreeContext,
+    WorktreeMergeReport,
+)
 from .goal_drift_monitor import GoalDriftMonitor
 from .handoff_contracts import ImplementationResult, ReviewStatus
 from .plan import PlanStepState
@@ -40,6 +46,7 @@ class StepExecutor(Protocol):
     repair_hint: Non-empty string when this is a repair attempt with context
                  from the previous failed review.
     step_instruction: Detailed instruction/acceptance criteria for the step.
+    workspace_path: The isolated working directory for this step (e.g. Git worktree).
 
     Returns
     -------
@@ -54,6 +61,7 @@ class StepExecutor(Protocol):
         step_role: AgentRole,
         repair_hint: str = "",
         step_instruction: str = "",
+        workspace_path: Path | str | None = None,
     ) -> ImplementationResult: ...
 
 
@@ -76,11 +84,13 @@ class _NoOpStepExecutor:
         step_role: AgentRole,
         repair_hint: str = "",
         step_instruction: str = "",
+        workspace_path: Path | str | None = None,
     ) -> ImplementationResult:
         summary = (
             f"[NoOpStepExecutor] Simulated execution of step '{step_title}' "
             f"under role '{step_role.value}'"
             + (f" [repair: {repair_hint}]" if repair_hint else "")
+            + (f" [workspace: {workspace_path}]" if workspace_path else "")
         )
         return ImplementationResult(
             step_id=step_id,
@@ -92,6 +102,7 @@ class _NoOpStepExecutor:
                 "executor_identity": "_NoOpStepExecutor",
                 "is_real": False,
                 "evidence_source": "simulation",
+                "workspace_path": str(workspace_path) if workspace_path else None,
             },
         )
 
@@ -106,6 +117,7 @@ class WholePlanExecutionSummary:
     plan_completed: bool
     steps_auto_repaired: int = 0
     rollbacks_executed: int = 0
+    worktrees_merged: int = 0
     review_history: list[dict[str, Any]] = field(default_factory=list)
     # Per-step telemetry: list of {"step_id", "duration_ms", "attempts", "outcome", ...}
     step_telemetry: list[dict[str, Any]] = field(default_factory=list)
@@ -120,6 +132,7 @@ class WholePlanExecutionSummary:
             "plan_completed": self.plan_completed,
             "steps_auto_repaired": self.steps_auto_repaired,
             "rollbacks_executed": self.rollbacks_executed,
+            "worktrees_merged": self.worktrees_merged,
             "review_history": self.review_history,
             "step_telemetry": self.step_telemetry,
         }
@@ -131,7 +144,9 @@ class WholePlanCoordinator:
     testing gates, security scanners, and verification reviews until the entire plan
     completes.
 
-    Upstream Architecture Alignment (Aider / SWE-agent / MetaGPT Reflexion):
+    Upstream Architecture Alignment (worktrunk / Aider / SWE-agent / MetaGPT Reflexion):
+    - Physical Git Worktree Isolation: Every step runs in a dedicated, isolated Git worktree
+      branch with symlinked dependency caches (.venv, node_modules) for zero workspace contention.
     - Strictly bounded 3-attempt self-healing loop: initial attempt (Attempt 0) +
       up to 3 automated repair retries (Attempts 1, 2, 3). Total attempts per step <= 4.
     - Transactional pre-step snapshot: captures pre-step baseline before execution begins.
@@ -156,9 +171,11 @@ class WholePlanCoordinator:
         verification_coordinator: VerificationGateCoordinator | None = None,
         goal_drift_monitor: GoalDriftMonitor | None = None,
         snapshot_manager: WorkspaceSnapshotManager | None = None,
+        worktree_manager: GitWorktreeManager | None = None,
         decision_service: DecisionService | None = None,
         max_step_retries: int = 3,
         max_auto_repair_attempts: int = 3,
+        enable_worktree_isolation: bool = True,
     ) -> None:
         self._task_service = task_service
         self._plan_service = plan_service
@@ -170,9 +187,11 @@ class WholePlanCoordinator:
         self._gate_coordinator = verification_coordinator or VerificationGateCoordinator(require_real_execution=True)
         self._goal_drift_monitor = goal_drift_monitor or GoalDriftMonitor()
         self._snapshot_manager = snapshot_manager or WorkspaceSnapshotManager()
+        self._worktree_manager = worktree_manager or GitWorktreeManager()
         self._decision_service = decision_service
         self.max_step_retries = max_step_retries
         self.max_auto_repair_attempts = max_auto_repair_attempts
+        self.enable_worktree_isolation = enable_worktree_isolation
 
     def capabilities(self) -> Sequence[CapabilityStatus]:
         """Report truthful capability status for autonomous plan execution."""
@@ -365,14 +384,24 @@ class WholePlanCoordinator:
                 step_role=step_role,
                 repair_hint=repair_hint,
                 step_instruction=step_instruction,
+                workspace_path=workspace_path,
             )
         except TypeError:
-            imp_res = await self._step_executor.execute_step(
-                step_id=step_id,
-                step_title=step_title,
-                step_role=step_role,
-                repair_hint=repair_hint,
-            )
+            try:
+                imp_res = await self._step_executor.execute_step(
+                    step_id=step_id,
+                    step_title=step_title,
+                    step_role=step_role,
+                    repair_hint=repair_hint,
+                    step_instruction=step_instruction,
+                )
+            except TypeError:
+                imp_res = await self._step_executor.execute_step(
+                    step_id=step_id,
+                    step_title=step_title,
+                    step_role=step_role,
+                    repair_hint=repair_hint,
+                )
 
         # ── 2. Goal drift check using files reported by executor ──────────────
         if hasattr(imp_res, "modified_files") and imp_res.modified_files:
@@ -427,8 +456,8 @@ class WholePlanCoordinator:
         plan_id: str,
         workspace_path: Path | str,
     ) -> WholePlanExecutionSummary:
-        """Execute an entire plan end-to-end with autonomous self-healing and atomic rollback."""
-        root_path = Path(workspace_path)
+        """Execute an entire plan end-to-end with autonomous self-healing, Git worktree isolation, and atomic rollback."""
+        root_path = Path(workspace_path).resolve()
         plan = await self._plan_service.activate_plan(plan_id)
         steps = await self._plan_store.list_steps(plan_id)
 
@@ -439,6 +468,7 @@ class WholePlanCoordinator:
         skipped_count = 0
         auto_repaired_count = 0
         rollbacks_count = 0
+        worktrees_merged_count = 0
 
         for step in steps:
             if step.state in (PlanStepState.COMPLETED, PlanStepState.SKIPPED):
@@ -448,10 +478,17 @@ class WholePlanCoordinator:
                     skipped_count += 1
                 continue
 
-            # ── 1. Capture transactional pre-step snapshot for atomic rollback ──
-            snapshot = self._snapshot_manager.capture_snapshot(root_path, step.step_id)
+            # ── 1. Create isolated Git worktree if repository & enabled ──────
+            worktree_ctx: WorktreeContext | None = None
+            if self.enable_worktree_isolation and self._worktree_manager.is_git_repository(root_path):
+                worktree_ctx = self._worktree_manager.create_worktree(root_path, step.step_id)
 
-            # ── 2. Start step ──────────────────────────────────────────────────
+            step_workspace = worktree_ctx.worktree_path if (worktree_ctx and worktree_ctx.is_active) else root_path
+
+            # ── 2. Capture transactional pre-step snapshot for atomic rollback ──
+            snapshot = self._snapshot_manager.capture_snapshot(step_workspace, step.step_id)
+
+            # ── 3. Start step ──────────────────────────────────────────────────
             running_step = await self._plan_service.start_step(step.step_id)
             step_start = time.perf_counter()
             attempt = 0
@@ -459,15 +496,17 @@ class WholePlanCoordinator:
             review = None
             journal = StepRepairJournal(running_step.step_id)
             rollback_report: RollbackReport | None = None
+            merge_report: WorktreeMergeReport | None = None
+            abort_report: WorktreeAbortReport | None = None
             drift_detected = False
 
-            # ── 3. Bounded Self-Correction Loop (Upstream Aider / SWE-agent / MetaGPT) ──
+            # ── 4. Bounded Self-Correction Loop (Upstream Aider / SWE-agent / MetaGPT) ──
             # Initial run: attempt = 0.
             # Up to max_auto_repair_attempts retries: attempt = 1, 2, ..., max_auto_repair_attempts.
             # Total attempts <= max_auto_repair_attempts + 1.
             while attempt <= self.max_auto_repair_attempts:
                 review = await self._run_gates_for_step(
-                    workspace_path=root_path,
+                    workspace_path=step_workspace,
                     step_id=running_step.step_id,
                     step_title=running_step.title,
                     step_role=running_step.assigned_role,
@@ -500,16 +539,21 @@ class WholePlanCoordinator:
                         max_attempts=self.max_auto_repair_attempts,
                         journal=journal,
                         diagnoses=diagnoses,
-                        workspace_root=root_path,
+                        workspace_root=step_workspace,
                         drift_detected=drift_detected,
                     )
 
-            # ── 4. Evaluate outcome & commit or rollback ───────────────────────
+            # ── 5. Evaluate outcome & commit or rollback ───────────────────────
             duration_ms = round((time.perf_counter() - step_start) * 1000, 1)
             is_approved = review is not None and review.status == ReviewStatus.APPROVED
 
             if is_approved:
-                # Changes verified and accepted — discard snapshot
+                # Changes verified and accepted — merge worktree if active
+                if worktree_ctx and worktree_ctx.is_active:
+                    merge_report = self._worktree_manager.merge_and_cleanup(worktree_ctx)
+                    if merge_report.success:
+                        worktrees_merged_count += 1
+
                 await self._plan_service.complete_step(step.step_id)
                 completed_count += 1
                 if attempt > 0:
@@ -524,10 +568,15 @@ class WholePlanCoordinator:
                     "repair_exhausted": False,
                     "auto_repaired": attempt > 0,
                     "repair_attempts_run": attempt,
+                    "worktree_isolated": worktree_ctx is not None and worktree_ctx.is_active,
+                    "worktree_merged": merge_report is not None and merge_report.success,
+                    "worktree_merge_report": merge_report.to_dict() if merge_report else None,
                 })
             else:
-                # ── ATOMIC ROLLBACK ON EXHAUSTION ─────────────────────────────
-                # Revert all modified files, delete newly created files, restore deleted files
+                # ── ATOMIC ROLLBACK / WORKTREE ABORT ON EXHAUSTION ─────────────
+                if worktree_ctx and worktree_ctx.is_active:
+                    abort_report = self._worktree_manager.abort_and_cleanup(worktree_ctx)
+
                 rollback_report = self._snapshot_manager.rollback_snapshot(snapshot)
                 rollbacks_count += 1
                 await self._plan_service.fail_step(step.step_id)
@@ -541,6 +590,8 @@ class WholePlanCoordinator:
                     "outcome": outcome,
                     "repair_exhausted": True,
                     "repair_attempts_run": attempt - 1 if attempt > 0 else 0,
+                    "worktree_isolated": worktree_ctx is not None and worktree_ctx.is_active,
+                    "worktree_aborted": abort_report is not None and abort_report.success,
                     "rollback_executed": rollback_report is not None and rollback_report.success,
                     "rollback_report": rollback_report.to_dict() if rollback_report else None,
                 })
@@ -600,6 +651,7 @@ class WholePlanCoordinator:
             plan_completed=all_finished,
             steps_auto_repaired=auto_repaired_count,
             rollbacks_executed=rollbacks_count,
+            worktrees_merged=worktrees_merged_count,
             review_history=history,
             step_telemetry=telemetry,
         )

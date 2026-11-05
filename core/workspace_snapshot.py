@@ -23,6 +23,8 @@ DEFAULT_IGNORED_DIRS = frozenset({
     ".ruff_cache",
     ".cache",
     "data",
+    ".agents",
+    ".worktrees",
 })
 
 DEFAULT_IGNORED_EXTENSIONS = frozenset({
