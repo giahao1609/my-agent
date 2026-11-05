@@ -144,6 +144,7 @@ Hệ thống MyAgent được cấu thành từ 8 phân hệ chức năng trụ 
 | **FRS-06.3** | Kiểm định Tiếp cận (Accessibility WCAG 2.1) | Rà soát tuân thủ tiêu chuẩn tiếp cận WAI-ARIA, thẻ semantic HTML, độ tương phản màu sắc. | **HOÀN TẤT** (`core/ui_governance.py`) |
 | **FRS-06.4** | So sánh Sai khác Trực quan (Visual Diff Engine) | So khớp sai khác điểm ảnh trực tiếp từ dữ liệu nén PNG IDAT zlib và kiểm định layout sau thay đổi mã UI. | **HOÀN TẤT** (`core/visual_diff.py`) |
 | **FRS-06.5** | Trình duyệt Không đầu Tương tác Giao diện | Điều hướng trình duyệt, chụp ảnh màn hình và trích xuất cấu trúc DOM để xác thực E2E. | **MOCKED** (`integrations/playwright_browser.py`) |
+| **FRS-06.6** | Động cơ Lắp ráp Ngữ cảnh Hợp nhất (Unified ContextBuilder) | Tự động tổng hợp và tiêm ngữ cảnh đa tầng (CodeGraph AST, DurableMemory L2/L3, UserModel Preferences Rank 1-5, UI Design Contract) vào prompt của Specialist Agents với giới hạn Token Budget và cắt tỉa xác định. | **HOÀN TẤT** (`core/context_builder.py`) |
 
 ---
 

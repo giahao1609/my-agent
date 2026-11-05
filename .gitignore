@@ -51,3 +51,4 @@ coverage.json
 # Temporary files
 *.tmp
 *.temp
+data/designs/*.design.md

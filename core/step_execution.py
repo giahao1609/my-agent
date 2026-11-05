@@ -85,6 +85,7 @@ class CoderRuntimeStepExecutor:
         agent_run_service: AgentRunService | None = None,
         user_id: str | None = None,
         worker_task_launcher: Any | None = None,
+        context_builder: Any | None = None,
     ) -> None:
         self._coder_stack = coder_stack
         self._workspace_path = Path(workspace_path)
@@ -94,6 +95,7 @@ class CoderRuntimeStepExecutor:
         self._user_id = user_id or "authorized-user"
         self._agent_run_service = agent_run_service
         self._worker_task_launcher = worker_task_launcher
+        self._context_builder = context_builder
 
     async def execute_step(
         self,
@@ -101,6 +103,7 @@ class CoderRuntimeStepExecutor:
         step_title: str,
         step_role: AgentRole,
         repair_hint: str = "",
+        step_instruction: str = "",
     ) -> ImplementationResult:
         now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
         context = ExecutionContext(
@@ -164,6 +167,22 @@ class CoderRuntimeStepExecutor:
             )
 
         prompt = f"Execute step '{step_title}' for role '{step_role.value}'."
+        if self._context_builder is not None and self._project_id:
+            try:
+                unified_ctx = await self._context_builder.build_context(
+                    project_id=self._project_id,
+                    task_id=self._task_id,
+                    step_id=step_id,
+                    step_title=step_title,
+                    step_instruction=step_instruction or step_title,
+                    target_role=step_role,
+                    user_id=self._user_id,
+                )
+                if unified_ctx and getattr(unified_ctx, "formatted_prompt_section", None):
+                    prompt += f"\n\n{unified_ctx.formatted_prompt_section}"
+            except Exception:
+                # Degrade gracefully without blocking step execution
+                pass
         if repair_hint:
             prompt += f"\nPrevious attempt rejected with repair hint: {repair_hint}"
 

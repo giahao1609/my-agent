@@ -229,6 +229,19 @@ def register_builtin_capabilities(registry: CapabilityRegistry) -> None:
         )
     )
 
+    # 16. Unified context builder
+    registry.register(
+        CapabilityRecord(
+            name="unified_context_builder",
+            state=Availability.AVAILABLE,
+            implementation="core.context_builder.UnifiedContextBuilder",
+            provider_or_backend="sqlite_code_graph_and_memory",
+            last_verified_at=now,
+            verification_method="code_inspection",
+            evidence="UnifiedContextBuilder combines CodeGraph AST, DurableMemory, UserModel, and UI design contracts into bounded prompt context",
+        )
+    )
+
 
 def create_default_registry() -> CapabilityRegistry:
     """Create and initialize a CapabilityRegistry with built-in baseline capabilities."""
