@@ -143,6 +143,7 @@ class CapabilityRegistry:
         record = self.get(capability_name)
 
         for candidate in candidate_providers:
+            is_rejected = False
             if hasattr(candidate, "capabilities"):
                 try:
                     caps = candidate.capabilities()
@@ -159,10 +160,14 @@ class CapabilityRegistry:
                                     else cap.get("status") == Availability.MOCKED.value or cap.get("state") == Availability.MOCKED.value
                                 )
                                 if require_real and is_mock:
+                                    is_rejected = True
                                     break
                                 return candidate
                 except Exception:
                     pass
+
+            if is_rejected:
+                continue
 
             cls_name = type(candidate).__name__
             if record.implementation and cls_name in record.implementation:

@@ -63,20 +63,45 @@ def register_builtin_capabilities(registry: CapabilityRegistry) -> None:
         )
     )
 
-    # 5. Container isolation (MOCKED in Phase 00/01)
-    registry.register(
-        CapabilityRecord(
-            name="container_isolation",
-            state=Availability.MOCKED,
-            reason="Container execution is simulated in-memory; no Docker/Podman engine attached",
-            implementation="integrations.container_sandbox_backend.ContainerSandboxBackend",
-            provider_or_backend="in_memory_simulation",
-            last_verified_at=now,
-            verification_method="source_inspection",
-            evidence="ContainerSandboxBackend returns simulated stdout without container daemon",
-            failure_reason="No Docker/Podman engine attached; commands return simulated strings",
-        )
-    )
+    # 5. Container isolation (Dynamic probe)
+    def _probe_container_isolation() -> CapabilityRecord:
+        probe_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            from integrations.container_sandbox_backend import is_docker_available
+            if is_docker_available():
+                return CapabilityRecord(
+                    name="container_isolation",
+                    state=Availability.AVAILABLE,
+                    implementation="integrations.container_sandbox_backend.ContainerSandboxBackend",
+                    provider_or_backend="docker_container_engine",
+                    last_verified_at=probe_time,
+                    verification_method="runtime_probe",
+                    evidence="Real Docker/Podman container engine running with cgroups and Linux namespace isolation",
+                )
+            return CapabilityRecord(
+                name="container_isolation",
+                state=Availability.MOCKED,
+                reason="Container execution is simulated in-memory; no Docker/Podman engine attached",
+                implementation="integrations.container_sandbox_backend.ContainerSandboxBackend",
+                provider_or_backend="in_memory_simulation",
+                last_verified_at=probe_time,
+                verification_method="source_inspection",
+                evidence="ContainerSandboxBackend returns simulated stdout without container daemon",
+                failure_reason="No Docker/Podman engine attached; commands return simulated strings",
+            )
+        except Exception as exc:
+            return CapabilityRecord(
+                name="container_isolation",
+                state=Availability.UNKNOWN,
+                reason=f"Failed to probe container isolation: {exc}",
+                implementation="integrations.container_sandbox_backend.ContainerSandboxBackend",
+                provider_or_backend="unknown",
+                last_verified_at=probe_time,
+                verification_method="probe_error",
+                evidence=str(exc),
+            )
+
+    registry.register_probe("container_isolation", _probe_container_isolation)
 
     # 6. Browser navigation (Dynamic probe)
     def _probe_browser_nav() -> CapabilityRecord:
