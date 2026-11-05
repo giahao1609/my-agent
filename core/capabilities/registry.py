@@ -49,20 +49,20 @@ class CapabilityRegistry:
                 rec = self._dynamic_probes[norm]()
                 self._capabilities[norm] = rec
                 return rec
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 return CapabilityRecord(
                     name=name,
                     state=Availability.UNKNOWN,
                     reason=f"Probe failed: {exc}",
                     verification_method="dynamic_probe_error",
                     evidence=str(exc),
-                    last_verified_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    last_verified_at=datetime.datetime.now(datetime.UTC).isoformat(),
                 )
 
         if norm in self._capabilities:
             return self._capabilities[norm]
 
-        for key, rec in self._capabilities.items():
+        for rec in self._capabilities.values():
             if rec.name.lower() == name.lower():
                 return rec
 
@@ -72,7 +72,7 @@ class CapabilityRegistry:
             reason=f"Capability '{name}' has insufficient evidence or is unregistered",
             verification_method="none",
             evidence="No runtime evidence available",
-            last_verified_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            last_verified_at=datetime.datetime.now(datetime.UTC).isoformat(),
         )
 
     def is_available(self, name: str) -> bool:
@@ -100,7 +100,7 @@ class CapabilityRegistry:
         for norm, probe in self._dynamic_probes.items():
             try:
                 self._capabilities[norm] = probe()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         return sorted(self._capabilities.values(), key=lambda c: c.name)
 
@@ -124,10 +124,10 @@ class CapabilityRegistry:
                                 implementation=str(item.get("implementation", "")),
                                 provider_or_backend=str(item.get("provider_or_backend", "")),
                                 evidence=str(item.get("evidence", "")),
-                                last_verified_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                last_verified_at=datetime.datetime.now(datetime.UTC).isoformat(),
                             )
                         )
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         return self.list()
 
@@ -163,7 +163,7 @@ class CapabilityRegistry:
                                     is_rejected = True
                                     break
                                 return candidate
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
 
             if is_rejected:

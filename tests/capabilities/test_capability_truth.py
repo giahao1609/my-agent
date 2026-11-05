@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
-from typing import Any, Sequence
 from unittest.mock import MagicMock
 
 import pytest
 
+from core.agent_role import AgentRole
 from core.capabilities import (
     Availability,
     CapabilityMockedError,
-    CapabilityProvider,
     CapabilityRecord,
     CapabilityRegistry,
     CapabilityStatus,
@@ -18,13 +16,11 @@ from core.capabilities import (
     default_capability_registry,
 )
 from core.context import ExecutionContext
-from core.agent_role import AgentRole
 from core.handoff_contracts import ImplementationResult
-from core.whole_plan_coordinator import StepExecutor, WholePlanCoordinator, _NoOpStepExecutor
+from core.whole_plan_coordinator import WholePlanCoordinator
 from integrations.container_sandbox_backend import ContainerSandboxBackend
 from integrations.local_sandbox_backend import LocalSandboxBackend
 from integrations.playwright_browser import PlaywrightBrowserAdapter
-
 
 # ===========================================================================
 # TEST 1 — Browser mock & real truth

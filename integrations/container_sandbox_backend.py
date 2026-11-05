@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import shutil
 import subprocess
 import time
@@ -48,16 +47,15 @@ def is_docker_available(cache_ttl_seconds: float = 5.0) -> bool:
 
     try:
         res = subprocess.run(
-            [docker_bin, "info", "--format", "{{.ServerVersion}}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=2.0,
+            [docker_bin, "version", "--format", "{{.Server.Version}}"],
+            capture_output=True,
+            timeout=5.0,
             check=False,
         )
         is_avail = res.returncode == 0
         _DOCKER_AVAILABLE_CACHE = (is_avail, docker_bin if is_avail else None, now)
         return is_avail
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         _DOCKER_AVAILABLE_CACHE = (False, None, now)
         return False
 
@@ -207,7 +205,7 @@ class ContainerSandboxBackend(SandboxBackend):
             docker_cmd.extend(["-v", f"{target_mount}:/workspace:rw", "--workdir", "/workspace"])
             docker_cmd.extend([resolved_img, "sleep", "infinity"])
 
-            code, out, err = await self._run_docker_cmd(*docker_cmd)
+            code, _out, err = await self._run_docker_cmd(*docker_cmd)
             if code != 0:
                 logger.warning(
                     "Docker container launch failed (%s). Falling back to simulation mode.", err
@@ -270,11 +268,11 @@ class ContainerSandboxBackend(SandboxBackend):
                 exit_code = proc.returncode if proc.returncode is not None else 0
                 stdout = stdout_b.decode(errors="replace")
                 stderr = stderr_b.decode(errors="replace")
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 try:
                     proc.kill()
-                except Exception:
-                    pass
+                except OSError as kill_err:
+                    logger.debug("Failed to kill timed out process: %s", kill_err)
                 return {
                     "exit_code": 124,
                     "stdout": "",
@@ -322,7 +320,7 @@ class ContainerSandboxBackend(SandboxBackend):
 
         if sandbox.get("is_real"):
             image_tag = f"myagent-snap:{snapshot_id}"
-            code, out, err = await self._run_docker_cmd(
+            code, _out, err = await self._run_docker_cmd(
                 "commit", sandbox["container_name"], image_tag
             )
             if code != 0:
@@ -417,8 +415,8 @@ class ContainerSandboxBackend(SandboxBackend):
                 for tag in sandbox.get("snapshot_tags", []):
                     try:
                         await self._run_docker_cmd("rmi", "-f", tag)
-                    except Exception:
-                        pass
+                    except (OSError, RuntimeError) as rmi_err:
+                        logger.debug("Snapshot image cleanup failed: %s", rmi_err)
             sandbox["state"] = "terminated"
 
     async def capabilities(self) -> Sequence[CapabilityStatus]:

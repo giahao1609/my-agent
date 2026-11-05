@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import pytest
 from pathlib import Path
+
+import pytest
 
 from core.browser_backend import BrowserPolicy
 from integrations.playwright_browser import PlaywrightBrowserAdapter
@@ -117,8 +118,13 @@ async def test_playwright_browser_adapter_capabilities() -> None:
 
 
 from unittest.mock import AsyncMock, MagicMock
+
 from core.visual_diff import VisualDiffValidator
-from integrations.playwright_browser import RealPlaywrightSession, create_minimal_png, is_playwright_installed
+from integrations.playwright_browser import (
+    RealPlaywrightSession,
+    create_minimal_png,
+    is_playwright_installed,
+)
 
 
 @pytest.mark.asyncio
