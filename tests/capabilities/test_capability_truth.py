@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
-from typing import Any, Sequence
 from unittest.mock import MagicMock
 
 import pytest
 
+from core.agent_role import AgentRole
 from core.capabilities import (
     Availability,
     CapabilityMockedError,
-    CapabilityProvider,
     CapabilityRecord,
     CapabilityRegistry,
     CapabilityStatus,
@@ -18,13 +16,11 @@ from core.capabilities import (
     default_capability_registry,
 )
 from core.context import ExecutionContext
-from core.agent_role import AgentRole
 from core.handoff_contracts import ImplementationResult
-from core.whole_plan_coordinator import StepExecutor, WholePlanCoordinator, _NoOpStepExecutor
+from core.whole_plan_coordinator import WholePlanCoordinator
 from integrations.container_sandbox_backend import ContainerSandboxBackend
 from integrations.local_sandbox_backend import LocalSandboxBackend
 from integrations.playwright_browser import PlaywrightBrowserAdapter
-
 
 # ===========================================================================
 # TEST 1 — Browser mock & real truth
@@ -91,9 +87,10 @@ async def test_browser_real_truth() -> None:
 # ===========================================================================
 
 @pytest.mark.asyncio
-async def test_container_truth(tmp_path: Path) -> None:
-    """ContainerSandboxBackend cannot report real AVAILABLE container isolation."""
-    backend = ContainerSandboxBackend(workspace_root=tmp_path)
+async def test_container_truth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ContainerSandboxBackend cannot report real AVAILABLE container isolation when mocked."""
+    monkeypatch.setattr("integrations.container_sandbox_backend.is_docker_available", lambda: False)
+    backend = ContainerSandboxBackend(workspace_root=tmp_path, force_simulation=True)
     caps = await backend.capabilities()
 
     assert len(caps) >= 3
@@ -104,12 +101,32 @@ async def test_container_truth(tmp_path: Path) -> None:
     assert iso_cap.reason is not None
     assert "simulated" in iso_cap.evidence.lower() or "without container daemon" in iso_cap.evidence.lower()
 
-    # Check registry truth
+    # Check registry truth when mocked
     reg = default_capability_registry
     container_cap = reg.get("container_isolation")
     assert container_cap.state is Availability.MOCKED
     assert container_cap.available is False
     assert container_cap.is_mocked is True
+
+
+@pytest.mark.asyncio
+async def test_container_real_truth(tmp_path: Path) -> None:
+    """ContainerSandboxBackend reports AVAILABLE container isolation when Docker is active."""
+    from integrations.container_sandbox_backend import is_docker_available
+    if not is_docker_available():
+        pytest.skip("Docker daemon not reachable")
+    backend = ContainerSandboxBackend(workspace_root=tmp_path)
+    caps = await backend.capabilities()
+
+    iso_cap = next(c for c in caps if c.name == "container_isolation")
+    assert iso_cap.state is Availability.AVAILABLE
+    assert iso_cap.available is True
+    assert iso_cap.is_mocked is False
+
+    reg = default_capability_registry
+    container_cap = reg.get("container_isolation")
+    assert container_cap.state is Availability.AVAILABLE
+    assert container_cap.available is True
 
 
 # ===========================================================================
@@ -120,7 +137,7 @@ async def test_container_truth(tmp_path: Path) -> None:
 async def test_backend_distinction(tmp_path: Path) -> None:
     """LocalSandboxBackend is distinguishable from container isolation."""
     local_backend = LocalSandboxBackend(enabled=True)
-    container_backend = ContainerSandboxBackend(workspace_root=tmp_path)
+    container_backend = ContainerSandboxBackend(workspace_root=tmp_path, force_simulation=True)
 
     local_caps = await local_backend.capabilities()
     container_caps = await container_backend.capabilities()
@@ -253,8 +270,9 @@ def test_unknown_behavior() -> None:
 # TEST 7 — Evidence
 # ===========================================================================
 
-def test_evidence_inspection() -> None:
+def test_evidence_inspection(monkeypatch: pytest.MonkeyPatch) -> None:
     """Registry exposes evidence supporting capability status and serializes clearly."""
+    monkeypatch.setattr("integrations.container_sandbox_backend.is_docker_available", lambda: False)
     reg = default_capability_registry
     cap = reg.get("container_isolation")
 
@@ -316,9 +334,21 @@ async def test_real_provider_requirement() -> None:
     real_cap = reg.require("workspace_file_read")
     assert real_cap.available is True
 
+    # Register a dedicated synthetic mock capability to verify strict rejection
+    reg.register(
+        CapabilityRecord(
+            name="mocked_sandbox_fixture",
+            state=Availability.MOCKED,
+            reason="Synthetic mock capability for invariant test",
+            implementation="test.fixture",
+            provider_or_backend="in_memory_simulation",
+            evidence="Simulated capability",
+        )
+    )
+
     # Requiring a mocked capability raises CapabilityMockedError
     with pytest.raises(CapabilityMockedError) as exc_info:
-        reg.require("container_isolation")
+        reg.require("mocked_sandbox_fixture")
     assert "MOCKED" in str(exc_info.value)
     assert issubclass(CapabilityMockedError, CapabilityUnavailableError)
 
@@ -327,7 +357,7 @@ async def test_real_provider_requirement() -> None:
         reg.require("hypothetical_future_capability")
 
     # select_provider rejects mocked candidates when require_real=True
-    mock_candidate = ContainerSandboxBackend()
+    mock_candidate = ContainerSandboxBackend(force_simulation=True)
     local_candidate = LocalSandboxBackend(enabled=True)
 
     selected = await reg.select_provider(

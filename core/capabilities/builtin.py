@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime
-from pathlib import Path
 
 from core.capabilities.registry import CapabilityRegistry
 from core.status import Availability, CapabilityRecord
@@ -9,7 +8,7 @@ from core.status import Availability, CapabilityRecord
 
 def register_builtin_capabilities(registry: CapabilityRegistry) -> None:
     """Register the 15 baseline capabilities with truthful executable evidence."""
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now = datetime.datetime.now(datetime.UTC).isoformat()
 
     # 1. Workspace file read
     registry.register(
@@ -63,24 +62,49 @@ def register_builtin_capabilities(registry: CapabilityRegistry) -> None:
         )
     )
 
-    # 5. Container isolation (MOCKED in Phase 00/01)
-    registry.register(
-        CapabilityRecord(
-            name="container_isolation",
-            state=Availability.MOCKED,
-            reason="Container execution is simulated in-memory; no Docker/Podman engine attached",
-            implementation="integrations.container_sandbox_backend.ContainerSandboxBackend",
-            provider_or_backend="in_memory_simulation",
-            last_verified_at=now,
-            verification_method="source_inspection",
-            evidence="ContainerSandboxBackend returns simulated stdout without container daemon",
-            failure_reason="No Docker/Podman engine attached; commands return simulated strings",
-        )
-    )
+    # 5. Container isolation (Dynamic probe)
+    def _probe_container_isolation() -> CapabilityRecord:
+        probe_time = datetime.datetime.now(datetime.UTC).isoformat()
+        try:
+            from integrations.container_sandbox_backend import is_docker_available
+            if is_docker_available():
+                return CapabilityRecord(
+                    name="container_isolation",
+                    state=Availability.AVAILABLE,
+                    implementation="integrations.container_sandbox_backend.ContainerSandboxBackend",
+                    provider_or_backend="docker_container_engine",
+                    last_verified_at=probe_time,
+                    verification_method="runtime_probe",
+                    evidence="Real Docker/Podman container engine running with cgroups and Linux namespace isolation",
+                )
+            return CapabilityRecord(
+                name="container_isolation",
+                state=Availability.MOCKED,
+                reason="Container execution is simulated in-memory; no Docker/Podman engine attached",
+                implementation="integrations.container_sandbox_backend.ContainerSandboxBackend",
+                provider_or_backend="in_memory_simulation",
+                last_verified_at=probe_time,
+                verification_method="source_inspection",
+                evidence="ContainerSandboxBackend returns simulated stdout without container daemon",
+                failure_reason="No Docker/Podman engine attached; commands return simulated strings",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return CapabilityRecord(
+                name="container_isolation",
+                state=Availability.UNKNOWN,
+                reason=f"Failed to probe container isolation: {exc}",
+                implementation="integrations.container_sandbox_backend.ContainerSandboxBackend",
+                provider_or_backend="unknown",
+                last_verified_at=probe_time,
+                verification_method="probe_error",
+                evidence=str(exc),
+            )
+
+    registry.register_probe("container_isolation", _probe_container_isolation)
 
     # 6. Browser navigation (Dynamic probe)
     def _probe_browser_nav() -> CapabilityRecord:
-        probe_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        probe_time = datetime.datetime.now(datetime.UTC).isoformat()
         try:
             from integrations.playwright_browser import is_playwright_installed
             if is_playwright_installed():
@@ -104,7 +128,7 @@ def register_builtin_capabilities(registry: CapabilityRegistry) -> None:
                 evidence="PlaywrightBrowserSession.navigate returns synthetic success message without browser process",
                 failure_reason="No Playwright or browser engine installed",
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return CapabilityRecord(
                 name="browser_navigation",
                 state=Availability.UNKNOWN,
@@ -120,7 +144,7 @@ def register_builtin_capabilities(registry: CapabilityRegistry) -> None:
 
     # 7. Browser screenshot (Dynamic probe)
     def _probe_browser_screenshot() -> CapabilityRecord:
-        probe_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        probe_time = datetime.datetime.now(datetime.UTC).isoformat()
         try:
             from integrations.playwright_browser import is_playwright_installed
             if is_playwright_installed():
@@ -144,7 +168,7 @@ def register_builtin_capabilities(registry: CapabilityRegistry) -> None:
                 evidence="Writes static b'\\x89PNG\\r\\n\\x1a\\n\\x00\\x00\\x00\\rIHDR\\x00\\x00\\x00\\x01' bytes to file",
                 failure_reason="No browser process launched to capture real viewport pixels",
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return CapabilityRecord(
                 name="browser_screenshot",
                 state=Availability.UNKNOWN,
@@ -160,9 +184,8 @@ def register_builtin_capabilities(registry: CapabilityRegistry) -> None:
 
     # 8. WholePlan autonomous step execution (MOCKED by default)
     def _probe_whole_plan() -> CapabilityRecord:
-        probe_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        probe_time = datetime.datetime.now(datetime.UTC).isoformat()
         try:
-            from core.whole_plan_coordinator import _NoOpStepExecutor
             return CapabilityRecord(
                 name="whole_plan_autonomous_step_execution",
                 state=Availability.MOCKED,
@@ -174,7 +197,7 @@ def register_builtin_capabilities(registry: CapabilityRegistry) -> None:
                 evidence="WholePlanCoordinator._NoOpStepExecutor active by default; produces simulated execution summaries",
                 failure_reason="No real agent execution runtime injected by default",
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return CapabilityRecord(
                 name="whole_plan_autonomous_step_execution",
                 state=Availability.UNKNOWN,

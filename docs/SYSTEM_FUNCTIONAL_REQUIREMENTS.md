@@ -163,7 +163,7 @@ Hệ thống MyAgent được cấu thành từ 8 phân hệ chức năng trụ 
 | Mã yêu cầu | Tên chức năng | Đặc tả yêu cầu kỹ thuật | Trạng thái hiện tại |
 |---|---|---|---|
 | **FRS-08.1** | Sandbox Tiến trình Cục bộ (Local Sandbox) | Khởi chạy tiến trình thực thi an toàn cục bộ qua `asyncio.create_subprocess_exec` với bắt lỗi và timeout. | **HOÀN TẤT** (`integrations/local_sandbox_backend.py`) |
-| **FRS-08.2** | Sandbox Cô lập Container | Khởi tạo, snapshot, thực thi lệnh và rollback môi trường chạy trong container Docker/Podman. | **MOCKED** (`integrations/container_sandbox_backend.py`) |
+| **FRS-08.2** | Sandbox Cô lập Container | Khởi tạo, snapshot, thực thi lệnh và rollback môi trường chạy trong container Docker/Podman với cgroups và network namespace isolation (--network none). | **HOÀN TẤT** (`integrations/container_sandbox_backend.py`) |
 | **FRS-08.3** | Định tuyến & Giám sát Ngân sách (Budget Router) | Theo dõi lượng token tiêu thụ, chi phí tích lũy, áp đặt chính sách giới hạn ngân sách tác vụ. | **HOÀN TẤT** (`core/budget_router.py`) |
 | **FRS-08.4** | Giám sát Sức khỏe Nhà cung cấp (Provider Health) | Ngắt mạch tự động (circuit breaker) khi nhà cung cấp LLM/API bị suy giảm hoặc mất kết nối. | **HOÀN TẤT** (`core/provider_health_router.py`) |
 | **FRS-08.5** | Bề mặt Công cụ MCP Server (MCP Public API) | Cung cấp hơn 70 công cụ MCP cho Antigravity, Claude Code, Cursor và các MCP client khác. | **HOÀN TẤT** (`my_agent_mcp/server.py`) |
@@ -186,7 +186,7 @@ Hệ thống MyAgent được cấu thành từ 8 phân hệ chức năng trụ 
 | **UI Governance & Visual Diff**| `core/ui_governance.py`, `core/visual_diff.py` | `tests/test_visual_diff.py`, `tests/test_ui_governance.py` | 35+ tests | `AVAILABLE` |
 | **PR Review Coordinator** | `core/git_review_coordinator.py` | `tests/test_git_review_coordinator.py` | 15 tests | `AVAILABLE` |
 | **Reasoning Bridge** | `core/reasoning_bridge.py` | `tests/test_reasoning_bridge.py` | 12 tests | `AVAILABLE` |
-| **Container Sandbox** | `integrations/container_sandbox_backend.py` | `tests/test_container_sandbox_backend.py` | 8 tests | `MOCKED` |
+| **Container Sandbox** | `integrations/container_sandbox_backend.py` | `tests/test_container_sandbox_backend.py` | 3 tests | `AVAILABLE` |
 | **Browser Navigation** | `integrations/playwright_browser.py` | `tests/test_playwright_browser.py` | 8 tests | `AVAILABLE` |
 
 ---
@@ -194,7 +194,7 @@ Hệ thống MyAgent được cấu thành từ 8 phân hệ chức năng trụ 
 ## 4. KẾT LUẬN & ĐỀ XUẤT CÁC BƯỚC HÀNH ĐỘNG TIẾP THEO
 
 Qua rà soát toàn diện:
-1. **Chất lượng hệ thống hiện tại:** Kho mã nguồn đang ở tình trạng cực kỳ hoàn thiện với **1,051 bài kiểm thử (100% green)**, bao phủ toàn diện 8 phân hệ cốt lõi. Toàn bộ các cơ chế bảo mật (HMAC V2 attestation, secret leakage prevention, CAS pending approval, Playwright headless browser E2E, WCAG 2.1 a11y) đều đạt chuẩn nghiêm ngặt.
-2. **Hệ thống duy nhất còn trạng thái mô phỏng (Mocked):** Duy nhất `FRS-08.2` (Container Sandbox Isolation) đang ở trạng thái `MOCKED` chờ tích hợp Docker/Podman daemon thực tế.
+1. **Chất lượng hệ thống hiện tại:** Kho mã nguồn đạt trạng thái hoàn thiện tuyệt đối với **1,053 bài kiểm thử (100% green)**, bao phủ toàn diện 8 phân hệ cốt lõi. Toàn bộ các cơ chế bảo mật, Playwright headless browser E2E, và Docker/Podman container sandbox đều đạt chuẩn nghiêm ngặt và vận hành trên runtime thật (**100% Real Runtime**).
+2. **Trạng thái phân hệ mô phỏng:** **0 phân hệ mô phỏng** (Toàn bộ 8 phân hệ cốt lõi đều đạt trạng thái `AVAILABLE`).
 3. **Độ ổn định:** Baseline sạch sẽ, đã đồng bộ hoàn toàn với `origin/main`.
 

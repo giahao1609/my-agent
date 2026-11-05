@@ -11,13 +11,13 @@ Supports:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import struct
 import uuid
 import zlib
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from core.status import CapabilityStatus
@@ -114,7 +114,7 @@ class RealPlaywrightSession(BrowserSession):
                 snippet = await self._page.evaluate(
                     "() => document.body ? document.body.innerText.slice(0, 500) : ''"
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 snippet = f"Navigated to {url}"
 
             # Screenshot capture
@@ -144,7 +144,7 @@ class RealPlaywrightSession(BrowserSession):
                 a11y_violations=tuple(a11y_issues),
                 error_message=None if success else f"HTTP error {status_code}",
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return BrowserActionResult(
                 action="navigate",
                 success=False,
@@ -173,7 +173,7 @@ class RealPlaywrightSession(BrowserSession):
                 content_snippet=f"Clicked element matching '{selector}'",
                 screenshot_path=screenshot_path,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return BrowserActionResult(
                 action="click",
                 success=False,
@@ -194,7 +194,7 @@ class RealPlaywrightSession(BrowserSession):
                 title=await self._page.title(),
                 content_snippet=f"Filled element '{selector}' with value length {len(value)}",
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return BrowserActionResult(
                 action="fill",
                 success=False,
@@ -227,7 +227,7 @@ class RealPlaywrightSession(BrowserSession):
                     "aria_snapshot": snap,
                     "children": [],
                 }
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("Failed to extract accessibility snapshot: %s", exc)
 
         return {
@@ -270,7 +270,7 @@ class RealPlaywrightSession(BrowserSession):
         """
         try:
             return await self._page.evaluate(js)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return []
 
     async def close(self) -> None:
@@ -278,19 +278,19 @@ class RealPlaywrightSession(BrowserSession):
             self._is_closed = True
             try:
                 await self._page.close()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             try:
                 await self._context.close()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             try:
                 await self._browser.close()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             try:
                 await self._pw.stop()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
 
 
@@ -446,7 +446,7 @@ class PlaywrightBrowserAdapter(BrowserBackend):
                     policy=effective_policy,
                     session_dir=session_dir,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Playwright is installed but browser launch failed (%s). Falling back to resilient simulation.",
                     exc,
@@ -457,7 +457,7 @@ class PlaywrightBrowserAdapter(BrowserBackend):
 
     async def capabilities(self) -> Sequence[CapabilityStatus]:
         import datetime
-        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        now = datetime.datetime.now(datetime.UTC).isoformat()
         has_pw = not self._force_simulation and is_playwright_installed()
 
         if has_pw:

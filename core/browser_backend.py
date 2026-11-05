@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,14 +24,20 @@ class BrowserPolicy:
         parsed = urlparse(url)
         host = parsed.netloc.split(":")[0]
 
-        if not self.allow_private_network:
-            if host in ("localhost", "127.0.0.1", "0.0.0.0") or host.startswith("192.168.") or host.startswith("10."):
-                return False
+        is_private = (
+            host in ("localhost", "127.0.0.1", "0.0.0.0")
+            or host.startswith(("192.168.", "10."))
+        )
+        if not self.allow_private_network and is_private:
+            return False
 
         if not self.allowed_domains or "*" in self.allowed_domains:
             return True
 
-        return any(host == domain or host.endswith(f".{domain}") for domain in self.allowed_domains)
+        return any(
+            host == domain or host.endswith(f".{domain}")
+            for domain in self.allowed_domains
+        )
 
 
 @dataclass(frozen=True, slots=True)
