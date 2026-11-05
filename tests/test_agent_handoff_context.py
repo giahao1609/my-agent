@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
 import tempfile
+from pathlib import Path
+
 import pytest
 
-from core.agent_role import AgentRole
 from core.agent_handoff_context import AgentHandoffContextBuilder
+from core.agent_role import AgentRole
 from core.agent_run import AgentRunRecord, AgentRunState
 from core.agent_work_result import AgentFinding, AgentWorkResult, FileChange, TestExecutionResult
 from persistence.sqlite_agent_run_store import SQLiteAgentRunStore
@@ -97,3 +98,15 @@ async def test_agent_handoff_context_builder_selective_prioritization():
         assert "src/api.ts" in brief
         assert "8 unit tests passed" in brief
         assert "Add redis cache middleware" in brief
+
+        # Format Technical English brief
+        en_brief = ctx.format_prompt_context(language="en")
+        assert "Execution Truth Ledger & Handoff Brief" in en_brief
+        assert "src/api.ts" in en_brief
+        assert "8 unit tests passed" in en_brief
+        assert "Add redis cache middleware" in en_brief
+
+        # Prune with budget
+        pruned_ctx, report = ctx.prune_with_budget()
+        assert pruned_ctx.task_id == "task-10"
+        assert report.original_estimated_tokens >= report.compressed_estimated_tokens

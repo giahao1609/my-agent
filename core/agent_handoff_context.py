@@ -8,6 +8,11 @@ from typing import Any
 from .agent_role import AgentRole
 from .agent_run import AgentRunRecord, AgentRunStore
 from .agent_work_result import AgentDecisionReference, AgentFinding, TestExecutionResult
+from .context_compression import (
+    HandoffCompressionReport,
+    HandoffTokenBudget,
+    estimate_tokens,
+)
 
 
 class ExecutionTruthStatus(StrEnum):
@@ -247,8 +252,110 @@ class AgentHandoffContext:
             latest_summary=self.latest_summary,
         )
 
-    def format_prompt_context(self) -> str:
+    def prune_with_budget(
+        self,
+        budget: HandoffTokenBudget | None = None,
+    ) -> tuple[AgentHandoffContext, HandoffCompressionReport]:
+        """Prunes verbose entries against dynamic token budget while preserving critical state."""
+        effective_budget = budget or HandoffTokenBudget.for_role(self.target_role)
+
+        max_files = min(20, max(5, effective_budget.diff_budget // 150))
+        max_tests = min(5, max(2, effective_budget.test_budget // 300))
+        max_findings = min(8, max(3, effective_budget.truth_budget // 200))
+        max_notes = min(5, max(2, effective_budget.notes_budget // 200))
+        max_truths = min(8, max(3, effective_budget.truth_budget // 200))
+
+        pruned_ctx = self.prune_context(
+            max_notes=max_notes,
+            max_findings=max_findings,
+            max_tests=max_tests,
+            max_files=max_files,
+            max_execution_truths=max_truths,
+        )
+
+        orig_tokens = estimate_tokens(str(self.to_dict()))
+        comp_tokens = estimate_tokens(str(pruned_ctx.to_dict()))
+        tokens_saved = max(0, orig_tokens - comp_tokens)
+        ratio = comp_tokens / orig_tokens if orig_tokens > 0 else 1.0
+
+        report = HandoffCompressionReport(
+            original_estimated_tokens=orig_tokens,
+            compressed_estimated_tokens=comp_tokens,
+            tokens_saved=tokens_saved,
+            compression_ratio=ratio,
+            diff_compressed=False,
+            tests_compacted=len(self.recent_tests) > len(pruned_ctx.recent_tests),
+            history_summarized=False,
+            truncated_keys=("recent_tests",) if len(self.recent_tests) > len(pruned_ctx.recent_tests) else (),
+        )
+        return pruned_ctx, report
+
+    def format_technical_english_brief(self) -> str:
+        """Renders a high-density, BPE-optimized Technical English brief for downstream specialist agents."""
+        if not self.prior_runs:
+            return "No previous execution records found for this task."
+
+        lines = [
+            "### Execution Truth Ledger & Handoff Brief",
+            "",
+        ]
+
+        if self.execution_truth:
+            lines.append("**Execution Truth Evidence**:")
+            for et in self.execution_truth:
+                step_ref = f" (step {et.source_step_id})" if et.source_step_id else ""
+                lines.append(
+                    f"- Run `{et.source_run_id}`{step_ref}: `[{et.execution_status.value.upper()}]` "
+                    f"(real={et.is_real}, mocked={et.is_mocked}, "
+                    f"verified={et.verification_performed}/{et.verification_passed}, "
+                    f"executor={et.executor_identity or 'n/a'})"
+                )
+            lines.append("")
+
+        if self.latest_summary:
+            lines.append(f"**Preceding Execution Summary**: {self.latest_summary}")
+            lines.append("")
+
+        if self.created_files:
+            lines.append(f"**Created Files**: {', '.join(self.created_files)}")
+        if self.changed_files:
+            lines.append(f"**Modified Files**: {', '.join(self.changed_files)}")
+        if self.created_files or self.changed_files:
+            lines.append("")
+
+        if self.recent_tests:
+            lines.append("**Recent Verification Results**:")
+            for t in self.recent_tests[-3:]:
+                status_str = "PASS" if t.is_success else "FAIL"
+                lines.append(f"- [{status_str}] `{t.framework or 'test'}`: {t.passed} passed, {t.failed} failed ({t.summary})")
+            lines.append("")
+
+        if self.open_findings:
+            lines.append("**Technical Constraints & Open Findings**:")
+            for f in self.open_findings[-5:]:
+                lines.append(f"- `[{f.severity.upper()}]` {f.title}: {f.summary}")
+            lines.append("")
+
+        if self.remaining_work:
+            lines.append("**Remaining Deliverables**:")
+            for item in self.remaining_work:
+                lines.append(f"- {item}")
+            lines.append("")
+
+        if self.handoff_notes:
+            lines.append("**Specialist Directives**:")
+            for note in self.handoff_notes:
+                if note:
+                    lines.append(f"> {note}")
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
+    def format_prompt_context(self, language: str = "vi") -> str:
         """Renders an intuitive human & machine-readable handoff brief for the next specialist agent."""
+        if language == "en":
+            return self.format_technical_english_brief()
+
         if not self.prior_runs:
             return "Chưa có lượt thực thi (AgentRun) nào trước đó cho tác vụ này."
 
@@ -399,17 +506,14 @@ class AgentHandoffContextBuilder:
                     changed_files.add(f.path)
                 for cf in r.result.created_files:
                     created_files.add(cf)
-                for t in r.result.tests:
-                    recent_tests.append(t)
-                for fd in r.result.findings:
-                    open_findings.append(fd)
+                recent_tests.extend(r.result.tests)
+                open_findings.extend(r.result.findings)
                 for rw in r.result.remaining_work:
                     if rw not in remaining_work:
                         remaining_work.append(rw)
                 if r.result.handoff_notes:
                     handoff_notes.append(r.result.handoff_notes)
-                for dec in r.result.decisions_made:
-                    decision_refs.append(dec)
+                decision_refs.extend(r.result.decisions_made)
 
         ctx = AgentHandoffContext(
             task_id=task_id,
