@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from .agent_role import AgentRole
 from .ai_security import PromptInjectionDefense
+from .context_compression import DynamicHandoffPruner, HandoffTokenBudget
 from .security_scanner import SecretRedactor
 
 
@@ -182,9 +183,11 @@ class HandoffGuardrailEngine:
         self,
         prompt_defense: PromptInjectionDefense | None = None,
         strict_schema: bool = False,
+        budget: HandoffTokenBudget | None = None,
     ) -> None:
         self._prompt_defense = prompt_defense or PromptInjectionDefense()
         self.strict_schema = strict_schema
+        self._pruner = DynamicHandoffPruner(budget=budget)
 
     def sanitize_payload_recursive(self, data: Any) -> Any:
         if isinstance(data, str):
@@ -199,30 +202,17 @@ class HandoffGuardrailEngine:
             return [self.sanitize_payload_recursive(item) for item in data]
         return data
 
-    def prune_payload(self, payload: Any) -> tuple[Any, bool]:
-        """Prunes historical conversation contexts if they exceed threshold."""
-        was_pruned = False
+    def prune_payload(
+        self,
+        payload: Any,
+        target_role: AgentRole | None = None,
+    ) -> tuple[Any, bool]:
+        """Prunes historical conversation contexts and compacts diffs/tests preserving syntax integrity."""
         if not isinstance(payload, dict):
             return payload, False
 
-        pruned = dict(payload)
-
-        # 1. Prune conversation history lists to keep only recent messages + summary
-        if "history" in pruned and isinstance(pruned["history"], list):
-            history = pruned["history"]
-            if len(history) > 15:
-                # Keep first message context + last 15 messages
-                pruned["history"] = [
-                    {"role": "system", "content": f"[{len(history) - 15} earlier messages truncated for token efficiency]"}
-                ] + history[-15:]
-                was_pruned = True
-
-        # 2. Truncate arbitrarily huge raw string fields (> 5000 chars)
-        for k, v in list(pruned.items()):
-            if isinstance(v, str) and len(v) > 5000:
-                pruned[k] = v[:4000] + "\n...[truncated]"
-                was_pruned = True
-
+        pruned, report = self._pruner.prune_payload(payload, target_role=target_role)
+        was_pruned = report.tokens_saved > 0
         return pruned, was_pruned
 
     def evaluate_guardrails(
@@ -252,7 +242,7 @@ class HandoffGuardrailEngine:
         guardrail_results["prompt_safety"] = "FAIL" if injection_found else "PASS"
 
         # 3. Context Pruning
-        pruned_payload, was_pruned = self.prune_payload(request.payload)
+        pruned_payload, was_pruned = self.prune_payload(request.payload, target_role=request.target_role)
         guardrail_results["payload_pruned"] = "PRUNED" if was_pruned else "UNCHANGED"
 
         # 4. Payload schema validation
