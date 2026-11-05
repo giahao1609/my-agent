@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+
 import pytest
 
 from core.code_hygiene import (
@@ -95,3 +96,9 @@ async def test_mcp_code_hygiene_tools(tmp_path: Path) -> None:
     dead_res = await server.detect_dead_code(str(tmp_path))
     assert dead_res["dead_symbols_count"] >= 1
     assert any(s["symbol"] == "unused_foo" for s in dead_res["dead_symbols"])
+
+
+def test_production_repo_zero_circular_dependencies() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    cycles = CircularDependencyDetector.detect_cycles(repo_root)
+    assert cycles == [], f"Expected 0 circular dependencies in production repo, found: {cycles}"
