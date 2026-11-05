@@ -78,35 +78,85 @@ def register_builtin_capabilities(registry: CapabilityRegistry) -> None:
         )
     )
 
-    # 6. Browser navigation (MOCKED in Phase 00/01)
-    registry.register(
-        CapabilityRecord(
-            name="browser_navigation",
-            state=Availability.MOCKED,
-            reason="No Playwright or headless browser engine installed; returns synthetic string",
-            implementation="integrations.playwright_browser.PlaywrightBrowserAdapter",
-            provider_or_backend="synthetic_browser",
-            last_verified_at=now,
-            verification_method="source_inspection",
-            evidence="PlaywrightBrowserSession.navigate returns synthetic success message without browser process",
-            failure_reason="No Playwright or browser engine installed",
-        )
-    )
+    # 6. Browser navigation (Dynamic probe)
+    def _probe_browser_nav() -> CapabilityRecord:
+        probe_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            from integrations.playwright_browser import is_playwright_installed
+            if is_playwright_installed():
+                return CapabilityRecord(
+                    name="browser_navigation",
+                    state=Availability.AVAILABLE,
+                    implementation="integrations.playwright_browser.PlaywrightBrowserAdapter",
+                    provider_or_backend="playwright_headless_chromium",
+                    last_verified_at=probe_time,
+                    verification_method="runtime_probe",
+                    evidence="Playwright async API installed and ready for headless browser navigation",
+                )
+            return CapabilityRecord(
+                name="browser_navigation",
+                state=Availability.MOCKED,
+                reason="No Playwright or headless browser engine installed; returns synthetic string",
+                implementation="integrations.playwright_browser.PlaywrightBrowserAdapter",
+                provider_or_backend="synthetic_browser",
+                last_verified_at=probe_time,
+                verification_method="source_inspection",
+                evidence="PlaywrightBrowserSession.navigate returns synthetic success message without browser process",
+                failure_reason="No Playwright or browser engine installed",
+            )
+        except Exception as exc:
+            return CapabilityRecord(
+                name="browser_navigation",
+                state=Availability.UNKNOWN,
+                reason=f"Failed to probe browser navigation: {exc}",
+                implementation="integrations.playwright_browser.PlaywrightBrowserAdapter",
+                provider_or_backend="unknown",
+                last_verified_at=probe_time,
+                verification_method="probe_error",
+                evidence=str(exc),
+            )
 
-    # 7. Browser screenshot (MOCKED in Phase 00/01)
-    registry.register(
-        CapabilityRecord(
-            name="browser_screenshot",
-            state=Availability.MOCKED,
-            reason="Synthesizes fake screenshots using hardcoded 20-byte static PNG header; no viewport captured",
-            implementation="integrations.playwright_browser.PlaywrightBrowserAdapter",
-            provider_or_backend="synthetic_browser",
-            last_verified_at=now,
-            verification_method="source_inspection",
-            evidence="Writes static b'\\x89PNG\\r\\n\\x1a\\n\\x00\\x00\\x00\\rIHDR\\x00\\x00\\x00\\x01' bytes to file",
-            failure_reason="No browser process launched to capture real viewport pixels",
-        )
-    )
+    registry.register_probe("browser_navigation", _probe_browser_nav)
+
+    # 7. Browser screenshot (Dynamic probe)
+    def _probe_browser_screenshot() -> CapabilityRecord:
+        probe_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            from integrations.playwright_browser import is_playwright_installed
+            if is_playwright_installed():
+                return CapabilityRecord(
+                    name="browser_screenshot",
+                    state=Availability.AVAILABLE,
+                    implementation="integrations.playwright_browser.PlaywrightBrowserAdapter",
+                    provider_or_backend="playwright_headless_chromium",
+                    last_verified_at=probe_time,
+                    verification_method="runtime_probe",
+                    evidence="Real viewport PNG capture with RFC 2083 IDAT scanlines via Playwright",
+                )
+            return CapabilityRecord(
+                name="browser_screenshot",
+                state=Availability.MOCKED,
+                reason="Synthesizes fake screenshots using hardcoded 20-byte static PNG header; no viewport captured",
+                implementation="integrations.playwright_browser.PlaywrightBrowserAdapter",
+                provider_or_backend="synthetic_browser",
+                last_verified_at=probe_time,
+                verification_method="source_inspection",
+                evidence="Writes static b'\\x89PNG\\r\\n\\x1a\\n\\x00\\x00\\x00\\rIHDR\\x00\\x00\\x00\\x01' bytes to file",
+                failure_reason="No browser process launched to capture real viewport pixels",
+            )
+        except Exception as exc:
+            return CapabilityRecord(
+                name="browser_screenshot",
+                state=Availability.UNKNOWN,
+                reason=f"Failed to probe browser screenshot: {exc}",
+                implementation="integrations.playwright_browser.PlaywrightBrowserAdapter",
+                provider_or_backend="unknown",
+                last_verified_at=probe_time,
+                verification_method="probe_error",
+                evidence=str(exc),
+            )
+
+    registry.register_probe("browser_screenshot", _probe_browser_screenshot)
 
     # 8. WholePlan autonomous step execution (MOCKED by default)
     def _probe_whole_plan() -> CapabilityRecord:

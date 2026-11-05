@@ -27,6 +27,9 @@ dev = [
     "pytest-cov",
     "ruff",
 ]
+browser = [
+    "playwright>=1.40.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -52,3 +52,4 @@ coverage.json
 *.tmp
 *.temp
 data/designs/*.design.md
+data/browser_artifacts/
