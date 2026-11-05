@@ -11,10 +11,13 @@ class BrowserPolicy:
     timeout_ms: int = 30000
     capture_screenshots: bool = True
     capture_traces: bool = True
+    viewport_width: int = 1280
+    viewport_height: int = 800
+    headless: bool = True
 
     def is_domain_allowed(self, url: str) -> bool:
-        if not self.allowed_domains:
-            return True  # If empty, all public domains allowed unless private network check fails
+        if url.startswith(("data:", "about:")):
+            return True
 
         from urllib.parse import urlparse
         parsed = urlparse(url)
@@ -23,6 +26,9 @@ class BrowserPolicy:
         if not self.allow_private_network:
             if host in ("localhost", "127.0.0.1", "0.0.0.0") or host.startswith("192.168.") or host.startswith("10."):
                 return False
+
+        if not self.allowed_domains or "*" in self.allowed_domains:
+            return True
 
         return any(host == domain or host.endswith(f".{domain}") for domain in self.allowed_domains)
 
@@ -36,6 +42,8 @@ class BrowserActionResult:
     content_snippet: str = ""
     screenshot_path: str | None = None
     trace_path: str | None = None
+    accessibility_tree: dict[str, Any] | None = None
+    a11y_violations: tuple[str, ...] = field(default_factory=tuple)
     error_message: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -47,6 +55,8 @@ class BrowserActionResult:
             "content_snippet": self.content_snippet,
             "screenshot_path": self.screenshot_path,
             "trace_path": self.trace_path,
+            "accessibility_tree": self.accessibility_tree,
+            "a11y_violations": list(self.a11y_violations),
             "error_message": self.error_message,
         }
 
@@ -56,6 +66,7 @@ class BrowserSession(Protocol):
     async def click(self, selector: str) -> BrowserActionResult: ...
     async def fill(self, selector: str, value: str) -> BrowserActionResult: ...
     async def screenshot(self, name: str = "screenshot") -> str: ...
+    async def get_accessibility_tree(self) -> dict[str, Any] | None: ...
     async def close(self) -> None: ...
 
 
