@@ -49,6 +49,7 @@ class StepExecutor(Protocol):
         step_title: str,
         step_role: AgentRole,
         repair_hint: str = "",
+        step_instruction: str = "",
     ) -> ImplementationResult: ...
 
 
@@ -70,6 +71,7 @@ class _NoOpStepExecutor:
         step_title: str,
         step_role: AgentRole,
         repair_hint: str = "",
+        step_instruction: str = "",
     ) -> ImplementationResult:
         summary = (
             f"[NoOpStepExecutor] Simulated execution of step '{step_title}' "
@@ -229,6 +231,7 @@ class WholePlanCoordinator:
         repair_hint: str = "",
         modified_files: Sequence[str] = (),
         allowed_paths: Sequence[str] | None = None,
+        step_instruction: str = "",
     ) -> Any:
         """Invoke the step executor then run all verification gates.
 
@@ -241,12 +244,21 @@ class WholePlanCoordinator:
             4. Evaluate all results through ``VerificationGateCoordinator``.
         """
         # ── 1. Execute via wired agent runtime ───────────────────────────────
-        imp_res = await self._step_executor.execute_step(
-            step_id=step_id,
-            step_title=step_title,
-            step_role=step_role,
-            repair_hint=repair_hint,
-        )
+        try:
+            imp_res = await self._step_executor.execute_step(
+                step_id=step_id,
+                step_title=step_title,
+                step_role=step_role,
+                repair_hint=repair_hint,
+                step_instruction=step_instruction,
+            )
+        except TypeError:
+            imp_res = await self._step_executor.execute_step(
+                step_id=step_id,
+                step_title=step_title,
+                step_role=step_role,
+                repair_hint=repair_hint,
+            )
 
         # ── 2. Goal drift check using files reported by executor ──────────────
         if hasattr(imp_res, "modified_files") and imp_res.modified_files:
@@ -338,6 +350,7 @@ class WholePlanCoordinator:
                     step_title=running_step.title,
                     step_role=running_step.assigned_role,
                     repair_hint=repair_hint,
+                    step_instruction=getattr(running_step, "instruction", ""),
                 )
                 history.append(review.to_dict())
 

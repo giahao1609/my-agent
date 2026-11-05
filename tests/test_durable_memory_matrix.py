@@ -992,11 +992,26 @@ async def test_26_archived_memory_remains_physically_stored(tmp_path: Path) -> N
 
 
 def test_27_no_automatic_context_builder_injection() -> None:
-    """Verify Phase 04 does not import or invoke ContextBuilder."""
+    """Verify Phase 04 does not import or invoke ContextBuilder.
+
+    Verified via an isolated Python subprocess to ensure zero pollution from
+    sibling test modules in the same pytest runner process.
+    """
+    import subprocess
     import sys
-    assert "core.context_builder" not in sys.modules
-    import core.durable_memory_service as dms
-    assert not hasattr(dms, "ContextBuilder")
+
+    script = """
+import sys
+from core.durable_memory_service import DurableMemoryService
+assert "core.context_builder" not in sys.modules, "DurableMemoryService must not import core.context_builder"
+assert not hasattr(DurableMemoryService, "ContextBuilder")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"ContextBuilder isolation check failed:\n{result.stderr}"
 
 
 def test_28_no_user_model_side_effect() -> None:

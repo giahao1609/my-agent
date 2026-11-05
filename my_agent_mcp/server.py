@@ -87,6 +87,7 @@ from core.test_runner import TestRunnerRegistry
 from core.verification_gate_coordinator import VerificationGateCoordinator
 from core.whole_plan_coordinator import WholePlanCoordinator
 from core.step_execution import CoderRuntimeStepExecutor
+from core.context_builder import UnifiedContextBuilder
 from eval.evaluation_job import EvaluationHarness
 from integrations.docs_knowledge_backend import DocsKnowledgeBackend
 from integrations.playwright_browser import PlaywrightBrowserAdapter
@@ -143,6 +144,12 @@ _resume_assembler = ResumeAssembler(
 memory_store = SQLiteMemoryStore(DB_PATH)
 _memory_service = DurableMemoryService(memory_store)
 _user_model_engine = UserModelEngine(_memory_service, store=memory_store)
+_unified_context_builder = UnifiedContextBuilder(
+    code_graph=code_graph,
+    memory_service=_memory_service,
+    user_model_engine=_user_model_engine,
+    design_dir=ROOT / "data" / "designs",
+)
 
 
 
@@ -1170,6 +1177,42 @@ async def code_context(node_id: str, project_id: str | None = None, context_line
     return {"status": "ok", "project_id": project.project_id, "tier": tier, "node": _node_payload(node), "source": source, "start_line": start, "end_line": end, "truncated": truncated, "dependencies": [_node_payload(n) for n in dependencies], "dependents": [_node_payload(n) for n in dependents]}
 
 
+@mcp.tool()
+async def assemble_context(
+    step_title: str,
+    project_id: str | None = None,
+    target_role: str = "backend_coder",
+    step_instruction: str = "",
+    target_files: list[str] | None = None,
+    token_budget: int = 4000,
+) -> dict[str, object]:
+    """Assembles a unified, bounded context combining CodeGraph AST symbols, L2/L3 Durable Memory,
+    UserModel preferences, and UI Design contracts into an optimized specialist prompt section.
+    """
+    resolved_project_id = project_id
+    if not resolved_project_id or not resolved_project_id.strip():
+        project = await projects.get_active()
+        if project:
+            resolved_project_id = project.project_id
+        else:
+            return {"error": "project_id is mandatory and no active project is selected"}
+
+    try:
+        role = AgentRole(target_role.strip().lower())
+    except ValueError:
+        role = AgentRole.BACKEND_CODER
+
+    ctx = await _unified_context_builder.build_context(
+        project_id=resolved_project_id,
+        step_title=step_title,
+        step_instruction=step_instruction,
+        target_role=role,
+        target_files=target_files,
+        token_budget=token_budget,
+    )
+    return ctx.to_dict()
+
+
 def _require_external_coder_runtime() -> None:
     if (
         settings.coder_runtime_mode
@@ -1444,6 +1487,7 @@ async def run_whole_plan(
         plan_id=plan_id,
         agent_run_service=_agent_run_service,
         worker_task_launcher=_ensure_in_process_coder_worker,
+        context_builder=_unified_context_builder,
     )
 
     coordinator = WholePlanCoordinator(
