@@ -261,14 +261,22 @@ async def test_front_agent_preference_awareness(user_model_engine: UserModelEngi
 
 
 @pytest.mark.asyncio
-async def test_mcp_server_tools_direct() -> None:
+async def test_mcp_server_tools_direct(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from my_agent_mcp.server import (
         _initialize,
         get_user_profile,
         list_user_preferences,
+        projects,
         retract_user_preference,
         set_user_preference,
     )
+    from core.project import ProjectRecord
+    monkeypatch.setenv("MYAGENT_WORKSPACE", str(tmp_path))
+    existing = await projects.get("test-mcp-proj")
+    if existing is None:
+        await projects.create(ProjectRecord("test-mcp-proj", "test-mcp-proj", str(tmp_path)))
+    else:
+        await projects.update(ProjectRecord("test-mcp-proj", "test-mcp-proj", str(tmp_path)))
     await _initialize()
 
     # 1. set_user_preference

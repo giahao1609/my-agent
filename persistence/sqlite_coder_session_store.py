@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import datetime, timezone
+from collections.abc import Generator
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 from core.context import ExecutionContext
@@ -16,10 +18,15 @@ class SQLiteCoderSessionStore:
     async def initialize(self) -> None:
         await asyncio.to_thread(self._initialize_sync)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Generator[sqlite3.Connection]:
         connection = sqlite3.connect(self._database_path)
         connection.row_factory = sqlite3.Row
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _initialize_sync(self) -> None:
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,7 +61,7 @@ class SQLiteCoderSessionStore:
         await asyncio.to_thread(self._save_sync, session)
 
     def _save_sync(self, session: SessionRecord) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         context = session.context
 
         with self._connect() as connection:

@@ -41,8 +41,10 @@ logs/
 *.db
 *.db-wal
 *.db-shm
+*.backup*
 data/*.db
 data/*.key
+data/*.backup*
 *.key
 
 # Coverage reports

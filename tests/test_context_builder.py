@@ -20,6 +20,7 @@ from core.context_builder import (
     UserPreferenceContextItem,
 )
 from core.durable_memory_service import DurableMemoryService, MemoryMatch
+from core.project import ProjectRecord
 from core.handoff_contracts import ImplementationResult
 from core.memory import MemoryLevel, MemoryRecord, MemoryStatus, MemoryType
 from core.step_execution import CoderRuntimeStepExecutor
@@ -529,13 +530,17 @@ async def test_context_builder_strict_project_isolation():
 
 
 @pytest.mark.asyncio
-async def test_context_builder_mcp_assemble_context_tool(monkeypatch):
+async def test_context_builder_mcp_assemble_context_tool(monkeypatch, tmp_path):
     import my_agent_mcp.server as server_mod
 
     # Setup active project mock
-    mock_project = MagicMock()
-    mock_project.project_id = "proj-mcp"
-    server_mod.projects.get_active = AsyncMock(return_value=mock_project)
+    mock_project = ProjectRecord(
+        project_id="proj-mcp",
+        name="MCP Project",
+        workspace_path=str(tmp_path),
+    )
+    monkeypatch.setattr(server_mod.projects, "list", AsyncMock(return_value=[mock_project]))
+    server_mod._auth_manager.set_server_workspace(tmp_path)
 
     # Assemble context via tool
     res = await server_mod.assemble_context(

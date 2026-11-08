@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from core.goal_drift_monitor import GoalDriftMonitor
+from core.project import ProjectRecord
 from core.repo_map import RepoMapCompactor
 from my_agent_mcp import server
 
@@ -87,7 +88,9 @@ def test_goal_drift_monitor_invariant_violations() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_repo_map_and_drift_tools(tmp_path: Path) -> None:
+async def test_mcp_repo_map_and_drift_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MYAGENT_WORKSPACE", str(tmp_path))
+    await server._initialize()
     # 1. get_repo_map tool
     (tmp_path / "main.py").write_text("def start_app(): pass\n", encoding="utf-8")
     map_res = await server.get_repo_map(str(tmp_path), max_tokens=100)

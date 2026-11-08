@@ -131,7 +131,8 @@ async def test_sqlite_plan_store_migrates_legacy_plan_steps_table(
     database_path = tmp_path / "legacy.db"
     now = datetime.now(UTC).isoformat()
 
-    with sqlite3.connect(database_path) as connection:
+    connection = sqlite3.connect(database_path)
+    try:
         connection.execute(
             """
             CREATE TABLE plan_steps (
@@ -170,6 +171,9 @@ async def test_sqlite_plan_store_migrates_legacy_plan_steps_table(
                 now,
             ),
         )
+        connection.commit()
+    finally:
+        connection.close()
 
     plans = SQLitePlanStore(database_path)
     await plans.initialize()
@@ -179,12 +183,15 @@ async def test_sqlite_plan_store_migrates_legacy_plan_steps_table(
     assert restored is not None
     assert restored.execution_session_id is None
 
-    with sqlite3.connect(database_path) as connection:
+    connection = sqlite3.connect(database_path)
+    try:
         columns = {
             row[1]
             for row in connection.execute(
                 "PRAGMA table_info(plan_steps)"
             ).fetchall()
         }
+    finally:
+        connection.close()
 
     assert "execution_session_id" in columns

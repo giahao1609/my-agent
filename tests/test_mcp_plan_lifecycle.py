@@ -30,6 +30,9 @@ async def build_stores(tmp_path):
         )
     )
 
+    server._auth_manager.set_server_workspace(tmp_path)
+    server._auth_manager.set_project_store(projects)
+
     return projects, tasks, plans
 
 

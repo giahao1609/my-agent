@@ -223,6 +223,43 @@ Do not substitute one subsystem for another.
 - **User Repository Isolation & Zero-Pollution Policy:**
   STRICTLY FORBIDDEN from creating internal metadata files, design contracts (`DESIGN.md`), temporary notes, or status reports inside the user's project repository. All system configuration files, design profiles, caches, checkpoints, and governance artifacts MUST BE STORED EXCLUSIVELY inside MyAgent's internal repository (`/Users/haohg/Project/my-agent/data/` or `.agents/`). The user's target repository must contain only actual production code requested by the user.
 
+## Global Git Branch & Development Governance Policy — MANDATORY
+
+This development governance policy is strictly enforced across ALL projects and repositories (MyAgent, Teachora AI, AI Protein Design System, VietRAG, and any current/future workspaces) and across ALL AI agents and hosts (Antigravity, Codex, Claude Code, Houhou):
+
+1. **Project Auto-Discovery Protocol:**
+   - Before implementing any feature, the AI Agent must dynamically detect the target repository:
+     - Identify the actual repository path and Git root (`git rev-parse --show-toplevel`).
+     - Inspect repository structure, documentation, and existing conventions.
+     - Inspect `git status`, current branch, HEAD, uncommitted changes, and working tree state.
+     - Never assume the repository is `my-agent`. Never hard-code repository paths or static branch names across projects.
+2. **Mandatory Dedicated Feature Branch:**
+   - Prior to modifying any source code for net-new feature implementation:
+     - Always create and checkout a dedicated feature branch (`feat/<task-name>` or `<type>/<scope>`).
+     - Strictly prohibited from developing directly on `main`, `master`, or protected branches.
+     - Never arbitrarily reset, clean, stash, or overwrite existing uncommitted changes in the working tree.
+     - Never auto-merge into main without user review and explicit approval.
+   - Read-only audit tasks do not mandate branch creation as long as no source files are mutated.
+3. **8-Stage Standard Development Lifecycle (with Mandatory User Local Acceptance Gate):**
+   `Project Discovery -> Git Audit -> Feature Branch Checkout -> Implementation -> Automated Testing -> Local Server Verification -> User Local Acceptance (UAT) -> Approved Git Merge`
+   - **Local Server Verification:** Spin up frontend/backend on local, confirm accessibility, provide exact localhost URL/port and test instructions. Keep local service running.
+   - **Mandatory User Local Acceptance Gate:** Agent MUST STOP execution at state `AWAITING_USER_LOCAL_ACCEPTANCE`. Never auto-transition to `APPROVED`. The user directly tests UI, API, and features.
+   - **Strict Git Approval Gate:** User acceptance of UI/API DOES NOT authorize automatic Git push or merge. Strictly prohibited from auto-commit, auto-push, auto-PR, auto-merge, or auto-deploy without explicit user confirmation and granted Git scope.
+   - **Core Invariants:**
+     - `AUTOMATED TEST PASS != USER ACCEPTANCE.`
+     - `LOCAL UI/API MUST BE AVAILABLE FOR USER TESTING.`
+     - `NO USER ACCEPTANCE -> NO COMMIT / PUSH.`
+     - `NO EXPLICIT GIT APPROVAL -> NO PR / MERGE / DEPLOY.`
+4. **Standard Branch Naming Convention (`<type>/<scope>-<description>`):**
+   - Must use standard format: `<type>/<scope>-<description>`.
+   - Types: `feat/` (feature), `fix/` (bugfix), `refactor/` (refactoring), `docs/` (documentation), `test/` (tests), `chore/` (config/maintenance), `revert/` (reverts).
+   - Only lowercase alphanumeric characters and hyphens (`[a-z0-9-]`). No spaces, uppercase, or shell-breaking characters.
+   - Strictly prohibited from generic names (`new-feature`, `fix-bug`).
+   - No arbitrary phase numbers unless explicitly mandated by project roadmap.
+   - Strictly prohibited from renaming, deleting, or force-pushing existing branches.
+5. **Universal Applicability:**
+   - Enforced unconditionally across all downstream specialist agents, runtime hosts, and repositories.
+
 ## Multi-Plan and Decision-Driven Interaction Protocol
 
 For EVERY user question, audit, or task request:

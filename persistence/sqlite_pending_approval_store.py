@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 import json
-from pathlib import Path
 import sqlite3
+from collections.abc import Generator
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 DEFAULT_APPROVAL_MAX_AGE_SECONDS: float = 86400.0  # 24 hours
 
 
 def _utc_iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class SqlitePendingApprovalStore:
@@ -35,10 +37,15 @@ class SqlitePendingApprovalStore:
     async def initialize(self) -> None:
         await asyncio.to_thread(self._initialize_sync)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Generator[sqlite3.Connection]:
         conn = sqlite3.connect(self._database_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _initialize_sync(self) -> None:
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -117,13 +124,13 @@ class SqlitePendingApprovalStore:
 
     def is_expired(self, approval: dict[str, Any], now: datetime | None = None) -> bool:
         """Determines whether a pending approval record has exceeded its expiration TTL."""
-        ref_now = now or datetime.now(timezone.utc)
+        ref_now = now or datetime.now(UTC)
         expires_at_str = approval.get("expires_at")
         if expires_at_str:
             try:
                 exp_dt = datetime.fromisoformat(expires_at_str)
                 if exp_dt.tzinfo is None:
-                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                    exp_dt = exp_dt.replace(tzinfo=UTC)
                 return ref_now >= exp_dt
             except (ValueError, TypeError):
                 pass
@@ -133,7 +140,7 @@ class SqlitePendingApprovalStore:
             try:
                 created_dt = datetime.fromisoformat(created_at_str)
                 if created_dt.tzinfo is None:
-                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+                    created_dt = created_dt.replace(tzinfo=UTC)
                 return (ref_now - created_dt).total_seconds() >= self._default_max_age_seconds
             except (ValueError, TypeError):
                 pass
@@ -144,7 +151,7 @@ class SqlitePendingApprovalStore:
 
     def _save_sync(self, approval: dict[str, Any]) -> None:
         tool_call_id = approval["tool_call_id"]
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(UTC)
 
         with self._connect() as conn:
             existing = conn.execute(
@@ -224,7 +231,7 @@ class SqlitePendingApprovalStore:
                 try:
                     c_dt = datetime.fromisoformat(created_at)
                     if c_dt.tzinfo is None:
-                        c_dt = c_dt.replace(tzinfo=timezone.utc)
+                        c_dt = c_dt.replace(tzinfo=UTC)
                 except (ValueError, TypeError):
                     c_dt = now_dt
                 expires_at = (c_dt + timedelta(seconds=self._default_max_age_seconds)).isoformat()
@@ -336,7 +343,7 @@ class SqlitePendingApprovalStore:
         project_id: str | None = None,
         note: str = "",
     ) -> dict[str, Any] | None:
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(UTC)
         now_iso = now_dt.isoformat()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")

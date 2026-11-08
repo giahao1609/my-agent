@@ -8,6 +8,7 @@ import pytest
 
 from core.coverage_gate import CoverageGateCoordinator
 from core.handoff_contracts import TestResult
+from core.project import ProjectRecord
 from core.test_runner import PytestRunnerAdapter, NpmTestRunnerAdapter, GoTestRunnerAdapter
 from core.visual_diff import VisualDiffValidator
 from my_agent_mcp import server
@@ -134,7 +135,9 @@ def test_visual_diff_missing_files() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_coverage_and_visual_tools(tmp_path: Path) -> None:
+async def test_mcp_coverage_and_visual_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MYAGENT_WORKSPACE", str(tmp_path))
+    await server._initialize()
     # 1. compare_visual_diff tool
     img1 = tmp_path / "v1.png"
     img2 = tmp_path / "v2.png"

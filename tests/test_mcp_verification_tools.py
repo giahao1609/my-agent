@@ -38,6 +38,9 @@ async def build_stores(tmp_path: Path):
     await projects.create(project)
     await projects.set_active("test-proj-1")
 
+    server._auth_manager.set_server_workspace(tmp_path)
+    server._auth_manager.set_project_store(projects)
+
     return projects, conversations, checkpoints, code_graph, tasks, plans
 
 
@@ -78,7 +81,9 @@ async def test_mcp_start_coder_session_rejects_injection(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_mcp_scan_security_clean_workspace(tmp_path):
+async def test_mcp_scan_security_clean_workspace(tmp_path, monkeypatch):
+    projects, convs, ckpts, cgraph, tasks, plans = await build_stores(tmp_path)
+    patch_server(monkeypatch, projects, convs, ckpts, cgraph, tasks, plans)
     # Clean workspace
     (tmp_path / "main.py").write_text("def hello():\n    return 'world'\n")
     res = await server.scan_security(str(tmp_path), step_id="step-1")
@@ -87,7 +92,9 @@ async def test_mcp_scan_security_clean_workspace(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_scan_security_detects_secrets(tmp_path):
+async def test_mcp_scan_security_detects_secrets(tmp_path, monkeypatch):
+    projects, convs, ckpts, cgraph, tasks, plans = await build_stores(tmp_path)
+    patch_server(monkeypatch, projects, convs, ckpts, cgraph, tasks, plans)
     # Workspace with hardcoded secret
     (tmp_path / "secret.py").write_text("AWS_KEY = 'AKIA1234567890123456'\n")
     res = await server.scan_security(str(tmp_path), step_id="step-2")
@@ -96,7 +103,9 @@ async def test_mcp_scan_security_detects_secrets(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_verify_step(tmp_path):
+async def test_mcp_verify_step(tmp_path, monkeypatch):
+    projects, convs, ckpts, cgraph, tasks, plans = await build_stores(tmp_path)
+    patch_server(monkeypatch, projects, convs, ckpts, cgraph, tasks, plans)
     (tmp_path / "app.py").write_text("def add(a, b):\n    return a + b\n")
     res = await server.verify_step(step_id="step-100", workspace_path=str(tmp_path))
     assert "status" in res
@@ -200,7 +209,9 @@ async def test_mcp_run_red_team_assessment_category():
 
 
 @pytest.mark.asyncio
-async def test_mcp_generate_ui_design_profile(tmp_path):
+async def test_mcp_generate_ui_design_profile(tmp_path, monkeypatch):
+    projects, convs, ckpts, cgraph, tasks, plans = await build_stores(tmp_path)
+    patch_server(monkeypatch, projects, convs, ckpts, cgraph, tasks, plans)
     res = await server.generate_ui_design_profile(
         project_description="High-end fashion editorial store",
         sector="creative_agency",

@@ -3,9 +3,19 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 import json
+import logging
+import os
 from pathlib import Path
+import re
+import sys
 from typing import Any, Sequence
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from mcp.server import MCPServer
 
@@ -32,6 +42,10 @@ from core.project import ProjectRecord
 from core.session import SessionState
 from core.task import TaskRecord
 from core.task_service import TaskService
+from core.security_authorization import (
+    SecurityAuthorizationManager,
+    SecurityAuthorizationError,
+)
 from core.tools import ToolPermission
 from persistence.sqlite_checkpoint_store import SQLiteCheckpointStore
 from persistence.sqlite_code_graph_store import SQLiteCodeGraphStore
@@ -120,9 +134,10 @@ from core.resume_assembler import ResumeAssembler
 from core.git_review_coordinator import GitReviewCoordinator, parse_github_remote
 
 ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = ROOT / "data" / "my_agent.db"
+DB_PATH = Path(os.environ.get("MYAGENT_DB_PATH", ROOT / "data" / "my_agent.db"))
 
 projects = SQLiteProjectStore(DB_PATH)
+_global_projects = projects
 conversations = SQLiteConversationStore(DB_PATH)
 checkpoints = SQLiteCheckpointStore(DB_PATH)
 code_graph = SQLiteCodeGraphStore(DB_PATH)
@@ -150,6 +165,7 @@ _unified_context_builder = UnifiedContextBuilder(
     user_model_engine=_user_model_engine,
     design_dir=ROOT / "data" / "designs",
 )
+_auth_manager = SecurityAuthorizationManager(projects)
 
 
 
@@ -166,7 +182,6 @@ _security_scanner_registry = SecurityScannerRegistry()
 _test_runner_registry = TestRunnerRegistry()
 _verification_gate_coordinator = VerificationGateCoordinator()
 _evaluation_harness = EvaluationHarness()
-_docs_knowledge: DocsKnowledgeBackend | None = None
 _playwright_browser = PlaywrightBrowserAdapter(
     artifacts_dir=ROOT / "data" / "browser_artifacts"
 )
@@ -203,7 +218,6 @@ mcp = MCPServer("my-agent")
 
 
 async def _initialize() -> None:
-    global _docs_knowledge
     await projects.initialize()
     await conversations.initialize()
     await checkpoints.initialize()
@@ -215,11 +229,60 @@ async def _initialize() -> None:
     await memory_store.initialize()
     await pending_approvals.initialize()
     await _handoff_history_store.initialize()
-    # Bootstrap docs knowledge backend for active project workspace
-    if _docs_knowledge is None:
-        active = await projects.get_active()
-        workspace = Path(active.workspace_path) if active else ROOT
-        _docs_knowledge = DocsKnowledgeBackend(workspace_root=workspace)
+
+    env_ws_str = os.environ.get("MYAGENT_WORKSPACE")
+    if env_ws_str:
+        env_ws = Path(env_ws_str).expanduser().resolve()
+        cwd = Path.cwd().resolve()
+        if cwd != env_ws and not cwd.is_relative_to(env_ws) and not env_ws.is_relative_to(cwd):
+            logger.warning(
+                "Process working directory '%s' does not match MYAGENT_WORKSPACE '%s'. Enforcing MYAGENT_WORKSPACE.",
+                cwd,
+                env_ws,
+            )
+        bound_workspace = env_ws
+    else:
+        bound_workspace = Path.cwd().resolve()
+
+    disallowed_roots = {
+        Path("/"),
+        Path("/private"),
+        Path("/tmp"),
+        Path("/var"),
+        Path("/etc"),
+        Path("/usr"),
+        Path("/bin"),
+        Path("/System"),
+        Path.home(),
+    }
+
+    if bound_workspace not in disallowed_roots:
+        _auth_manager.set_server_workspace(bound_workspace)
+    _auth_manager.set_project_store(projects)
+
+    # Auto-register bound workspace if it is an existing directory, not registered yet, and not a system root
+    try:
+        records = await projects.list()
+        bound_key = str(bound_workspace).casefold()
+        matching = [
+            p for p in records
+            if str(Path(p.workspace_path).expanduser().resolve()).casefold() == bound_key
+        ]
+        if not matching and bound_workspace.exists() and bound_workspace.is_dir() and bound_workspace not in disallowed_roots:
+            base_id = bound_workspace.name.strip() or "project"
+            existing_ids = {p.project_id for p in records}
+            proj_id = base_id
+            if proj_id in existing_ids:
+                import hashlib
+                suffix = hashlib.sha1(bound_key.encode("utf-8")).hexdigest()[:8]
+                proj_id = f"{base_id}-{suffix}"
+            await projects.create(ProjectRecord(
+                project_id=proj_id,
+                name=bound_workspace.name or proj_id,
+                workspace_path=str(bound_workspace),
+            ))
+    except Exception as exc:
+        logger.debug("Failed auto-registering workspace during init: %s", exc)
 
 
 def _project_payload(project: ProjectRecord) -> dict[str, object]:
@@ -307,11 +370,116 @@ class _ServerPlanStepCoderLauncher:
         )
 
 
+async def _resolve_project(
+    project_id: str | None = None,
+) -> ProjectRecord | None:
+    _auth_manager.set_project_store(projects)
+    if project_id is not None and project_id.strip():
+        return await _auth_manager.authorize_project(project_id=project_id.strip())
+
+    try:
+        return await _auth_manager.authorize_project(project_id=None)
+    except SecurityAuthorizationError as exc:
+        logger.debug("No active authorized project for bound workspace: %s", exc)
+        return None
+
+
+async def _require_bound_project(
+    project_id: str | None = None,
+) -> ProjectRecord:
+    project = await _resolve_project(project_id)
+    if project is None:
+        bound_ws = _auth_manager.get_server_workspace()
+        raise SecurityAuthorizationError(
+            f"NO_AUTHORIZED_PROJECT: Server workspace '{bound_ws}' has no authorized project.",
+            violation_type="UNAUTHORIZED_WORKSPACE",
+        )
+    return project
+
+
+async def _authorize_task(task_id: str, *, require_exists: bool = False) -> tuple[TaskRecord | None, ProjectRecord]:
+    task = await _task_service().get_task(task_id)
+    bound_project = await _require_bound_project()
+    if task is None:
+        if require_exists:
+            raise KeyError(f"unknown task: {task_id}")
+        return None, bound_project
+    if task.project_id != bound_project.project_id:
+        _auth_manager._log_security_audit(
+            event="AUTHORIZE_TASK",
+            decision="DENIED",
+            reason="CROSS_PROJECT_IDOR_TASK_ACCESS_FORBIDDEN",
+            project_id=task.project_id,
+            authorized_project_id=bound_project.project_id,
+        )
+        raise SecurityAuthorizationError(
+            f"CROSS_PROJECT_IDOR_VIOLATION: Task '{task_id}' belongs to project '{task.project_id}', "
+            f"which does not match authorized server project '{bound_project.project_id}'.",
+            requested_project_id=task.project_id,
+            authorized_project_id=bound_project.project_id,
+            violation_type="CROSS_PROJECT_IDOR",
+        )
+    return task, bound_project
+
+
+async def _authorize_plan(plan_id: str, *, require_exists: bool = True) -> tuple[PlanRecord | None, TaskRecord | None, ProjectRecord]:
+    plan = await plans.get_plan(plan_id)
+    if plan is None:
+        if require_exists:
+            raise KeyError(f"unknown plan: {plan_id}")
+        bound_project = await _require_bound_project()
+        return None, None, bound_project
+    task, bound_project = await _authorize_task(plan.task_id, require_exists=False)
+    return plan, task, bound_project
+
+
+async def _authorize_step(step_id: str, *, require_exists: bool = False) -> tuple[PlanStepRecord | None, PlanRecord | None, TaskRecord | None, ProjectRecord]:
+    step = await plans.get_step(step_id)
+    if step is None:
+        if require_exists:
+            raise KeyError(f"unknown step: {step_id}")
+        bound_project = await _require_bound_project()
+        return None, None, None, bound_project
+    plan, task, bound_project = await _authorize_plan(step.plan_id, require_exists=False)
+    return step, plan, task, bound_project
+
+
+async def _authorize_agent_run(run_id: str) -> tuple[AgentRunRecord, ProjectRecord]:
+    run = await _agent_run_service.get_run(run_id)
+    if run is None:
+        raise KeyError(f"unknown run: {run_id}")
+    bound_project = await _require_bound_project()
+    if run.project_id != bound_project.project_id:
+        _auth_manager._log_security_audit(
+            event="AUTHORIZE_AGENT_RUN",
+            decision="DENIED",
+            reason="CROSS_PROJECT_IDOR_AGENT_RUN_ACCESS_FORBIDDEN",
+            project_id=run.project_id,
+            authorized_project_id=bound_project.project_id,
+        )
+        raise SecurityAuthorizationError(
+            f"CROSS_PROJECT_IDOR_VIOLATION: AgentRun '{run_id}' belongs to project '{run.project_id}', "
+            f"which does not match authorized server project '{bound_project.project_id}'.",
+            requested_project_id=run.project_id,
+            authorized_project_id=bound_project.project_id,
+            violation_type="CROSS_PROJECT_IDOR",
+        )
+    return run, bound_project
+
+
+async def _authorize_decision(decision_id: str) -> tuple[DecisionRecord, TaskRecord | None, ProjectRecord]:
+    rec = await _decision_service.get_decision(decision_id)
+    if rec is None:
+        raise KeyError(f"unknown decision: {decision_id}")
+    task, bound_project = await _authorize_task(rec.task_id, require_exists=False)
+    return rec, task, bound_project
+
+
 @mcp.tool()
 async def my_agent_status() -> dict[str, object]:
     """Return MyAgent persistence status and the active project."""
     await _initialize()
-    active = await projects.get_active()
+    active = await _resolve_project(None)
     active_coder_workers = sorted(
         session_id
         for session_id, task in _coder_worker_tasks.items()
@@ -363,11 +531,35 @@ async def list_capabilities(filter_status: str | None = None) -> list[dict[str, 
 
 
 @mcp.tool()
-async def list_projects() -> list[dict[str, object]]:
-    """List all projects known to MyAgent."""
+async def list_projects(admin_token: str | None = None) -> list[dict[str, object]]:
+    """List projects authorized for the active server workspace, or all if verified admin."""
     await _initialize()
+    bound_ws = _auth_manager.get_server_workspace()
     records = await projects.list()
-    return [_project_payload(project) for project in records]
+
+    admin_secret = os.environ.get("MYAGENT_ADMIN_SECRET")
+    if admin_secret and admin_token == admin_secret:
+        _auth_manager._log_security_audit(
+            event="LIST_PROJECTS",
+            decision="ALLOWED",
+            reason="ADMIN_TOKEN_VERIFIED",
+        )
+        return [_project_payload(project) for project in records]
+
+    # Standard non-admin client: strictly filter to projects within or owning the bound server workspace
+    scoped_projects: list[ProjectRecord] = []
+    for p in records:
+        proj_root = Path(p.workspace_path).expanduser().resolve()
+        if proj_root == bound_ws or proj_root.is_relative_to(bound_ws) or bound_ws.is_relative_to(proj_root):
+            scoped_projects.append(p)
+
+    _auth_manager._log_security_audit(
+        event="LIST_PROJECTS",
+        decision="ALLOWED",
+        reason="SCOPED_TO_BOUND_WORKSPACE",
+        authorized_project_id=scoped_projects[0].project_id if scoped_projects else None,
+    )
+    return [_project_payload(p) for p in scoped_projects]
 
 
 @mcp.tool()
@@ -376,24 +568,70 @@ async def register_project(
     name: str,
     workspace_path: str,
 ) -> dict[str, object]:
-    """Register an existing workspace as a MyAgent project without creating or modifying its source files."""
+    """Register an existing workspace as a MyAgent project within the authorized server boundary."""
     await _initialize()
+    bound_ws = _auth_manager.get_server_workspace()
+    target_path = Path(workspace_path).expanduser().resolve()
+
+    if not target_path.exists() or not target_path.is_dir():
+        raise ValueError(f"Workspace path does not exist or is not a directory: {workspace_path}")
+
+    # Enforce containment within server's verified bound workspace
+    if not (target_path == bound_ws or target_path.is_relative_to(bound_ws)):
+        _auth_manager._log_security_audit(
+            event="REGISTER_PROJECT",
+            decision="DENIED",
+            reason="EXTERNAL_WORKSPACE_REGISTRATION_FORBIDDEN",
+            project_id=project_id,
+            target_path=str(target_path),
+        )
+        raise SecurityAuthorizationError(
+            f"UNAUTHORIZED_REGISTRATION: Cannot register workspace '{target_path}' outside "
+            f"the server authorized boundary '{bound_ws}'.",
+            requested_project_id=project_id,
+            caller_path=str(target_path),
+            violation_type="UNAUTHORIZED_WORKSPACE",
+        )
+
+    # Prevent overwriting or hijacking existing projects
+    existing = await projects.get(project_id)
+    if existing is not None:
+        _auth_manager._log_security_audit(
+            event="REGISTER_PROJECT",
+            decision="DENIED",
+            reason="PROJECT_ALREADY_EXISTS_HIJACKING_PREVENTED",
+            project_id=project_id,
+            target_path=str(target_path),
+        )
+        raise SecurityAuthorizationError(
+            f"PROJECT_ALREADY_EXISTS: Cannot overwrite or hijack existing project '{project_id}'.",
+            requested_project_id=project_id,
+            violation_type="PROJECT_HIJACK_ATTEMPT",
+        )
+
     project = ProjectRecord(
         project_id=project_id,
         name=name,
-        workspace_path=workspace_path,
+        workspace_path=str(target_path),
     )
     await projects.create(project)
-    await projects.set_active(project_id)
+    _auth_manager._log_security_audit(
+        event="REGISTER_PROJECT",
+        decision="ALLOWED",
+        reason="PROJECT_REGISTERED_WITHIN_BOUNDARY",
+        project_id=project_id,
+        authorized_project_id=project_id,
+        target_path=str(target_path),
+    )
     return _project_payload(project)
 
 
 
 @mcp.tool()
 async def switch_project(project_id: str) -> dict[str, object]:
-    """Switch MyAgent to another persistent project."""
+    """Switch MyAgent to another persistent project within the authorized server boundary."""
     await _initialize()
-    project = await projects.set_active(project_id)
+    project = await _auth_manager.authorize_project(project_id=project_id)
     return {
         "status": "switched",
         "project": _project_payload(project),
@@ -409,16 +647,7 @@ async def create_task(
     """Create a durable task for the active or specified project."""
     await _initialize()
 
-    if project_id is None:
-        project = await projects.get_active()
-    else:
-        project = await projects.get(project_id)
-
-    if project is None:
-        return {
-            "status": "no_active_project",
-            "task": None,
-        }
+    project = await _require_bound_project(project_id)
 
     resolved_task_id = task_id or f"task-{uuid4().hex}"
 
@@ -441,7 +670,9 @@ async def start_task(
     """Activate a durable task for its project."""
     await _initialize()
 
-    task = await _task_service().start_task(task_id)
+    task, project = await _authorize_task(task_id, require_exists=True)
+
+    task = await _task_service().start_task(task.task_id)
 
     return {
         "status": "started",
@@ -456,16 +687,7 @@ async def get_active_task(
     """Return the active durable task for a project."""
     await _initialize()
 
-    if project_id is None:
-        project = await projects.get_active()
-    else:
-        project = await projects.get(project_id)
-
-    if project is None:
-        return {
-            "status": "no_active_project",
-            "task": None,
-        }
+    project = await _require_bound_project(project_id)
 
     task = await _task_service().get_active_task(
         project.project_id,
@@ -490,16 +712,7 @@ async def list_tasks(
     """List durable tasks for the active or specified project."""
     await _initialize()
 
-    if project_id is None:
-        project = await projects.get_active()
-    else:
-        project = await projects.get(project_id)
-
-    if project is None:
-        return {
-            "status": "no_active_project",
-            "tasks": [],
-        }
+    project = await _require_bound_project(project_id)
 
     records = await _task_service().list_tasks(
         project.project_id,
@@ -522,10 +735,7 @@ async def cancel_task(
     """Cancel a durable task when it has no resumable coder session."""
     await _initialize()
 
-    service = _task_service()
-    task = await service.get_task(task_id)
-    if task is None:
-        raise KeyError(f"unknown task: {task_id}")
+    task, project = await _authorize_task(task_id, require_exists=True)
 
     stack = await _get_coder_stack()
     session = await stack.session_store.get_latest_resumable(
@@ -542,7 +752,8 @@ async def cancel_task(
             "session_state": session.state.value,
         }
 
-    task = await service.cancel_task(task_id)
+    service = _task_service()
+    task = await service.cancel_task(task.task_id)
 
     return {
         "status": "cancelled",
@@ -557,10 +768,7 @@ async def complete_task(
     """Complete a durable task when it has no resumable coder session."""
     await _initialize()
 
-    service = _task_service()
-    task = await service.get_task(task_id)
-    if task is None:
-        raise KeyError(f"unknown task: {task_id}")
+    task, project = await _authorize_task(task_id, require_exists=True)
 
     stack = await _get_coder_stack()
     session = await stack.session_store.get_latest_resumable(
@@ -577,7 +785,8 @@ async def complete_task(
             "session_state": session.state.value,
         }
 
-    task = await service.complete_task(task_id)
+    service = _task_service()
+    task = await service.complete_task(task.task_id)
 
     return {
         "status": "completed",
@@ -595,19 +804,11 @@ async def propose_task_plan(
     """Generate and persist a model-proposed Draft Plan for a durable task."""
     await _initialize()
 
-    task = await _task_service().get_task(task_id)
-    if task is None:
-        raise KeyError(f"unknown task: {task_id}")
+    task, project = await _authorize_task(task_id, require_exists=True)
 
     if task.terminal:
         raise ValueError(
             f"cannot plan terminal task: {task_id}"
-        )
-
-    project = await projects.get(task.project_id)
-    if project is None:
-        raise KeyError(
-            f"unknown project for task: {task.project_id}"
         )
 
     composition = await _get_model_composition()
@@ -654,6 +855,8 @@ async def start_plan_step_execution(
     """Start one active PlanStep in a dedicated Coder session."""
     await _initialize()
 
+    step, plan, task, project = await _authorize_step(step_id)
+
     coordinator = PlanStepExecutionCoordinator(
         task_store=tasks,
         plan_store=plans,
@@ -663,7 +866,7 @@ async def start_plan_step_execution(
     )
 
     execution = await coordinator.start_step_execution(
-        step_id
+        step.step_id
     )
 
     return {
@@ -682,10 +885,12 @@ async def create_plan(
     """Create a durable plan revision for a task."""
     await _initialize()
 
+    task, project = await _authorize_task(task_id, require_exists=True)
+
     resolved_plan_id = plan_id or f"plan-{uuid4().hex}"
 
     plan = await _plan_service().create_plan(
-        task_id=task_id,
+        task_id=task.task_id,
         plan_id=resolved_plan_id,
     )
 
@@ -702,11 +907,13 @@ async def list_plans(
     """List durable plan revisions for a task."""
     await _initialize()
 
-    records = await _plan_service().list_plans(task_id)
+    task, project = await _authorize_task(task_id, require_exists=True)
+
+    records = await _plan_service().list_plans(task.task_id)
 
     return {
         "status": "ok",
-        "task_id": task_id,
+        "task_id": task.task_id,
         "plans": [
             _plan_payload(plan)
             for plan in records
@@ -724,10 +931,12 @@ async def add_plan_step(
     """Add a durable ordered step to a plan."""
     await _initialize()
 
+    plan, task, project = await _authorize_plan(plan_id)
+
     resolved_step_id = step_id or f"step-{uuid4().hex}"
 
     step = await _plan_service().add_step(
-        plan_id=plan_id,
+        plan_id=plan.plan_id,
         step_id=resolved_step_id,
         title=title,
         instruction=instruction,
@@ -746,11 +955,13 @@ async def activate_plan(
     """Activate a durable plan for execution."""
     await _initialize()
 
-    plan = await _plan_service().activate_plan(plan_id)
+    plan, task, project = await _authorize_plan(plan_id)
+
+    activated_plan = await _plan_service().activate_plan(plan.plan_id)
 
     return {
         "status": "activated",
-        "plan": _plan_payload(plan),
+        "plan": _plan_payload(activated_plan),
     }
 
 
@@ -761,11 +972,13 @@ async def start_plan_step(
     """Mark a durable plan step as running."""
     await _initialize()
 
-    step = await _plan_service().start_step(step_id)
+    step, plan, task, project = await _authorize_step(step_id)
+
+    running_step = await _plan_service().start_step(step.step_id)
 
     return {
         "status": "started",
-        "step": _plan_step_payload(step),
+        "step": _plan_step_payload(running_step),
     }
 
 
@@ -776,11 +989,13 @@ async def complete_plan_step(
     """Mark a running durable plan step as complete."""
     await _initialize()
 
-    step = await _plan_service().complete_step(step_id)
+    step, plan, task, project = await _authorize_step(step_id)
+
+    completed_step = await _plan_service().complete_step(step.step_id)
 
     return {
         "status": "completed",
-        "step": _plan_step_payload(step),
+        "step": _plan_step_payload(completed_step),
     }
 
 
@@ -791,11 +1006,13 @@ async def complete_plan(
     """Complete an active plan after all steps are finished."""
     await _initialize()
 
-    plan = await _plan_service().complete_plan(plan_id)
+    plan, task, project = await _authorize_plan(plan_id)
+
+    completed = await _plan_service().complete_plan(plan.plan_id)
 
     return {
         "status": "completed",
-        "plan": _plan_payload(plan),
+        "plan": _plan_payload(completed),
     }
 
 
@@ -807,12 +1024,7 @@ async def resume_project(
     """Resume a project with its latest checkpoint, conversation, and history."""
     await _initialize()
 
-    if project_id is None:
-        project = await projects.get_active()
-    else:
-        project = await projects.get(project_id)
-        if project is not None:
-            await projects.set_active(project_id)
+    project = await _require_bound_project(project_id)
 
     if project is None:
         return {
@@ -827,6 +1039,11 @@ async def resume_project(
         project.project_id,
         task_id=project.active_task_id,
     )
+    if latest_checkpoint is None and project.active_task_id is not None:
+        latest_checkpoint = await checkpoints.latest(
+            project.project_id,
+            task_id=None,
+        )
     conversation_list = await conversations.list_for_project(project.project_id)
     latest_conversation = conversation_list[0] if conversation_list else None
 
@@ -842,6 +1059,7 @@ async def resume_project(
     if latest_checkpoint is not None:
         checkpoint_payload = {
             "checkpoint_id": latest_checkpoint.checkpoint_id,
+            "task_id": latest_checkpoint.task_id,
             "summary": latest_checkpoint.summary,
             "next_action": latest_checkpoint.next_action,
             "files_changed": list(latest_checkpoint.files_changed),
@@ -878,19 +1096,34 @@ async def resume_project(
 
 @mcp.tool()
 async def open_workspace(workspace_path: str) -> dict[str, object]:
-    """Open an existing workspace in MyAgent, auto-registering it if needed."""
+    """Open an existing workspace in MyAgent within the authorized server boundary."""
     await _initialize()
 
     resolved = Path(workspace_path).expanduser().resolve()
     if not resolved.exists() or not resolved.is_dir():
         raise ValueError(f"workspace does not exist or is not a directory: {resolved}")
 
+    # Enforce that workspace_path cannot escape the server's bound workspace root
+    bound_root = _auth_manager.get_server_workspace()
+    if not (resolved == bound_root or resolved.is_relative_to(bound_root)):
+        _auth_manager._log_security_audit(
+            event="OPEN_WORKSPACE",
+            decision="DENIED",
+            reason="EXTERNAL_WORKSPACE_ACCESS_FORBIDDEN",
+            target_path=str(resolved),
+        )
+        raise SecurityAuthorizationError(
+            f"UNAUTHORIZED_WORKSPACE: Server process is bound to '{bound_root}'. "
+            f"Opening external workspace '{resolved}' is strictly FORBIDDEN.",
+            caller_path=str(resolved),
+            violation_type="UNAUTHORIZED_WORKSPACE",
+        )
+
     records = await projects.list()
     resolved_key = str(resolved).casefold()
 
     for project in records:
         if str(Path(project.workspace_path).expanduser().resolve()).casefold() == resolved_key:
-            await projects.set_active(project.project_id)
             resumed = await resume_project(project.project_id)
             return {
                 "status": "resumed",
@@ -915,7 +1148,6 @@ async def open_workspace(workspace_path: str) -> dict[str, object]:
         workspace_path=str(resolved),
     )
     await projects.create(project)
-    await projects.set_active(project_id)
 
     return {
         "status": "registered",
@@ -934,14 +1166,12 @@ async def save_checkpoint(
     files_changed: list[str] | None = None,
     tests: list[str] | None = None,
     project_id: str | None = None,
+    task_id: str | None = None,
 ) -> dict[str, object]:
     """Save a persistent checkpoint for the active or specified MyAgent project."""
     await _initialize()
 
-    if project_id is None:
-        project = await projects.get_active()
-    else:
-        project = await projects.get(project_id)
+    project = await _resolve_project(project_id)
 
     if project is None:
         return {
@@ -949,23 +1179,49 @@ async def save_checkpoint(
             "checkpoint": None,
         }
 
+    # Determine effective task_id:
+    # - If task_id is explicitly provided and non-empty: validate it belongs to this project
+    # - If task_id == "": explicitly project-level (no task)
+    # - If task_id is None: default to project.active_task_id
+    effective_task_id: str | None = None
+    if task_id is not None:
+        trimmed_task = task_id.strip()
+        if trimmed_task:
+            task = await tasks.get(trimmed_task)
+            if task is None or task.project_id != project.project_id:
+                raise SecurityAuthorizationError(
+                    f"TASK_IDOR_VIOLATION: Task '{trimmed_task}' does not exist or does not belong "
+                    f"to authorized project '{project.project_id}'.",
+                    violation_type="TASK_IDOR_VIOLATION",
+                )
+            effective_task_id = trimmed_task
+        else:
+            effective_task_id = None
+    else:
+        effective_task_id = project.active_task_id
+
     checkpoint = CheckpointRecord(
         checkpoint_id=f"cp-{uuid4().hex}",
         project_id=project.project_id,
         summary=summary,
         next_action=next_action,
         conversation_id=conversation_id,
-        task_id=project.active_task_id,
+        task_id=effective_task_id,
         files_changed=tuple(files_changed or ()),
         tests=tuple(tests or ()),
     )
     await checkpoints.save(checkpoint)
+
+    # Maintain ProjectRecord consistency: update last_checkpoint_id
+    project.last_checkpoint_id = checkpoint.checkpoint_id
+    await projects.update(project)
 
     return {
         "status": "saved",
         "checkpoint": {
             "checkpoint_id": checkpoint.checkpoint_id,
             "project_id": checkpoint.project_id,
+            "task_id": checkpoint.task_id,
             "summary": checkpoint.summary,
             "next_action": checkpoint.next_action,
             "conversation_id": checkpoint.conversation_id,
@@ -991,10 +1247,7 @@ def _node_payload(node) -> dict[str, object]:
     }
 
 
-async def _resolve_project(project_id: str | None = None) -> ProjectRecord | None:
-    if project_id is None:
-        return await projects.get_active()
-    return await projects.get(project_id)
+
 
 
 async def _graph_read_guard(project_id: str) -> dict[str, object] | None:
@@ -1189,13 +1442,11 @@ async def assemble_context(
     """Assembles a unified, bounded context combining CodeGraph AST symbols, L2/L3 Durable Memory,
     UserModel preferences, and UI Design contracts into an optimized specialist prompt section.
     """
-    resolved_project_id = project_id
-    if not resolved_project_id or not resolved_project_id.strip():
-        project = await projects.get_active()
-        if project:
-            resolved_project_id = project.project_id
-        else:
-            return {"error": "project_id is mandatory and no active project is selected"}
+    project = await _resolve_project(project_id)
+    if project:
+        resolved_project_id = project.project_id
+    else:
+        return {"error": "project_id is mandatory and no active project is selected"}
 
     try:
         role = AgentRole(target_role.strip().lower())
@@ -1270,7 +1521,19 @@ async def scan_security(
 
     Returns security findings, severity summary, and whether the security gate passed.
     """
-    root = Path(workspace_path)
+    await _initialize()
+    project = await _resolve_project(None)
+    if project is None:
+        return {
+            "step_id": step_id,
+            "passed_gate": False,
+            "summary": "UNAUTHORIZED_WORKSPACE: No authorized project matching server workspace.",
+            "findings": [],
+            "total_findings": 0,
+        }
+    raw_path = Path(workspace_path)
+    target = raw_path if raw_path.is_absolute() else Path(project.workspace_path) / raw_path
+    root = _auth_manager.validate_path_containment(target, project)
     result = _security_scanner_registry.scan_workspace(root, step_id)
     return {
         "step_id": step_id,
@@ -1359,8 +1622,18 @@ async def generate_ui_design_profile(
     )
     profile = _ui_design_engine.generate_style_profile(ctx)
 
-    # Strictly isolate inside MyAgent's data directory
-    project_identifier = Path(workspace_path).name if workspace_path else "default_project"
+    # Strictly isolate inside MyAgent's data directory with workspace authorization
+    project = await _resolve_project(None)
+    if project is None:
+        raise SecurityAuthorizationError(
+            "WORKSPACE_REQUIRED: generate_ui_design_profile requires an authorized workspace/project context. "
+            "Shared fallback to unverified directories or default_project is strictly disabled."
+        )
+    if workspace_path:
+        raw_path = Path(workspace_path)
+        target = raw_path if raw_path.is_absolute() else Path(project.workspace_path) / raw_path
+        _auth_manager.validate_path_containment(target, project)
+    project_identifier = project.project_id
     out_file = _design_md_generator.write_to_agent_repo(
         profile=profile,
         project_id=project_identifier,
@@ -1431,9 +1704,18 @@ async def verify_step(
 
     Returns APPROVED, REQUEST_REWORK, or REJECTED with reasons.
     """
+    await _initialize()
+    step, plan, task, project = await _authorize_step(step_id)
+    if plan_id and plan.plan_id != plan_id:
+        raise SecurityAuthorizationError(
+            f"Plan ID mismatch: step '{step_id}' belongs to plan '{plan.plan_id}', not '{plan_id}'",
+            violation_type="CROSS_PROJECT_IDOR",
+        )
+    root = Path(workspace_path).expanduser().resolve()
+    _auth_manager.validate_path_containment(root, project)
+
     from core.handoff_contracts import ImplementationResult
 
-    root = Path(workspace_path)
     imp_result = ImplementationResult(
         step_id=step_id,
         summary=f"Verification requested for step {step_id}",
@@ -1460,11 +1742,8 @@ async def run_whole_plan(
     test gate + security gate + verification gate → APPROVED / repair loop.
     """
     await _initialize()
-    svc = _plan_service()
-    task_svc = _task_service()
-
-    plan = await plans.get_plan(plan_id)
-    if plan is None:
+    plan_rec = await plans.get_plan(plan_id)
+    if plan_rec is None:
         return {
             "error": f"plan not found: {plan_id}",
             "plan_completed": False,
@@ -1473,9 +1752,14 @@ async def run_whole_plan(
             "steps_skipped": 0,
             "review_history": [],
         }
-    task = await tasks.get(plan.task_id) if plan else None
-    project_id = task.project_id if task else None
-    task_id = task.task_id if task else None
+    plan, task, project = await _authorize_plan(plan_id)
+    root = Path(workspace_path).expanduser().resolve()
+    _auth_manager.validate_path_containment(root, project)
+
+    svc = _plan_service()
+    task_svc = _task_service()
+    project_id = project.project_id
+    task_id = task.task_id
 
     # Wire real coder runtime step executor
     stack = await _get_coder_stack()
@@ -1526,9 +1810,16 @@ async def run_benchmark(
 
     Verifies function and module latency against an SLO threshold (default 100ms).
     """
+    await _initialize()
+    project = await _resolve_project(None)
+    if project is None:
+        return {"step_id": step_id, "error": "UNAUTHORIZED_WORKSPACE: No authorized project matching server workspace."}
+    raw_path = Path(workspace_path)
+    target = raw_path if raw_path.is_absolute() else Path(project.workspace_path) / raw_path
+    root = _auth_manager.validate_path_containment(target, project)
     from core.performance_profiler import BenchmarkRunnerAdapter
     runner = BenchmarkRunnerAdapter()
-    result = await runner.run_benchmarks(Path(workspace_path), step_id=step_id, max_latency_ms=max_latency_ms)
+    result = await runner.run_benchmarks(root, step_id=step_id, max_latency_ms=max_latency_ms)
     return result.to_dict()
 
 
@@ -1555,8 +1846,15 @@ async def verify_coverage(
     min_coverage: float = 80.0,
 ) -> dict[str, object]:
     """Execute workspace tests and verify code coverage meets the required threshold."""
+    await _initialize()
+    project = await _resolve_project(None)
+    if project is None:
+        return {"step_id": step_id, "error": "UNAUTHORIZED_WORKSPACE: No authorized project matching server workspace."}
+    raw_path = Path(workspace_path)
+    target = raw_path if raw_path.is_absolute() else Path(project.workspace_path) / raw_path
+    root = _auth_manager.validate_path_containment(target, project)
     from core.coverage_gate import CoverageGateCoordinator
-    test_result = await _test_runner_registry.run_tests(Path(workspace_path), step_id)
+    test_result = await _test_runner_registry.run_tests(root, step_id)
     coordinator = CoverageGateCoordinator(default_threshold=min_coverage)
     cov_result = coordinator.evaluate_coverage(test_result, min_coverage=min_coverage)
     return cov_result.to_dict()
@@ -1587,8 +1885,15 @@ async def get_repo_map(
 
     Helps AI understand the entire codebase architecture without context overflow.
     """
+    await _initialize()
+    project = await _resolve_project(None)
+    if project is None:
+        return {"error": "UNAUTHORIZED_WORKSPACE: No authorized project matching server workspace."}
+    raw_path = Path(workspace_path)
+    target = raw_path if raw_path.is_absolute() else Path(project.workspace_path) / raw_path
+    root = _auth_manager.validate_path_containment(target, project)
     from core.repo_map import RepoMapCompactor
-    summary = RepoMapCompactor.generate_repo_map(workspace_path, max_tokens=max_tokens)
+    summary = RepoMapCompactor.generate_repo_map(str(root), max_tokens=max_tokens)
     return summary.to_dict()
 
 
@@ -1615,8 +1920,15 @@ async def detect_circular_dependencies(
     workspace_path: str,
 ) -> dict[str, object]:
     """Scan the workspace for circular import dependency cycles (A -> B -> A)."""
+    await _initialize()
+    project = await _resolve_project(None)
+    if project is None:
+        return {"error": "UNAUTHORIZED_WORKSPACE: No authorized project matching server workspace."}
+    raw_path = Path(workspace_path)
+    target = raw_path if raw_path.is_absolute() else Path(project.workspace_path) / raw_path
+    root = _auth_manager.validate_path_containment(target, project)
     from core.code_hygiene import CircularDependencyDetector
-    cycles = CircularDependencyDetector.detect_cycles(workspace_path)
+    cycles = CircularDependencyDetector.detect_cycles(str(root))
     cycle_strs = [" -> ".join(c) for c in cycles]
     return {
         "passed": len(cycles) == 0,
@@ -1630,8 +1942,15 @@ async def detect_dead_code(
     workspace_path: str,
 ) -> dict[str, object]:
     """Scan the workspace for unused (dead) functions, methods, and classes."""
+    await _initialize()
+    project = await _resolve_project(None)
+    if project is None:
+        return {"error": "UNAUTHORIZED_WORKSPACE: No authorized project matching server workspace."}
+    raw_path = Path(workspace_path)
+    target = raw_path if raw_path.is_absolute() else Path(project.workspace_path) / raw_path
+    root = _auth_manager.validate_path_containment(target, project)
     from core.code_hygiene import DeadCodeDetector
-    dead_symbols = DeadCodeDetector.detect_dead_code(workspace_path)
+    dead_symbols = DeadCodeDetector.detect_dead_code(str(root))
     return {
         "dead_symbols_count": len(dead_symbols),
         "dead_symbols": [{"file": f, "symbol": s, "line": l} for f, s, l in dead_symbols],
@@ -1669,14 +1988,22 @@ async def consolidate_memory(
         )
     target_project_id = project_id
     if not target_project_id:
-        active = await projects.get_active()
-        if active and active.project_id:
-            target_project_id = active.project_id
+        project = await _resolve_project(None)
+        if project and project.project_id:
+            target_project_id = project.project_id
         else:
             raise ValueError(
                 "PROJECT_CONTEXT_REQUIRED: consolidate_memory requires an explicit project_id "
                 "or an active registered project. Fabricating project_id from session_id is forbidden."
             )
+    else:
+        project = await _resolve_project(target_project_id)
+        if project is None:
+            raise SecurityAuthorizationError(
+                f"UNAUTHORIZED_PROJECT: Access to project '{target_project_id}' is denied.",
+                requested_project_id=target_project_id,
+            )
+        target_project_id = project.project_id
 
     context = ExecutionContext(
         workspace_id=session_id,
@@ -1721,34 +2048,31 @@ async def search_docs(
 ) -> dict[str, object]:
     """Search project documentation (README, AGENTS.md, docs/*.md) using progressive retrieval.
 
-    Returns ranked results with source attribution.
+    Enforces strict project authorization and per-request workspace binding.
     """
     await _initialize()
+    project = await _resolve_project(project_id)
+    if project is None:
+        return {
+            "error": "UNAUTHORIZED_OR_NO_PROJECT: Project access is not authorized for caller workspace.",
+            "query": query,
+            "docs_indexed": 0,
+            "results": [],
+        }
 
-    # Resolve workspace for docs knowledge backend
-    global _docs_knowledge
-    if project_id:
-        project = await projects.get(project_id)
-        if project is not None and (
-            _docs_knowledge is None
-            or str(_docs_knowledge._workspace_root) != project.workspace_path
-        ):
-            _docs_knowledge = DocsKnowledgeBackend(workspace_root=Path(project.workspace_path))
-
-    if _docs_knowledge is None:
-        _docs_knowledge = DocsKnowledgeBackend(workspace_root=ROOT)
-
+    docs_knowledge = DocsKnowledgeBackend(workspace_root=Path(project.workspace_path))
     context = ExecutionContext(
-        workspace_id=project_id or "default",
-        project_id=project_id or "default",
+        workspace_id=project.project_id,
+        project_id=project.project_id,
     )
-    results = await _docs_knowledge.search(context, query, limit=limit)
-    count = _docs_knowledge.index_workspace_docs()
+    results = await docs_knowledge.search(context, query, limit=limit)
+    count = docs_knowledge.index_workspace_docs()
 
     return {
         "query": query,
         "docs_indexed": count,
         "results": list(results),
+        "project_id": project.project_id,
     }
 
 
@@ -1763,10 +2087,8 @@ async def get_user_profile(
 ) -> dict[str, object]:
     """Retrieve effective user profile and active preferences with provenance verification."""
     await _initialize()
-    target_project_id = project_id
-    if target_project_id is None:
-        active = await projects.get_active()
-        target_project_id = active.project_id if active else None
+    project = await _require_bound_project(project_id)
+    target_project_id = project.project_id
 
     try:
         profile = await _user_model_engine.get_effective_profile(
@@ -1839,10 +2161,8 @@ async def list_user_preferences(
 ) -> dict[str, object]:
     """List stored preferences matching criteria across active project and global scope."""
     await _initialize()
-    target_project_id = project_id
-    if target_project_id is None:
-        active = await projects.get_active()
-        target_project_id = active.project_id if active else None
+    project = await _require_bound_project(project_id)
+    target_project_id = project.project_id
 
     cat_enum = None
     if category:
@@ -1915,13 +2235,32 @@ async def set_user_preference(
 ) -> dict[str, object]:
     """Store an explicit user preference with atomic Trusted Provenance attestation."""
     await _initialize()
-    target_project_id = project_id
-    if target_project_id is None and scope != "global":
-        active = await projects.get_active()
-        target_project_id = active.project_id if active else None
-
     if scope == "global":
+        _auth_manager.validate_global_memory_payload(content)
         target_project_id = None
+    else:
+        project = await _require_bound_project(project_id)
+        target_project_id = project.project_id
+
+        # Semantic Project Alignment Validation:
+        # Detect if content explicitly declares association with a different project
+        m = re.search(
+            r"(?:gắn với dự án|thuộc dự án|dự án|for project|project\s*:)\s*([a-zA-Z0-9_\-]+)",
+            content,
+            re.IGNORECASE,
+        )
+        if m:
+            detected_project = m.group(1).strip().lower()
+            if detected_project != target_project_id.lower() and detected_project not in ("này", "hiện tại", "this", "active"):
+                return {
+                    "status": "error",
+                    "error_type": "ProjectSemanticMismatchError",
+                    "message": (
+                        f"PROJECT_SEMANTIC_MISMATCH: Preference content explicitly declares association with project "
+                        f"'{detected_project}', but current authorized project is '{target_project_id}'. "
+                        f"Cross-project preference storage is rejected to prevent credential and profile contamination."
+                    ),
+                }
 
     try:
         cat_enum = normalize_preference_category(category)
@@ -1979,10 +2318,8 @@ async def retract_user_preference(
 ) -> dict[str, object]:
     """Retract a preference by transitioning it to ARCHIVED status (soft tombstone)."""
     await _initialize()
-    target_project_id = project_id
-    if target_project_id is None:
-        active = await projects.get_active()
-        target_project_id = active.project_id if active else None
+    project = await _require_bound_project(project_id)
+    target_project_id = project.project_id
 
     try:
         item = await _user_model_engine.retract_preference(
@@ -2021,9 +2358,12 @@ async def evaluate_execution(
 
     Returns EvaluationJob with quality_score (0–100).
     """
+    await _initialize()
+    task, project = await _authorize_task(task_id, require_exists=False)
+    resolved_task_id = task.task_id if task else task_id
     job = _evaluation_harness.evaluate_execution(
         model_id=model_id,
-        task_id=task_id,
+        task_id=resolved_task_id,
         duration_seconds=duration_seconds,
         cost_estimate_usd=cost_estimate_usd,
     )
@@ -2062,7 +2402,10 @@ async def browser_navigate(
 @mcp.tool()
 async def get_task_budget(task_id: str) -> dict[str, object]:
     """Get the current execution budget status for a task (cost spent, tokens used, limits)."""
-    budget = _budget_tracker.get_or_create_task_budget(task_id)
+    await _initialize()
+    task, project = await _authorize_task(task_id, require_exists=False)
+    resolved_task_id = task.task_id if task else task_id
+    budget = _budget_tracker.get_or_create_task_budget(resolved_task_id)
     return budget.to_dict()
 
 
@@ -2074,8 +2417,11 @@ async def set_task_budget(
     max_duration_seconds: float = 600.0,
 ) -> dict[str, object]:
     """Set custom execution budget limits for a task."""
+    await _initialize()
+    task, project = await _authorize_task(task_id, require_exists=False)
+    resolved_task_id = task.task_id if task else task_id
     budget = _budget_tracker.set_task_budget(
-        task_id=task_id,
+        task_id=resolved_task_id,
         max_cost_usd=max_cost_usd,
         max_tokens=max_tokens,
         max_duration_seconds=max_duration_seconds,
@@ -2095,7 +2441,11 @@ async def generate_sbom(
     project_name: str | None = None,
 ) -> dict[str, object]:
     """Generate a Software Bill of Materials (SBOM) in CycloneDX format from project dependencies."""
-    root = Path(workspace_path)
+    await _initialize()
+    project = await _require_bound_project()
+    raw_path = Path(workspace_path)
+    target = raw_path if raw_path.is_absolute() else Path(project.workspace_path) / raw_path
+    root = _auth_manager.validate_path_containment(target, project)
     name = project_name or root.name
     manifest = _sbom_generator.generate(root, project_name=name)
     return manifest.to_dict()
@@ -2109,9 +2459,15 @@ async def check_release_readiness(
     """Check release readiness gates for a workspace:
     verifies clean test suite pass, zero critical security findings, and SBOM availability.
     """
+    await _initialize()
+    task, project = await _authorize_task(task_id, require_exists=False)
+    resolved_task_id = task.task_id if task else task_id
+    raw_path = Path(workspace_path)
+    target = raw_path if raw_path.is_absolute() else Path(project.workspace_path) / raw_path
+    root = _auth_manager.validate_path_containment(target, project)
     return await _release_approval_coordinator.check_release_readiness(
-        workspace_path=Path(workspace_path),
-        task_id=task_id,
+        workspace_path=root,
+        task_id=resolved_task_id,
     )
 
 
@@ -2123,9 +2479,15 @@ async def create_release_attestation(
     approved_by: str = "my-agent-control-plane",
 ) -> dict[str, object]:
     """Generate a signed cryptographic attestation manifest containing SHA-256 hashes of workspace & SBOM."""
+    await _initialize()
+    task, project = await _authorize_task(task_id, require_exists=False)
+    resolved_task_id = task.task_id if task else task_id
+    raw_path = Path(workspace_path)
+    target = raw_path if raw_path.is_absolute() else Path(project.workspace_path) / raw_path
+    root = _auth_manager.validate_path_containment(target, project)
     attestation = _release_approval_coordinator.generate_attestation(
-        workspace_path=Path(workspace_path),
-        task_id=task_id,
+        workspace_path=root,
+        task_id=resolved_task_id,
         version=version,
         approved_by=approved_by,
     )
@@ -2148,10 +2510,15 @@ async def request_agent_handoff(
 
     Enforces Role Transition Matrix, schema validation, secret sanitization, and prompt safety.
     """
+    await _initialize()
+    task, project = await _authorize_task(task_id, require_exists=False)
+    resolved_task_id = task.task_id if task else task_id
+    if step_id:
+        await _authorize_step(step_id, require_exists=False)
     decision = _handoff_coordinator.request_handoff(
         source_role=source_role,
         target_role=target_role,
-        task_id=task_id,
+        task_id=resolved_task_id,
         step_id=step_id,
         payload=payload,
         reason=reason,
@@ -3160,6 +3527,10 @@ async def create_decision(
 ) -> dict[str, object]:
     """Create a durable open decision for a task requiring user input."""
     await _initialize()
+    task, project = await _authorize_task(task_id, require_exists=False)
+    if step_id:
+        await _authorize_step(step_id)
+
     sev = DecisionSeverity.MEDIUM
     try:
         sev = DecisionSeverity(severity.lower())
@@ -3168,7 +3539,7 @@ async def create_decision(
 
     decision_options = [DecisionOption.from_dict(opt) for opt in options]
     rec = await _decision_service.create_decision(
-        task_id=task_id,
+        task_id=task.task_id if task else task_id,
         prompt=prompt,
         severity=sev,
         options=decision_options,
@@ -3184,12 +3555,7 @@ async def create_decision(
 async def get_decision(decision_id: str) -> dict[str, object]:
     """Retrieve details and options for a specific decision record."""
     await _initialize()
-    rec = await _decision_service.get_decision(decision_id)
-    if rec is None:
-        return {
-            "status": "not_found",
-            "decision_id": decision_id,
-        }
+    rec, task, project = await _authorize_decision(decision_id)
     return {
         "status": "ok",
         "decision": rec.to_dict(),
@@ -3200,7 +3566,17 @@ async def get_decision(decision_id: str) -> dict[str, object]:
 async def list_open_decisions(task_id: str | None = None) -> dict[str, object]:
     """List all currently OPEN decisions awaiting user choice."""
     await _initialize()
-    decs = await _decision_service.list_open_decisions(task_id=task_id)
+    if task_id:
+        task, project = await _authorize_task(task_id, require_exists=False)
+        effective_task_id = task.task_id if task else task_id
+        decs = await _decision_service.list_open_decisions(task_id=effective_task_id)
+    else:
+        bound_project = await _require_bound_project()
+        all_open = await _decision_service.list_open_decisions()
+        project_tasks = await _task_service().list_tasks(bound_project.project_id)
+        project_task_ids = {t.task_id for t in project_tasks}
+        decs = [d for d in all_open if d.task_id in project_task_ids]
+
     return {
         "status": "ok",
         "decisions": [d.to_dict() for d in decs],
@@ -3215,6 +3591,7 @@ async def resolve_decision(
 ) -> dict[str, object]:
     """Resolve an open decision with the selected option ID."""
     await _initialize()
+    rec, task, project = await _authorize_decision(decision_id)
     try:
         resolved = await _decision_service.resolve_decision(
             decision_id,
@@ -3240,6 +3617,7 @@ async def cancel_decision(
 ) -> dict[str, object]:
     """Cancel an open decision."""
     await _initialize()
+    rec, task, project = await _authorize_decision(decision_id)
     try:
         cancelled = await _decision_service.cancel_decision(
             decision_id,
@@ -3331,9 +3709,11 @@ async def start_agent_run(
 ) -> dict[str, object]:
     """Start and persist a new AgentRunRecord in the durable execution ledger."""
     await _initialize()
-    project = await _resolve_project(project_id)
-    if project is None:
-        return {"status": "no_active_project", "project_id": project_id}
+    task, project = await _authorize_task(task_id, require_exists=True)
+    if plan_id:
+        await _authorize_plan(plan_id)
+    if step_id:
+        await _authorize_step(step_id)
 
     try:
         role = AgentRole(execution_role.lower())
@@ -3342,7 +3722,7 @@ async def start_agent_run(
 
     run = await _agent_run_service.create_run(
         project_id=project.project_id,
-        task_id=task_id,
+        task_id=task.task_id,
         agent_id=agent_id,
         execution_role=role,
         plan_id=plan_id,
@@ -3371,6 +3751,7 @@ async def complete_agent_run(
 ) -> dict[str, object]:
     """Record terminal completion of an AgentRun with machine-readable AgentWorkResult."""
     await _initialize()
+    run, project = await _authorize_agent_run(run_id)
     try:
         # Mark client/external-supplied execution evidence as untrusted
         # so external MCP callers cannot forge SYSTEM_VERIFIED_EXECUTION
@@ -3382,12 +3763,11 @@ async def complete_agent_run(
         cleaned_result["metadata"] = meta
 
         work_res = AgentWorkResult.from_dict(cleaned_result)
-        completed = await _agent_run_service.complete_run(run_id, work_res)
+        completed = await _agent_run_service.complete_run(run.run_id, work_res)
 
         # Also emit a conversation handoff projection message for visibility
         msg = AgentHandoffMessage.from_run_record(completed)
-        active = await projects.get_active()
-        if active and completed.session_id:
+        if completed.session_id:
             await conversations.add_message(
                 MessageRecord(
                     message_id=f"msg-{uuid4().hex[:8]}",
@@ -3420,9 +3800,10 @@ async def fail_agent_run(
 ) -> dict[str, object]:
     """Record failure of an AgentRun."""
     await _initialize()
+    run, project = await _authorize_agent_run(run_id)
     try:
         work_res = AgentWorkResult.from_dict(result) if result else None
-        failed = await _agent_run_service.fail_run(run_id, result=work_res, reason=reason)
+        failed = await _agent_run_service.fail_run(run.run_id, result=work_res, reason=reason)
         return {
             "status": "failed",
             "run": failed.to_dict(),
@@ -3439,9 +3820,7 @@ async def fail_agent_run(
 async def get_agent_run(run_id: str) -> dict[str, object]:
     """Retrieve an AgentRunRecord by run_id."""
     await _initialize()
-    run = await _agent_run_service.get_run(run_id)
-    if run is None:
-        return {"status": "not_found", "run_id": run_id}
+    run, project = await _authorize_agent_run(run_id)
     return {
         "status": "ok",
         "run": run.to_dict(),
@@ -3459,15 +3838,17 @@ async def list_agent_runs(
     await _initialize()
     runs: tuple[AgentRunRecord, ...] = ()
     if step_id:
-        runs = await agent_runs.list_for_step(step_id)
+        step, plan, task, project = await _authorize_step(step_id)
+        runs = await agent_runs.list_for_step(step.step_id)
     elif plan_id:
-        runs = await agent_runs.list_for_plan(plan_id)
+        plan, task, project = await _authorize_plan(plan_id)
+        runs = await agent_runs.list_for_plan(plan.plan_id)
     elif task_id:
-        runs = await agent_runs.list_for_task(task_id)
+        task, project = await _authorize_task(task_id, require_exists=True)
+        runs = await agent_runs.list_for_task(task.task_id)
     else:
-        project = await _resolve_project(project_id)
-        if project:
-            runs = await agent_runs.list_recent_for_project(project.project_id)
+        project = await _require_bound_project(project_id)
+        runs = await agent_runs.list_recent_for_project(project.project_id)
 
     return {
         "status": "ok",
@@ -3486,28 +3867,23 @@ async def get_agent_handoff_context(
     """Retrieve prioritized, bounded handoff context from previous agents for the incoming agent."""
     await _initialize()
     try:
+        task, project = await _authorize_task(task_id, require_exists=True)
+        if plan_id:
+            await _authorize_plan(plan_id)
+        if step_id:
+            await _authorize_step(step_id)
+    except (SecurityAuthorizationError, KeyError):
+        return {"status": "error", "error": "Task not found in active project scope."}
+
+    try:
         role = AgentRole(target_role.lower())
     except ValueError:
         role = AgentRole.BACKEND_CODER
 
-    project = await _resolve_project(project_id)
-    if not project:
-        return {"status": "error", "error": "Active project could not be resolved."}
-
-    task = await tasks.get(task_id)
-    if task:
-        if task.project_id != project.project_id:
-            return {"status": "error", "error": "Task not found in active project scope."}
-    else:
-        task_runs = await agent_runs.list_for_task(task_id)
-        matching_runs = [r for r in task_runs if r.project_id == project.project_id]
-        if not matching_runs:
-            return {"status": "error", "error": "Task not found in active project scope."}
-
     try:
         ctx = await _handoff_context_builder.build_context(
             project_id=project.project_id,
-            task_id=task_id,
+            task_id=task.task_id,
             target_role=role,
             plan_id=plan_id,
             step_id=step_id,
@@ -3721,17 +4097,25 @@ async def package_targeted_error(
     context_lines: int = 40,
 ) -> dict[str, object]:
     """Surgically package minimal, safe error context for a specific file, function or line to paste into Gemini Pro Web."""
+    await _initialize()
     from core.context_disclosure import BridgeError
     from tools.error_context_packager import package_targeted_error as _pkg_targeted
 
+    project = await _require_bound_project()
+    ws_root = Path(project.workspace_path).resolve()
+    target_path = Path(file_path).expanduser()
+    if not target_path.is_absolute():
+        target_path = ws_root / target_path
+    _auth_manager.validate_path_containment(target_path, project)
+
     try:
         md = _pkg_targeted(
-            file_path=file_path,
+            file_path=str(target_path),
             symbol_name=symbol_name,
             line_number=line_number,
             error_description=error_description,
             context_lines=context_lines,
-            workspace_root=ROOT,
+            workspace_root=ws_root,
         )
         return {
             "status": "ok",
@@ -3753,15 +4137,24 @@ async def package_last_test_failure(
     context_lines: int = 40,
 ) -> dict[str, object]:
     """Parse the most recent test failure and surgically package its context to paste into Gemini Pro Web."""
+    await _initialize()
     from core.context_disclosure import BridgeError
     from tools.error_context_packager import package_last_test_failure as _pkg_test
+
+    project = await _require_bound_project()
+    ws_root = Path(project.workspace_path).resolve()
+    if log_file:
+        log_path = Path(log_file).expanduser()
+        if not log_path.is_absolute():
+            log_path = ws_root / log_path
+        _auth_manager.validate_path_containment(log_path, project)
 
     try:
         md = _pkg_test(
             test_output=test_output,
             log_file=log_file,
             context_lines=context_lines,
-            workspace_root=ROOT,
+            workspace_root=ws_root,
         )
         return {
             "status": "ok",

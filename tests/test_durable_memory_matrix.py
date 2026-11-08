@@ -34,8 +34,10 @@ Verifies the complete DoD and audit requirements for the Durable Memory Pipeline
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
+
 import pytest
 
 from core.context import ExecutionContext
@@ -51,9 +53,9 @@ from core.memory import (
     MemoryType,
 )
 from core.memory_consolidation import MemoryConsolidator
+from core.project import ProjectRecord
 from my_agent_mcp import server
 from persistence.sqlite_memory_store import SQLiteMemoryStore
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -439,27 +441,32 @@ async def test_09_failed_replacement_transaction_rolls_back_old_status(tmp_path:
     # Mock execute inside _supersede_sync such that the second execute (INSERT) raises
     orig_connect = store._connect
 
-    class FailingConnection:
-        def __init__(self, real_con):
-            self._real_con = real_con
-            self._call_count = 0
+    @contextmanager
+    def failing_connect():
+        with orig_connect() as real_con:
+            class FailingConnection:
+                def __init__(self, real_con):
+                    self._real_con = real_con
+                    self._call_count = 0
 
-        def execute(self, sql, params=()):
-            if "INSERT INTO memories" in sql:
-                raise sqlite3.OperationalError("Simulated disk error on INSERT")
-            return self._real_con.execute(sql, params)
+                def execute(self, sql, params=()):
+                    if "INSERT INTO memories" in sql:
+                        raise sqlite3.OperationalError("Simulated disk error on INSERT")
+                    return self._real_con.execute(sql, params)
 
-        def __enter__(self):
-            self._real_con.__enter__()
-            return self
+                def __enter__(self):
+                    self._real_con.__enter__()
+                    return self
 
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            return self._real_con.__exit__(exc_type, exc_val, exc_tb)
+                def __exit__(self, exc_type, exc_val, exc_tb):
+                    return self._real_con.__exit__(exc_type, exc_val, exc_tb)
 
-        def __getattr__(self, name):
-            return getattr(self._real_con, name)
+                def __getattr__(self, name):
+                    return getattr(self._real_con, name)
 
-    with patch.object(store, "_connect", side_effect=lambda: FailingConnection(orig_connect())):
+            yield FailingConnection(real_con)
+
+    with patch.object(store, "_connect", side_effect=failing_connect):
         rec2 = _make_record(
             "Failing replacement",
             memory_id="atom-2",
@@ -795,7 +802,7 @@ async def test_22b_zero_match_uses_explicit_lexical_evidence(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_23_mcp_consolidate_memory_success_corresponds_to_durable_sqlite_data(tmp_path: Path) -> None:
+async def test_23_mcp_consolidate_memory_success_corresponds_to_durable_sqlite_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Calling production consolidate_memory writes durably to SQLite."""
     db_path = tmp_path / "mcp_test.db"
     store = SQLiteMemoryStore(db_path)
@@ -803,6 +810,13 @@ async def test_23_mcp_consolidate_memory_success_corresponds_to_durable_sqlite_d
 
     # Point server._memory_service to our test store
     test_svc = DurableMemoryService(store)
+    monkeypatch.setenv("MYAGENT_WORKSPACE", str(tmp_path))
+    existing = await server.projects.get("test-proj-mcp")
+    if existing is None:
+        await server.projects.create(ProjectRecord("test-proj-mcp", "test-proj-mcp", str(tmp_path)))
+    else:
+        await server.projects.update(ProjectRecord("test-proj-mcp", "test-proj-mcp", str(tmp_path)))
+    await server._initialize()
     with patch.object(server, "_memory_service", test_svc), \
          patch.object(server, "memory_store", store):
 
@@ -827,7 +841,7 @@ async def test_23_mcp_consolidate_memory_success_corresponds_to_durable_sqlite_d
 
 
 @pytest.mark.asyncio
-async def test_23b_mcp_consolidate_memory_requires_explicit_or_active_project(tmp_path: Path) -> None:
+async def test_23b_mcp_consolidate_memory_requires_explicit_or_active_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """MCP project identity validation:
 
     consolidate_memory must never use session_id as a fabricated project_id.
@@ -839,9 +853,14 @@ async def test_23b_mcp_consolidate_memory_requires_explicit_or_active_project(tm
     await store.initialize()
     test_svc = DurableMemoryService(store)
 
+    empty_ws = tmp_path / "empty_ws"
+    empty_ws.mkdir()
+    monkeypatch.setenv("MYAGENT_WORKSPACE", str(empty_ws))
+    await server._initialize()
+
     with patch.object(server, "_memory_service", test_svc), \
          patch.object(server, "memory_store", store), \
-         patch.object(server.projects, "get_active", return_value=None):
+         patch.object(server, "_resolve_project", return_value=None):
 
         with pytest.raises(ValueError, match="PROJECT_CONTEXT_REQUIRED"):
             await server.consolidate_memory(
@@ -859,7 +878,7 @@ async def test_23b_mcp_consolidate_memory_requires_explicit_or_active_project(tm
 
 
 @pytest.mark.asyncio
-async def test_23c_mcp_consolidate_memory_uses_active_project_when_project_id_omitted(tmp_path: Path) -> None:
+async def test_23c_mcp_consolidate_memory_uses_active_project_when_project_id_omitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """MCP project identity resolution:
 
     When project_id is omitted, consolidate_memory resolves to the registered active project.
@@ -875,10 +894,16 @@ async def test_23c_mcp_consolidate_memory_uses_active_project_when_project_id_om
         name="Active Proj 99",
         workspace_path=str(tmp_path),
     )
+    monkeypatch.setenv("MYAGENT_WORKSPACE", str(tmp_path))
+    existing = await server.projects.get("active-registered-proj-99")
+    if existing is None:
+        await server.projects.create(fake_project)
+    else:
+        await server.projects.update(fake_project)
+    await server._initialize()
 
     with patch.object(server, "_memory_service", test_svc), \
-         patch.object(server, "memory_store", store), \
-         patch.object(server.projects, "get_active", return_value=fake_project):
+         patch.object(server, "memory_store", store):
 
         res = await server.consolidate_memory(
             session_id="session-active-fallback",
