@@ -147,7 +147,8 @@ async def test_checkpoint_store_migrates_legacy_schema_without_losing_data(
 ) -> None:
     database_path = tmp_path / "legacy.db"
 
-    with sqlite3.connect(database_path) as connection:
+    connection = sqlite3.connect(database_path)
+    try:
         connection.execute(
             """
             CREATE TABLE checkpoints (
@@ -189,17 +190,23 @@ async def test_checkpoint_store_migrates_legacy_schema_without_losing_data(
                 datetime(2026, 8, 24, 1, 0, tzinfo=UTC).isoformat(),
             ),
         )
+        connection.commit()
+    finally:
+        connection.close()
 
     store = SQLiteCheckpointStore(database_path)
     await store.initialize()
 
-    with sqlite3.connect(database_path) as connection:
+    connection = sqlite3.connect(database_path)
+    try:
         columns = {
             str(row[1])
             for row in connection.execute(
                 "PRAGMA table_info(checkpoints)"
             ).fetchall()
         }
+    finally:
+        connection.close()
 
     assert "task_id" in columns
 

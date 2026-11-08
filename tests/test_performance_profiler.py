@@ -10,6 +10,7 @@ from core.performance_profiler import (
     FunctionProfiler,
     PerformanceGateCoordinator,
 )
+from core.project import ProjectRecord
 from my_agent_mcp import server
 
 
@@ -108,7 +109,9 @@ async def test_benchmark_runner_adapter(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_performance_tools(tmp_path: Path) -> None:
+async def test_mcp_performance_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MYAGENT_WORKSPACE", str(tmp_path))
+    await server._initialize()
     # 1. profile_code tool
     prof_res = await server.profile_code("a = [i for i in range(100)]", iterations=10)
     assert "avg_duration_ms" in prof_res

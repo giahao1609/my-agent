@@ -2094,7 +2094,7 @@ async def test_client_supplied_mcp_complete_agent_run_cannot_forge_verified_exec
     await run_store.save(
         AgentRunRecord(
             run_id="run-client-forge",
-            project_id="proj-1",
+            project_id="my-agent",
             task_id="task-1",
             agent_id="coder",
             execution_role=AgentRole.BACKEND_CODER,
@@ -2105,7 +2105,12 @@ async def test_client_supplied_mcp_complete_agent_run_cannot_forge_verified_exec
     async def fake_init():
         return None
 
+    mock_project = ProjectRecord(project_id="my-agent", name="MyAgent", workspace_path=str(tmp_path))
+    async def fake_resolve(project_id=None):
+        return mock_project
+
     monkeypatch.setattr(server, "_initialize", fake_init)
+    monkeypatch.setattr(server, "_resolve_project", fake_resolve)
     monkeypatch.setattr(server, "agent_runs", run_store)
     from core.agent_run_service import AgentRunService
     monkeypatch.setattr(server, "_agent_run_service", AgentRunService(run_store))
@@ -2212,7 +2217,7 @@ async def test_mcp_complete_agent_run_without_evidence_dict_cannot_forge_verifie
     await run_store.save(
         AgentRunRecord(
             run_id="run-forge-nodict",
-            project_id="proj-1",
+            project_id="my-agent",
             task_id="task-1",
             agent_id="coder",
             execution_role=AgentRole.BACKEND_CODER,
@@ -2223,7 +2228,12 @@ async def test_mcp_complete_agent_run_without_evidence_dict_cannot_forge_verifie
     async def fake_init():
         return None
 
+    mock_project = ProjectRecord(project_id="my-agent", name="MyAgent", workspace_path=str(tmp_path))
+    async def fake_resolve(project_id=None):
+        return mock_project
+
     monkeypatch.setattr(server, "_initialize", fake_init)
+    monkeypatch.setattr(server, "_resolve_project", fake_resolve)
     monkeypatch.setattr(server, "agent_runs", run_store)
     from core.agent_run_service import AgentRunService
     monkeypatch.setattr(server, "_agent_run_service", AgentRunService(run_store))

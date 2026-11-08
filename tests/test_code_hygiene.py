@@ -9,6 +9,7 @@ from core.code_hygiene import (
     CodeHygieneCoordinator,
     DeadCodeDetector,
 )
+from core.project import ProjectRecord
 from my_agent_mcp import server
 
 
@@ -83,7 +84,9 @@ def test_code_hygiene_coordinator(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_code_hygiene_tools(tmp_path: Path) -> None:
+async def test_mcp_code_hygiene_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MYAGENT_WORKSPACE", str(tmp_path))
+    await server._initialize()
     (tmp_path / "x.py").write_text("import y\ndef unused_foo(): pass\n", encoding="utf-8")
     (tmp_path / "y.py").write_text("import x\n", encoding="utf-8")
 

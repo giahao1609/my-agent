@@ -36,7 +36,7 @@ async def build_decision_test_stores(tmp_path):
     return projects, tasks, plans, decisions
 
 
-def patch_decision_server(monkeypatch, projects, tasks, plans, decisions) -> None:
+def patch_decision_server(monkeypatch, projects, tasks, plans, decisions, workspace_root=None) -> None:
     async def fake_initialize() -> None:
         return None
 
@@ -46,12 +46,15 @@ def patch_decision_server(monkeypatch, projects, tasks, plans, decisions) -> Non
     monkeypatch.setattr(server, "plans", plans, raising=False)
     monkeypatch.setattr(server, "decisions", decisions, raising=False)
     monkeypatch.setattr(server, "_decision_service", DecisionService(decisions), raising=False)
+    server._auth_manager.set_project_store(projects)
+    if workspace_root:
+        server._auth_manager.set_server_workspace(workspace_root)
 
 
 @pytest.mark.asyncio
 async def test_mcp_decision_tools_lifecycle(tmp_path, monkeypatch) -> None:
     projects, tasks, plans, decisions = await build_decision_test_stores(tmp_path)
-    patch_decision_server(monkeypatch, projects, tasks, plans, decisions)
+    patch_decision_server(monkeypatch, projects, tasks, plans, decisions, workspace_root=tmp_path)
 
     # 1. Create Decision
     opts = [
@@ -95,7 +98,7 @@ async def test_mcp_decision_tools_lifecycle(tmp_path, monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_mcp_front_agent_request_tool(tmp_path, monkeypatch) -> None:
     projects, tasks, plans, decisions = await build_decision_test_stores(tmp_path)
-    patch_decision_server(monkeypatch, projects, tasks, plans, decisions)
+    patch_decision_server(monkeypatch, projects, tasks, plans, decisions, workspace_root=tmp_path)
 
     res = await server.front_agent_request(
         user_input="Build User Management Service",

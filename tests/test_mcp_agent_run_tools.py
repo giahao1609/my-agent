@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from core.project import ProjectRecord
+from core.task import TaskRecord
+from core.plan import PlanRecord, PlanStepRecord
 from my_agent_mcp.server import (
     _initialize,
     complete_agent_run,
@@ -11,6 +13,8 @@ from my_agent_mcp.server import (
     get_agent_run,
     list_agent_runs,
     projects,
+    tasks,
+    plans,
     start_agent_run,
 )
 
@@ -29,6 +33,31 @@ async def test_mcp_agent_run_tools_lifecycle():
         )
         await projects.create(proj)
         await projects.set_active("my-agent")
+
+    # Ensure task and step exist for authorized project
+    existing_task = await tasks.get("task-mcp-run-1")
+    if not existing_task:
+        await tasks.save(TaskRecord(
+            task_id="task-mcp-run-1",
+            project_id="my-agent",
+            objective="Test Agent Run",
+        ))
+    existing_plan = await plans.get_plan("plan-mcp-1")
+    if not existing_plan:
+        await plans.save_plan(PlanRecord(
+            plan_id="plan-mcp-1",
+            task_id="task-mcp-run-1",
+            revision=1,
+        ))
+    existing_step = await plans.get_step("step-mcp-1")
+    if not existing_step:
+        await plans.save_step(PlanStepRecord(
+            step_id="step-mcp-1",
+            plan_id="plan-mcp-1",
+            step_index=0,
+            title="Step 1",
+            instruction="Do work",
+        ))
 
     # 1. Start agent run
     start_res = await start_agent_run(

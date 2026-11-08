@@ -453,6 +453,12 @@ _SECTOR_ARCHETYPES: dict[str, tuple[str, list[str], str, str]] = {
         "warm-focus",
         "balanced",
     ),
+    "edtech_k12_teacher": (
+        "Luminous Pedagogical Studio",
+        ["Be Vietnam Pro", "Merriweather", "JetBrains Mono"],
+        "warm-paper",
+        "generous",
+    ),
     "web3_crypto": (
         "Cyber Dark & Neon Accent",
         ["Space Grotesk", "Syne", "Geist Mono"],
@@ -653,6 +659,18 @@ _COLOR_PALETTES: dict[str, dict[str, str]] = {
         "border": "#DDD5C8",
         "border_highlight": "rgba(107, 143, 113, 0.15)",
         "glow_ambient": "rgba(107, 143, 113, 0.06)",
+    },
+    "warm-paper": {
+        "surface_primary": "#FBF9F5",   # warm cream natural paper
+        "surface_secondary": "#FFFFFF", # crisp white card
+        "surface_elevated": "#FFFFFF",  # elevated modal / dropdown
+        "text_primary": "#1C1917",      # deep charcoal ink
+        "text_secondary": "#57534E",    # accessible muted warm slate
+        "accent": "#1E5128",            # warm scholarly forest green
+        "accent_secondary": "#1D4ED8",  # scholarly cobalt blue
+        "border": "#E8E4DC",            # gentle warm divider
+        "border_highlight": "rgba(30, 81, 40, 0.15)",
+        "glow_ambient": "rgba(30, 81, 40, 0.05)",
     },
     "warm-rich": {
         "surface_primary": "#FBF8F3",   # ivory

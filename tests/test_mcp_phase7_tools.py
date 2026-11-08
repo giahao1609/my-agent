@@ -36,7 +36,8 @@ async def test_mcp_provider_health_tool():
 
 
 @pytest.mark.asyncio
-async def test_mcp_sbom_and_release_tools(tmp_path: Path):
+async def test_mcp_sbom_and_release_tools(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MYAGENT_WORKSPACE", str(tmp_path))
     (tmp_path / "requirements.txt").write_text("pytest>=8.0\n")
     (tmp_path / "app.py").write_text("print('ready')\n")
 

@@ -200,7 +200,8 @@ async def test_05_existing_sqlite_row_read(tmp_path: Path) -> None:
     await store.initialize()
 
     # Raw insert simulating data written by pre-Phase-03 code
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         conn.execute(
             """
             INSERT INTO memories (
@@ -225,6 +226,9 @@ async def test_05_existing_sqlite_row_read(tmp_path: Path) -> None:
                 "2026-02-01T10:00:00+00:00",
             ),
         )
+        conn.commit()
+    finally:
+        conn.close()
 
     # Read through SQLiteMemoryStore
     results = await store.search("legacy-proj", "Rust", limit=10)
@@ -322,11 +326,14 @@ async def test_07_global_non_project_memory(tmp_path: Path) -> None:
     await store.add_many((global_record,))
 
     # Direct DB inspection: ensure column project_id is written safely as empty string
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM memories WHERE memory_id = ?", ("mem-global-1",)).fetchone()
         assert row is not None
         assert row["project_id"] == ""
+    finally:
+        conn.close()
 
     # Reconstructed canonical record should have restored project_id as None
     record_restored = store._row_to_memory(row)
@@ -442,9 +449,12 @@ async def test_11_no_pipeline_side_effect(tmp_path: Path) -> None:
     assert len(records) == 1
 
     # Verify database remains completely empty
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         count = conn.execute("SELECT count(*) FROM memories").fetchone()[0]
         assert count == 0
+    finally:
+        conn.close()
 
 
 def test_12_validation_invariants() -> None:

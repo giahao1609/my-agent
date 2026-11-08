@@ -258,6 +258,23 @@ class UnifiedContextBuilder:
 
         items: list[UserPreferenceContextItem] = []
         for key, pref in profile.preferences_by_key.items():
+            # Exclude preferences whose content explicitly targets a different project
+            m = re.search(
+                r"(?:gắn với dự án|thuộc dự án|dự án|for project|project\s*:)\s*([a-zA-Z0-9_\-]+)",
+                pref.content,
+                re.IGNORECASE,
+            )
+            if m:
+                detected_project = m.group(1).strip().lower()
+                if detected_project != project_id.lower() and detected_project not in ("này", "hiện tại", "this", "active"):
+                    logger.warning(
+                        "Excluding preference '%s' from project '%s' context: content explicitly targets project '%s'",
+                        key,
+                        project_id,
+                        detected_project,
+                    )
+                    continue
+
             # Sanitize content
             safe_content = self._sanitize(pref.content)
             rank = getattr(pref, "precedence_rank", None)
@@ -426,7 +443,13 @@ class UnifiedContextBuilder:
         return symbols
 
     def _retrieve_design_contract(self, project_id: str) -> str | None:
-        """Retrieves and sanitizes the UI design contract if present."""
+        """Retrieves and sanitizes the UI design contract if present.
+
+        Enforces strict project isolation: 'default_project' or '__global__' contracts are never shared.
+        """
+        if not project_id or project_id in ("default_project", "__global__"):
+            return None
+
         candidates = [
             self._design_dir / f"{project_id}.design.md",
             Path("data/designs") / f"{project_id}.design.md",

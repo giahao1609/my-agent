@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 import json
-from pathlib import Path
 import sqlite3
+from collections.abc import Generator
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from core.security_scanner import SecretRedactor
@@ -25,10 +27,15 @@ class SqliteHandoffHistoryStore:
     async def initialize(self) -> None:
         await asyncio.to_thread(self._initialize_sync)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Generator[sqlite3.Connection]:
         conn = sqlite3.connect(self._database_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _initialize_sync(self) -> None:
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -121,7 +128,7 @@ class SqliteHandoffHistoryStore:
                     decision["status"],
                     reasons_json,
                     guardrails_json,
-                    float(decision.get("timestamp", datetime.now(timezone.utc).timestamp())),
+                    float(decision.get("timestamp", datetime.now(UTC).timestamp())),
                 ),
             )
 

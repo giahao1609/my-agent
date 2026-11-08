@@ -150,7 +150,8 @@ async def test_incremental_laravel_route_keeps_persisted_controller_target(tmp_p
     assert changes.modified == ("routes/api/auth.php",)
 
     import sqlite3
-    with sqlite3.connect(db) as conn:
+    conn = sqlite3.connect(db)
+    try:
         row = conn.execute(
             """
             SELECT r.name, m.qualified_name, e.metadata_json
@@ -165,6 +166,8 @@ async def test_incremental_laravel_route_keeps_persisted_controller_target(tmp_p
             """,
             ("demo", "routes_to", "POST /sign-in"),
         ).fetchone()
+    finally:
+        conn.close()
 
     assert row is not None
     assert row[1] == "App\\Http\\Controllers\\AuthController::login"

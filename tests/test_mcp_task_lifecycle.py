@@ -26,16 +26,22 @@ async def build_stores(tmp_path):
         )
     )
 
+    server._auth_manager.set_server_workspace(tmp_path)
+    server._auth_manager.set_project_store(projects)
+
     return projects, tasks
 
 
-def patch_server(monkeypatch, projects, tasks) -> None:
+def patch_server(monkeypatch, projects, tasks, tmp_path=None) -> None:
     async def fake_initialize() -> None:
         return None
 
     monkeypatch.setattr(server, "_initialize", fake_initialize)
     monkeypatch.setattr(server, "projects", projects)
     monkeypatch.setattr(server, "tasks", tasks, raising=False)
+    server._auth_manager.set_project_store(projects)
+    if tmp_path is not None:
+        server._auth_manager.set_server_workspace(tmp_path)
 
 
 @pytest.mark.asyncio
