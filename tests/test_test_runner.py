@@ -50,6 +50,34 @@ def test_pytest_output_parsing() -> None:
     assert len(res_fail.failure_details) > 0
 
 
+def test_pytest_collection_error_never_reports_pass() -> None:
+    """Pytest collection error with exit code 2 must never report pass."""
+    output = "ERROR collecting tests/test_broken.py\nSyntaxError: invalid syntax\n1 error in 0.05s"
+    res = PytestRunnerAdapter._parse_pytest_output("step-col", output, exit_code=2)
+    assert res.success is False
+    assert res.failed_tests >= 1
+    assert any("ERROR" in f for f in res.failure_details)
+
+
+def test_pytest_nonzero_exit_code_with_passed_tests_never_reports_pass() -> None:
+    """When some tests passed but exit code != 0, it must fail closed and never report pass."""
+    output = "5 passed in 0.12s\nERROR: Fixture teardown failed"
+    res = PytestRunnerAdapter._parse_pytest_output("step-err", output, exit_code=1)
+    assert res.success is False
+    assert res.passed_tests == 5
+    assert res.failed_tests >= 1
+    assert any("ERROR" in f for f in res.failure_details)
+
+
+def test_pytest_crash_or_usage_error_never_reports_pass() -> None:
+    """Arbitrary non-zero exit code without summary line must fail closed and record exit code."""
+    output = "Fatal Python error: SIGKILL\n[1] 12345 killed"
+    res = PytestRunnerAdapter._parse_pytest_output("step-crash", output, exit_code=137)
+    assert res.success is False
+    assert res.failed_tests >= 1
+    assert any("exit code 137" in f for f in res.failure_details)
+
+
 @pytest.mark.asyncio
 async def test_test_runner_registry_run_tests(tmp_path: Path) -> None:
     registry = TestRunnerRegistry()

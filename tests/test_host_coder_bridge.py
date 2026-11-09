@@ -269,6 +269,8 @@ async def test_advance_step_flow_and_final_verification_gate(tmp_path: Path):
         step_id="step-s1",
         workspace_path=tmp_path,
         execution_evidence={
+            "is_real": True,
+            "executor_identity": "external_host_coder",
             "session_id": "session-1",
             "files_changed": ["core/feature.py"],
         },
@@ -290,6 +292,8 @@ async def test_advance_step_flow_and_final_verification_gate(tmp_path: Path):
         step_id="step-s2",
         workspace_path=tmp_path,
         execution_evidence={
+            "is_real": True,
+            "executor_identity": "external_host_coder",
             "session_id": advance_res1.next_session_id,
             "files_changed": ["core/feature2.py"],
         },
@@ -369,6 +373,8 @@ async def test_advance_step_rejection_and_reflexion_hint(tmp_path: Path):
         step_id="step-fail-1",
         workspace_path=tmp_path,
         execution_evidence={
+            "is_real": True,
+            "executor_identity": "external_host_coder",
             "session_id": "session-1",
             "files_changed": ["core/faulty.py"],
         },
@@ -381,6 +387,80 @@ async def test_advance_step_rejection_and_reflexion_hint(tmp_path: Path):
     # Verify repair hint was enqueued in session-1
     assert len(orchestrator.sessions["session-1"]) == 2
     assert "Repair required" in orchestrator.sessions["session-1"][1]
+
+
+@pytest.mark.asyncio
+async def test_advance_step_rejects_missing_or_fake_evidence(tmp_path: Path):
+    """advance_step must reject steps when host provides empty, missing, or non-real evidence."""
+    task_svc, plan_svc, plan_store, task_store, run_svc = await _setup_bridge_env(tmp_path)
+
+    task = await task_svc.create_task(
+        task_id="task-neg-ev",
+        project_id="proj-ext",
+        objective="Reject missing evidence test",
+    )
+    await task_svc.start_task(task.task_id)
+
+    plan = await plan_svc.materialize_plan(
+        task_id=task.task_id,
+        plan_id="plan-neg-ev",
+        steps=(("step-fake-1", "Fake feature", "Implement feature"),),
+    )
+
+    orchestrator = MockOrchestrator()
+    mock_stack = SimpleNamespace(
+        orchestrator=orchestrator,
+        agent=MockCoderAgent(orchestrator),
+    )
+
+    executor = CoderRuntimeStepExecutor(
+        coder_stack=mock_stack,
+        workspace_path=tmp_path,
+        project_id="proj-ext",
+        task_id=task.task_id,
+        plan_id=plan.plan_id,
+        agent_run_service=run_svc,
+        worker_task_launcher=None,
+    )
+
+    coordinator = WholePlanCoordinator(
+        task_service=task_svc,
+        plan_service=plan_svc,
+        plan_store=plan_store,
+        step_executor=executor,
+        agent_run_service=run_svc,
+        project_id="proj-ext",
+    )
+
+    await coordinator.execute_whole_plan(plan.plan_id, tmp_path)
+
+    # 1. Test completely empty evidence
+    res_empty = await coordinator.advance_step(
+        step_id="step-fake-1",
+        workspace_path=tmp_path,
+        execution_evidence={},
+    )
+    assert res_empty.status == "step_rejected"
+    assert res_empty.plan_completed is False
+    assert "Real execution with positive evidence is required" in str(res_empty.review) or "Implementation was simulated/mocked" in str(res_empty.review)
+
+    # 2. Test explicit is_real=False evidence
+    res_fake = await coordinator.advance_step(
+        step_id="step-fake-1",
+        workspace_path=tmp_path,
+        execution_evidence={"is_real": False, "executor_identity": "mock"},
+    )
+    assert res_fake.status == "step_rejected"
+    assert "Implementation was simulated/mocked without real execution" in str(res_fake.review)
+
+    # 3. Test missing executor_identity even if is_real=True
+    res_no_id = await coordinator.advance_step(
+        step_id="step-fake-1",
+        workspace_path=tmp_path,
+        execution_evidence={"is_real": True},
+    )
+    assert res_no_id.status == "step_rejected"
+    assert "lacks valid executor identity" in str(res_no_id.review)
 
 
 @pytest.mark.asyncio

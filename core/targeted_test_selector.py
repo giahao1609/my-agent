@@ -229,7 +229,7 @@ class TargetedTestSelector:
             return True
         if any(sec in norm for sec in ("security", "inspector_db_safety", "policy", "permission", "authorization", "auth_")):
             return True
-        if norm.startswith(".agents/rules/") or norm.endswith((".mcp.json", "agents.md")):
+        if norm.startswith(".agents/") or norm.endswith(("skill.md", ".mcp.json", "agents.md")):
             return True
         return False
 

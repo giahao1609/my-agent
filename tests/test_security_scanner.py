@@ -156,3 +156,52 @@ def test_scan_workspace_target_file_escape_fails_gate(tmp_path: Path) -> None:
 
     assert res.passed_gate is False
     assert any(f.rule_id == "ESCAPE-001" and f.severity == SecuritySeverity.CRITICAL for f in res.findings)
+
+
+def test_is_scannable_file_includes_skill_md_and_configs() -> None:
+    """Verify is_scannable_file correctly identifies skills, rules, configs, and scripts."""
+    assert SecurityScannerRegistry.is_scannable_file(Path("SKILL.md")) is True
+    assert SecurityScannerRegistry.is_scannable_file(Path("skill.md")) is True
+    assert SecurityScannerRegistry.is_scannable_file(Path(".agents/skills/my-agent/SKILL.md")) is True
+    assert SecurityScannerRegistry.is_scannable_file(Path(".agents/rules/branch_policy.md")) is True
+    assert SecurityScannerRegistry.is_scannable_file(Path("config.yaml")) is True
+    assert SecurityScannerRegistry.is_scannable_file(Path("pipeline.yml")) is True
+    assert SecurityScannerRegistry.is_scannable_file(Path("settings.toml")) is True
+    assert SecurityScannerRegistry.is_scannable_file(Path(".env")) is True
+    assert SecurityScannerRegistry.is_scannable_file(Path("deploy.sh")) is True
+    assert SecurityScannerRegistry.is_scannable_file(Path("app.py")) is True
+
+    # General documentation outside .agents/skills/ and .agents/rules/ is not scannable code
+    assert SecurityScannerRegistry.is_scannable_file(Path("docs/README.md")) is False
+    assert SecurityScannerRegistry.is_scannable_file(Path("notes/architecture.md")) is False
+
+
+def test_scan_workspace_detects_secrets_in_skill_md_and_configs(tmp_path: Path) -> None:
+    """Workspace scan must inspect SKILL.md and configs and detect hardcoded credentials."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # 1. SKILL.md containing a leaked OpenAI token
+    skill_file = repo / ".agents" / "skills" / "deploy-tool" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text("# Deploy Skill\nUse key: sk-abcdefghijklmnopqrstuvwxyz12345\n", encoding="utf-8")
+
+    # 2. Config YAML containing a leaked AWS Access Key
+    config_file = repo / "deploy" / "config.yaml"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("aws_key: AKIAIOSFODNN7EXAMPLE\n", encoding="utf-8")
+
+    # 3. Standard markdown doc without secrets
+    doc_file = repo / "docs" / "user_guide.md"
+    doc_file.parent.mkdir(parents=True)
+    doc_file.write_text("# User Guide\nThis is a harmless documentation file.\n", encoding="utf-8")
+
+    scanner = SecurityScannerRegistry()
+    res = scanner.scan_workspace(repo, step_id="skill_config_scan")
+
+    assert res.passed_gate is False
+    findings_files = [f.file_path for f in res.findings]
+    assert any("SKILL.md" in fp for fp in findings_files)
+    assert any("config.yaml" in fp for fp in findings_files)
+    # user_guide.md was not scanned
+    assert not any("user_guide.md" in fp for fp in findings_files)

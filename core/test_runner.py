@@ -89,18 +89,43 @@ class PytestRunnerAdapter:
 
     @staticmethod
     def _parse_pytest_output(step_id: str, output: str, exit_code: int) -> TestResult:
-        # Match lines like "340 passed in 6.04s" or "1 failed, 338 passed in 6.24s"
-        passed_match = re.search(r"(\d+)\s+passed", output)
-        failed_match = re.search(r"(\d+)\s+failed", output)
-        passed = int(passed_match.group(1)) if passed_match else 0
-        failed = int(failed_match.group(1)) if failed_match else (1 if exit_code != 0 and passed == 0 else 0)
-        total = passed + failed
+        # Match passed, failed, and error counts in pytest summary
+        passed_match = re.search(r"(\d+)\s+passed\b", output)
+        failed_match = re.search(r"(\d+)\s+failed\b", output)
+        errors_match = re.search(r"(\d+)\s+error(?:s)?\b", output)
 
-        failures = []
-        if failed > 0:
+        passed = int(passed_match.group(1)) if passed_match else 0
+        failed = int(failed_match.group(1)) if failed_match else 0
+        errors = int(errors_match.group(1)) if errors_match else 0
+
+        total_failed = failed + errors
+
+        # Strict invariant: any non-zero exit code or execution/collection error MUST NOT report PASS
+        if exit_code != 0 and total_failed == 0:
+            total_failed = 1
+
+        total = passed + total_failed
+
+        failures: list[str] = []
+        if total_failed > 0:
             for line in output.splitlines():
-                if "FAILED" in line or "Error:" in line or "E   " in line:
-                    failures.append(line.strip())
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if (
+                    "FAILED" in stripped
+                    or "ERROR" in stripped
+                    or "Error:" in stripped
+                    or "E   " in stripped
+                    or "INTERNALERROR" in stripped
+                    or "collection error" in stripped.lower()
+                ):
+                    failures.append(stripped)
+
+            if not failures and exit_code != 0:
+                failures.append(f"Pytest exited with non-zero exit code {exit_code}")
+                tail_lines = [l.strip() for l in output.splitlines() if l.strip()][-3:]
+                failures.extend(tail_lines)
 
         cov_match = re.search(r"TOTAL\s+.*\s+(\d+(?:\.\d+)?)%", output)
         if not cov_match:
@@ -111,7 +136,7 @@ class PytestRunnerAdapter:
             step_id=step_id,
             total_tests=total,
             passed_tests=passed,
-            failed_tests=failed,
+            failed_tests=total_failed,
             failure_details=tuple(failures[:10]),
             coverage_percentage=coverage,
         )
@@ -174,7 +199,9 @@ class NpmTestRunnerAdapter:
         passed_match = re.search(r"(\d+)\s+passed", output, re.IGNORECASE)
         failed_match = re.search(r"(\d+)\s+failed", output, re.IGNORECASE)
         passed = int(passed_match.group(1)) if passed_match else (1 if exit_code == 0 else 0)
-        failed = int(failed_match.group(1)) if failed_match else (1 if exit_code != 0 else 0)
+        failed = int(failed_match.group(1)) if failed_match else 0
+        if exit_code != 0 and failed == 0:
+            failed = 1
         total = passed + failed
 
         cov_match = re.search(r"All files\s*\|\s*(\d+(?:\.\d+)?)", output)

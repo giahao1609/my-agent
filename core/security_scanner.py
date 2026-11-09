@@ -254,6 +254,56 @@ class SecurityScannerRegistry:
         self._semgrep_available: bool = shutil.which("semgrep") is not None
         self._gitleaks_available: bool = shutil.which("gitleaks") is not None
 
+    SCANNABLE_EXTENSIONS = (
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".go",
+        ".json",
+        ".env",
+        ".txt",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".ini",
+        ".cfg",
+        ".sh",
+        ".bash",
+    )
+    SCANNABLE_SPECIAL_NAMES = (
+        "SKILL.md",
+        "skill.md",
+        "Dockerfile",
+        "Containerfile",
+        "Makefile",
+    )
+
+    @classmethod
+    def is_scannable_file(cls, file_path: Path, root: Path | None = None) -> bool:
+        """Determine whether file_path is a scannable source, config, manifest, or skill file.
+
+        Included scopes:
+        1. Source code: .py, .js, .ts, .tsx, .jsx, .go, .sh, .bash, .txt
+        2. Configs & manifests: .json, .env, .toml, .yaml, .yml, .ini, .cfg
+        3. Container/build manifests: Dockerfile, Containerfile, Makefile
+        4. Skill and agent governance documents:
+           - Any file named SKILL.md or skill.md
+           - Any markdown (.md) file located under .agents/skills/ or .agents/rules/
+        """
+        name = file_path.name
+        if name in cls.SCANNABLE_SPECIAL_NAMES or name.lower() == "skill.md" or name == ".env" or name.startswith(".env."):
+            return True
+        if file_path.suffix.lower() in cls.SCANNABLE_EXTENSIONS:
+            return True
+        if file_path.suffix.lower() == ".md":
+            parts = file_path.parts
+            for i in range(len(parts) - 1):
+                if parts[i] == ".agents" and parts[i + 1] in ("skills", "rules"):
+                    return True
+        return False
+
     @staticmethod
     def is_ignored_path(file_path: Path, root: Path) -> bool:
         """Determine whether file_path should be ignored during workspace security scan.
@@ -360,12 +410,12 @@ class SecurityScannerRegistry:
                 if full_p.is_file() and not self.is_ignored_path(full_p, root):
                     files_to_scan.append(full_p)
         else:
-            # Default scan python/js/go files, manifests, and configs, ignoring standard exclusions
+            # Default scan source files, manifests, configs, and skill/rule documents, ignoring standard exclusions
             for p in root.rglob("*"):
                 if (
                     p.is_file()
                     and not self.is_ignored_path(p, root)
-                    and p.suffix in (".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".json", ".env", ".txt", ".toml")
+                    and self.is_scannable_file(p, root)
                 ):
                     files_to_scan.append(p)
 

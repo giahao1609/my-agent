@@ -821,11 +821,7 @@ class WholePlanCoordinator:
             )
 
         root_path = Path(workspace_path).resolve()
-        evidence = dict(execution_evidence or {})
-        if "is_real" not in evidence:
-            evidence["is_real"] = True
-        if "executor_identity" not in evidence and "evidence_source" not in evidence:
-            evidence["executor_identity"] = "external_host_coder"
+        evidence = dict(execution_evidence) if execution_evidence else {}
 
         # 1. Resolve modified files from evidence or agent run service
         modified_files: list[str] = list(
@@ -872,13 +868,14 @@ class WholePlanCoordinator:
         )
 
         # 5. Evaluate Verification Gate
+        is_real = bool(evidence.get("is_real", False))
         imp_res = ImplementationResult(
             step_id=step_id,
             summary=f"Host execution for step '{step.title}'"
             + (f" | DRIFT: {drift_res.summary}" if drift_res.drift_detected else ""),
             modified_files=tuple(modified_files),
             success=not drift_res.drift_detected,
-            is_mocked=False,
+            is_mocked=not is_real,
             execution_evidence=evidence,
         )
         review = self._gate_coordinator.evaluate(
