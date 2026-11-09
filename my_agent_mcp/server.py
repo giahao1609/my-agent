@@ -100,6 +100,7 @@ from core.security_scanner import SecurityScannerRegistry
 from core.test_runner import TestRunnerRegistry
 from core.verification_gate_coordinator import VerificationGateCoordinator
 from core.whole_plan_coordinator import WholePlanCoordinator
+from core.targeted_test_selector import TargetedTestSelector
 from core.step_execution import CoderRuntimeStepExecutor
 from core.context_builder import UnifiedContextBuilder
 from eval.evaluation_job import EvaluationHarness
@@ -1782,6 +1783,9 @@ async def run_whole_plan(
         test_runner_registry=_test_runner_registry,
         security_scanner_registry=_security_scanner_registry,
         verification_coordinator=_verification_gate_coordinator,
+        targeted_test_selector=TargetedTestSelector(code_graph_store=code_graph),
+        agent_run_service=_agent_run_service,
+        project_id=project_id,
         decision_service=_decision_service,
         max_auto_repair_attempts=3,
     )
@@ -1789,7 +1793,11 @@ async def run_whole_plan(
     return {
         "task_id": summary.task_id,
         "plan_id": summary.plan_id,
+        "execution_state": summary.execution_state,
         "plan_completed": summary.plan_completed,
+        "current_step_id": summary.current_step_id,
+        "current_session_id": summary.current_session_id,
+        "action_required": summary.action_required,
         "steps_completed": summary.steps_completed,
         "steps_failed": summary.steps_failed,
         "steps_skipped": summary.steps_skipped,
@@ -1798,6 +1806,52 @@ async def run_whole_plan(
         "review_history": summary.review_history,
         "step_telemetry": summary.step_telemetry,
     }
+
+
+@mcp.tool()
+async def advance_plan_step(
+    step_id: str,
+    workspace_path: str | None = None,
+    execution_evidence: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Evaluate verification gate on host-submitted step execution evidence and advance plan."""
+    await _initialize()
+    step, plan, task, project = await _authorize_step(step_id)
+    target_path = Path(workspace_path) if workspace_path else Path(project.workspace_path)
+    root = target_path if target_path.is_absolute() else Path(project.workspace_path) / target_path
+    _auth_manager.validate_path_containment(root, project)
+
+    stack = await _get_coder_stack()
+    real_executor = CoderRuntimeStepExecutor(
+        coder_stack=stack,
+        workspace_path=str(root),
+        project_id=project.project_id,
+        task_id=task.task_id,
+        plan_id=plan.plan_id,
+        agent_run_service=_agent_run_service,
+        worker_task_launcher=_ensure_in_process_coder_worker,
+        context_builder=_unified_context_builder,
+    )
+    coordinator = WholePlanCoordinator(
+        task_service=_task_service(),
+        plan_service=_plan_service(),
+        plan_store=plans,
+        step_executor=real_executor,
+        test_runner_registry=_test_runner_registry,
+        security_scanner_registry=_security_scanner_registry,
+        verification_coordinator=_verification_gate_coordinator,
+        targeted_test_selector=TargetedTestSelector(code_graph_store=code_graph),
+        agent_run_service=_agent_run_service,
+        project_id=project.project_id,
+        decision_service=_decision_service,
+        max_auto_repair_attempts=3,
+    )
+    res = await coordinator.advance_step(
+        step_id=step.step_id,
+        workspace_path=root,
+        execution_evidence=execution_evidence,
+    )
+    return res.to_dict()
 
 
 @mcp.tool()

@@ -9,6 +9,7 @@ class ReviewStatus(StrEnum):
     APPROVED = 'approved'
     REJECTED = 'rejected'
     REQUEST_REWORK = 'request_rework'
+    WAITING_FOR_HOST = 'waiting_for_host'
 
 
 class SecuritySeverity(StrEnum):

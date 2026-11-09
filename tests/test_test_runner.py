@@ -57,3 +57,66 @@ async def test_test_runner_registry_run_tests(tmp_path: Path) -> None:
     res = await registry.run_tests(tmp_path, "step-1")
     assert res.step_id == "step-1"
     assert "No supported test runner detected" in res.failure_details[0]
+
+
+@pytest.mark.asyncio
+async def test_pytest_runner_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = PytestRunnerAdapter()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+
+    import asyncio
+
+    # Simulate timeout by having communicate sleep
+    async def slow_communicate(*args, **kwargs):
+        await asyncio.sleep(2.0)
+        return b"", b""
+
+    class FakeProc:
+        returncode = None
+        def kill(self): pass
+        async def wait(self): pass
+        communicate = slow_communicate
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    res = await adapter.run_tests(
+        tmp_path,
+        "step-timeout",
+        timeout_seconds=0.05,
+    )
+    assert res.failed_tests == 1
+    assert "timed out after" in res.failure_details[0]
+
+
+@pytest.mark.asyncio
+async def test_pytest_runner_with_target_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = PytestRunnerAdapter()
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+
+    import asyncio
+
+    executed_cmd = []
+
+    class FakeProc:
+        returncode = 0
+        async def communicate(self):
+            return b"1 passed in 0.05s", b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        executed_cmd.extend(args)
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    res = await adapter.run_tests(
+        tmp_path,
+        "step-target",
+        target_files=["tests/test_foo.py", "tests/test_bar.py"],
+    )
+    assert res.passed_tests == 1
+    assert "tests/test_foo.py" in executed_cmd
+    assert "tests/test_bar.py" in executed_cmd

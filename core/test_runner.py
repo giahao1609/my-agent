@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import re
-
+import shutil
+import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -16,6 +18,8 @@ class TestRunnerAdapter(Protocol):
         self,
         workspace_path: Path,
         step_id: str,
+        target_files: Sequence[str] | None = None,
+        timeout_seconds: float = 120.0,
     ) -> TestResult: ...
 
 
@@ -32,10 +36,21 @@ class PytestRunnerAdapter:
         self,
         workspace_path: Path,
         step_id: str,
+        target_files: Sequence[str] | None = None,
+        timeout_seconds: float = 120.0,
     ) -> TestResult:
-        python_bin = workspace_path / ".venv" / "bin" / "pytest"
-        cmd = [str(python_bin) if python_bin.exists() else "pytest"]
+        local_pytest = workspace_path / ".venv" / "bin" / "pytest"
+        which_pytest = shutil.which("pytest")
+        if local_pytest.exists():
+            cmd = [str(local_pytest)]
+        elif which_pytest:
+            cmd = [which_pytest]
+        else:
+            cmd = [sys.executable, "-m", "pytest"]
+        if target_files:
+            cmd.extend(target_files)
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -43,9 +58,26 @@ class PytestRunnerAdapter:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout_seconds,
+            )
             output = stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")
             return self._parse_pytest_output(step_id, output, proc.returncode or 0)
+        except TimeoutError:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            return TestResult(
+                step_id=step_id,
+                total_tests=0,
+                passed_tests=0,
+                failed_tests=1,
+                failure_details=(f"Pytest execution timed out after {timeout_seconds}s",),
+            )
         except Exception as e:
             return TestResult(
                 step_id=step_id,
@@ -93,17 +125,41 @@ class NpmTestRunnerAdapter:
         self,
         workspace_path: Path,
         step_id: str,
+        target_files: Sequence[str] | None = None,
+        timeout_seconds: float = 120.0,
     ) -> TestResult:
+        cmd = ["npm", "test", "--", "--run"]
+        if target_files:
+            cmd.extend(target_files)
+
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
-                "npm", "test", "--", "--run",
+                *cmd,
                 cwd=str(workspace_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout_seconds,
+            )
             output = stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")
             return self._parse_npm_output(step_id, output, proc.returncode or 0)
+        except TimeoutError:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            return TestResult(
+                step_id=step_id,
+                total_tests=0,
+                passed_tests=0,
+                failed_tests=1,
+                failure_details=(f"Npm test execution timed out after {timeout_seconds}s",),
+            )
         except Exception as e:
             return TestResult(
                 step_id=step_id,
@@ -144,17 +200,43 @@ class GoTestRunnerAdapter:
         self,
         workspace_path: Path,
         step_id: str,
+        target_files: Sequence[str] | None = None,
+        timeout_seconds: float = 120.0,
     ) -> TestResult:
+        cmd = ["go", "test"]
+        if target_files:
+            cmd.extend(target_files)
+        else:
+            cmd.append("./...")
+
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
-                "go", "test", "./...",
+                *cmd,
                 cwd=str(workspace_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout_seconds,
+            )
             output = stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")
             return self._parse_go_output(step_id, output, proc.returncode or 0)
+        except TimeoutError:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            return TestResult(
+                step_id=step_id,
+                total_tests=0,
+                passed_tests=0,
+                failed_tests=1,
+                failure_details=(f"Go test execution timed out after {timeout_seconds}s",),
+            )
         except Exception as e:
             return TestResult(
                 step_id=step_id,
@@ -211,7 +293,13 @@ class TestRunnerRegistry:
                 return adapter
         return None
 
-    async def run_tests(self, workspace_path: Path | str, step_id: str) -> TestResult:
+    async def run_tests(
+        self,
+        workspace_path: Path | str,
+        step_id: str,
+        target_files: Sequence[str] | None = None,
+        timeout_seconds: float = 120.0,
+    ) -> TestResult:
         path = Path(workspace_path)
         adapter = self.detect_adapter(path)
         if adapter is None:
@@ -222,7 +310,12 @@ class TestRunnerRegistry:
                 failed_tests=0,
                 failure_details=("No supported test runner detected",),
             )
-        return await adapter.run_tests(path, step_id)
+        return await adapter.run_tests(
+            path,
+            step_id,
+            target_files=target_files,
+            timeout_seconds=timeout_seconds,
+        )
 
 
 default_test_runner_registry = TestRunnerRegistry()

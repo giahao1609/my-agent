@@ -68,6 +68,16 @@ class AgentRunService:
         await self._store.save(updated)
         return updated
 
+    async def wait_run(
+        self,
+        run_id: str,
+        reason: str = "",
+    ) -> AgentRunRecord:
+        run = await self._require_run(run_id)
+        updated = run.mark_waiting(reason=reason)
+        await self._store.save(updated)
+        return updated
+
     async def complete_run(
         self,
         run_id: str,

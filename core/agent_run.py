@@ -95,6 +95,33 @@ class AgentRunRecord:
             metadata=self.metadata,
         )
 
+    def mark_waiting(self, reason: str = "") -> AgentRunRecord:
+        if self.is_terminal:
+            raise ValueError(f"cannot transition terminal run {self.run_id} ({self.state.value}) to waiting")
+        now = utc_iso_now()
+        meta = dict(self.metadata)
+        if reason:
+            meta["waiting_reason"] = reason
+        return AgentRunRecord(
+            run_id=self.run_id,
+            project_id=self.project_id,
+            task_id=self.task_id,
+            agent_id=self.agent_id,
+            execution_role=self.execution_role,
+            plan_id=self.plan_id,
+            step_id=self.step_id,
+            model_id=self.model_id,
+            runtime_id=self.runtime_id,
+            session_id=self.session_id,
+            state=AgentRunState.WAITING,
+            started_at=self.started_at or now,
+            finished_at=None,
+            created_at=self.created_at,
+            updated_at=now,
+            result=self.result,
+            metadata=meta,
+        )
+
     def complete(self, result: AgentWorkResult) -> AgentRunRecord:
         if self.is_terminal:
             raise ValueError(f"cannot complete already terminal run {self.run_id} ({self.state.value})")

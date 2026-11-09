@@ -132,41 +132,7 @@ class CoderRuntimeStepExecutor:
             )
             await self._agent_run_service.start_run(agent_run.run_id, session_id=session_id)
 
-        # Launch background in-process worker task if requested / available
-        worker_task: asyncio.Task[None] | None = None
-        if self._worker_task_launcher is not None:
-            worker_task = await self._worker_task_launcher(session_id)
-
-        if worker_task is None:
-            finished_utc = datetime.datetime.now(datetime.UTC).isoformat()
-            if agent_run is not None and self._agent_run_service is not None:
-                await self._agent_run_service.fail_run(
-                    agent_run.run_id,
-                    reason="No coder worker available to drive step execution",
-                )
-            evidence = StepExecutionEvidence(
-                step_id=step_id,
-                executor_identity="CoderRuntimeStepExecutor",
-                runtime_id="none",
-                session_id=session_id,
-                run_id=agent_run.run_id if agent_run else None,
-                started_at=now_utc,
-                finished_at=finished_utc,
-                is_real=True,
-                evidence_source="coder_agent_orchestrator",
-                execution_success=False,
-                verification_performed=False,
-                verification_passed=False,
-                notes="Blocked: no active coder worker available to drive execution",
-            )
-            return ImplementationResult(
-                step_id=step_id,
-                summary=f"[CoderRuntimeStepExecutor] Blocked: No active coder worker available for step '{step_title}'.",
-                success=False,
-                is_mocked=False,
-                execution_evidence=evidence.to_dict(),
-            )
-
+        # Prepare unified prompt section
         prompt = f"Execute step '{step_title}' for role '{step_role.value}'."
         if self._context_builder is not None and self._project_id:
             try:
@@ -186,6 +152,46 @@ class CoderRuntimeStepExecutor:
                 pass
         if repair_hint:
             prompt += f"\nPrevious attempt rejected with repair hint: {repair_hint}"
+
+        # Launch background in-process worker task if requested / available
+        worker_task: asyncio.Task[None] | None = None
+        if self._worker_task_launcher is not None:
+            worker_task = await self._worker_task_launcher(session_id)
+
+        # In external host mode, no background worker task exists.
+        # Enqueue the command into the session orchestrator queue for the host to consume.
+        if worker_task is None:
+            await orchestrator.send(session_id, prompt, context)
+            if agent_run is not None and self._agent_run_service is not None:
+                await self._agent_run_service.wait_run(
+                    agent_run.run_id,
+                    reason="Waiting for external host coder worker execution",
+                )
+            evidence = StepExecutionEvidence(
+                step_id=step_id,
+                executor_identity="CoderRuntimeStepExecutor",
+                runtime_id="external_host_bridge",
+                session_id=session_id,
+                run_id=agent_run.run_id if agent_run else None,
+                started_at=now_utc,
+                finished_at="",
+                is_real=True,
+                evidence_source="coder_agent_orchestrator",
+                execution_success=True,
+                verification_performed=False,
+                verification_passed=False,
+                notes="WAITING_FOR_HOST: Prompt enqueued for external host execution",
+            )
+            return ImplementationResult(
+                step_id=step_id,
+                summary=(
+                    f"[CoderRuntimeStepExecutor] Step '{step_title}' enqueued in session '{session_id}'. "
+                    f"Waiting for host worker execution via next_coder_command."
+                ),
+                success=True,
+                is_mocked=False,
+                execution_evidence=evidence.to_dict(),
+            )
 
         tool_calls: list[dict[str, Any]] = []
         modified_files: list[str] = []

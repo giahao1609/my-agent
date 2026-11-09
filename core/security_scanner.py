@@ -254,6 +254,55 @@ class SecurityScannerRegistry:
         self._semgrep_available: bool = shutil.which("semgrep") is not None
         self._gitleaks_available: bool = shutil.which("gitleaks") is not None
 
+    @staticmethod
+    def is_ignored_path(file_path: Path, root: Path) -> bool:
+        """Determine whether file_path should be ignored during workspace security scan.
+
+        Invariants:
+        1. Ignore standard development artifacts (.venv, node_modules, .git, __pycache__, cache dirs).
+        2. Block/ignore symlink escapes outside the canonical workspace root.
+        3. When scanning from a parent root, ignore nested ephemeral worktrees located
+           under '.agents/worktrees/'.
+        4. NEVER ignore '.agents/rules/', '.agents/skills/', or other non-worktree directories.
+        5. If the scan root itself is a worktree inside '.agents/worktrees/', do NOT ignore
+           its source files (evaluated relative to canonical scan root).
+        6. Do not ignore files merely because an ancestor directory outside the scan root contains '.agents'.
+        """
+        try:
+            root_canonical = root.resolve()
+            p_canonical = file_path.resolve()
+        except (OSError, RuntimeError):
+            return True
+
+        # Check if file resides inside the scan root
+        try:
+            rel = p_canonical.relative_to(root_canonical)
+            rel_parts = rel.parts
+        except ValueError:
+            # File is outside the workspace root (e.g. symlink escape)
+            return True
+
+        # 1. Standard ignored directory names anywhere inside workspace relative path
+        ignored_names = {
+            ".venv",
+            "venv",
+            "node_modules",
+            ".git",
+            "__pycache__",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".mypy_cache",
+        }
+        if any(part in ignored_names for part in rel_parts):
+            return True
+
+        # 2. Check for nested worktrees under .agents/worktrees relative to scan root
+        for i in range(len(rel_parts) - 1):
+            if rel_parts[i] == ".agents" and rel_parts[i + 1] == "worktrees":
+                return True
+
+        return False
+
     def scan_workspace(
         self,
         workspace_path: Path | str,
@@ -290,14 +339,35 @@ class SecurityScannerRegistry:
         if target_files:
             for rel in target_files:
                 full_p = root / rel
-                if full_p.is_file():
+                try:
+                    p_canonical = full_p.resolve()
+                    root_canonical = root.resolve()
+                    is_outside = not p_canonical.is_relative_to(root_canonical)
+                except (OSError, RuntimeError, ValueError):
+                    is_outside = True
+
+                if is_outside:
+                    findings.append(SecurityFinding(
+                        rule_id="ESCAPE-001",
+                        severity=SecuritySeverity.CRITICAL,
+                        file_path=str(rel),
+                        line_number=0,
+                        description=f"Path traversal or symlink escape outside workspace boundary: '{rel}'",
+                        remediation="Ensure all modified and targeted files are strictly confined within the workspace root",
+                    ))
+                    continue
+
+                if full_p.is_file() and not self.is_ignored_path(full_p, root):
                     files_to_scan.append(full_p)
         else:
-            # Default scan python/js/go files, manifests, and configs, ignoring .venv and node_modules
+            # Default scan python/js/go files, manifests, and configs, ignoring standard exclusions
             for p in root.rglob("*"):
-                if p.is_file() and not any(part in p.parts for part in (".venv", "node_modules", ".git", "__pycache__")):
-                    if p.suffix in (".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".json", ".env", ".txt", ".toml"):
-                        files_to_scan.append(p)
+                if (
+                    p.is_file()
+                    and not self.is_ignored_path(p, root)
+                    and p.suffix in (".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".json", ".env", ".txt", ".toml")
+                ):
+                    files_to_scan.append(p)
 
         for file_p in files_to_scan:
             try:

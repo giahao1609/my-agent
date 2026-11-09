@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pytest
 from pathlib import Path
 
 from core.handoff_contracts import SecuritySeverity
@@ -44,3 +43,116 @@ def test_security_scanner_registry(tmp_path: Path) -> None:
     # Ensure findings text is redacted
     for f in res.findings:
         assert "sk-abcdefghijklmnopqrstuvwxyz12345" not in f.description
+
+
+def test_is_ignored_path_distinguishes_worktrees_from_rules_and_skills(tmp_path: Path) -> None:
+    """Verify that .agents/rules and .agents/skills are scanned, while .agents/worktrees is ignored."""
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    rule_file = root / ".agents" / "rules" / "policy.toml"
+    skill_file = root / ".agents" / "skills" / "my-skill" / "SKILL.md"
+    config_file = root / ".agents" / "config.json"
+    nested_worktree_file = root / ".agents" / "worktrees" / "step-1" / "core" / "code.py"
+    standard_venv_file = root / ".venv" / "lib" / "site.py"
+    normal_source_file = root / "core" / "main.py"
+
+    for f in (rule_file, skill_file, config_file, nested_worktree_file, standard_venv_file, normal_source_file):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("# dummy", encoding="utf-8")
+
+    # Rules, skills, and config under .agents must NOT be ignored
+    assert SecurityScannerRegistry.is_ignored_path(rule_file, root) is False
+    assert SecurityScannerRegistry.is_ignored_path(skill_file, root) is False
+    assert SecurityScannerRegistry.is_ignored_path(config_file, root) is False
+    assert SecurityScannerRegistry.is_ignored_path(normal_source_file, root) is False
+
+    # Ephemeral worktree checkouts and .venv must be ignored from parent root
+    assert SecurityScannerRegistry.is_ignored_path(nested_worktree_file, root) is True
+    assert SecurityScannerRegistry.is_ignored_path(standard_venv_file, root) is True
+
+
+def test_is_ignored_path_scans_worktree_when_root_is_worktree(tmp_path: Path) -> None:
+    """When the scan root itself is a worktree inside .agents/worktrees, its files MUST be scanned."""
+    worktree_root = tmp_path / "parent_repo" / ".agents" / "worktrees" / "step-42"
+    worktree_root.mkdir(parents=True)
+
+    src_file = worktree_root / "core" / "app.py"
+    rule_file = worktree_root / ".agents" / "rules" / "rule.json"
+    venv_file = worktree_root / ".venv" / "bin" / "pip"
+
+    src_file.parent.mkdir(parents=True, exist_ok=True)
+    rule_file.parent.mkdir(parents=True, exist_ok=True)
+    venv_file.parent.mkdir(parents=True, exist_ok=True)
+
+    src_file.write_text("print('hello')", encoding="utf-8")
+    rule_file.write_text("{}", encoding="utf-8")
+    venv_file.write_text("# pip", encoding="utf-8")
+
+    # Relative to the worktree root, src_file and rule_file are NOT ignored
+    assert SecurityScannerRegistry.is_ignored_path(src_file, worktree_root) is False
+    assert SecurityScannerRegistry.is_ignored_path(rule_file, worktree_root) is False
+    # .venv inside the worktree is still ignored
+    assert SecurityScannerRegistry.is_ignored_path(venv_file, worktree_root) is True
+
+
+def test_is_ignored_path_ancestor_agents_path_not_ignored(tmp_path: Path) -> None:
+    """A project root located in an ancestor path containing '.agents' must not have its files ignored."""
+    ancestor = tmp_path / "user" / ".agents" / "workspace" / "project"
+    ancestor.mkdir(parents=True)
+
+    file_p = ancestor / "src" / "index.py"
+    file_p.parent.mkdir(parents=True, exist_ok=True)
+    file_p.write_text("# code", encoding="utf-8")
+
+    assert SecurityScannerRegistry.is_ignored_path(file_p, ancestor) is False
+
+
+def test_scan_workspace_full_e2e_worktree_and_rules_coverage(tmp_path: Path) -> None:
+    """E2E verification that scan_workspace scans .agents/rules but ignores nested worktrees."""
+    repo_root = tmp_path / "e2e_repo"
+    repo_root.mkdir()
+
+    # 1. Clean app file
+    clean_app = repo_root / "app.py"
+    clean_app.write_text("def hello(): pass\n", encoding="utf-8")
+
+    # 2. Insecure rule in .agents/rules/ -> MUST be detected
+    bad_rule = repo_root / ".agents" / "rules" / "custom_rule.py"
+    bad_rule.parent.mkdir(parents=True, exist_ok=True)
+    bad_rule.write_text("eval('os.system(cmd)')\n", encoding="utf-8")
+
+    # 3. Insecure file in nested .agents/worktrees/ -> MUST be ignored from parent scan
+    worktree_bad = repo_root / ".agents" / "worktrees" / "step-test" / "leaked.py"
+    worktree_bad.parent.mkdir(parents=True, exist_ok=True)
+    worktree_bad.write_text("aws_key = 'AKIAIOSFODNN7EXAMPLE'\n", encoding="utf-8")
+
+    scanner = SecurityScannerRegistry()
+
+    # Scan parent repo: should detect bad_rule in .agents/rules, but ignore worktree_bad
+    res_parent = scanner.scan_workspace(repo_root, step_id="parent_scan")
+    file_paths = [f.file_path for f in res_parent.findings]
+
+    # bad_rule in .agents/rules was scanned and detected
+    assert any("custom_rule.py" in fp for fp in file_paths)
+    # worktree_bad in .agents/worktrees was skipped
+    assert not any("leaked.py" in fp for fp in file_paths)
+
+    # Now scan the worktree itself as root: leaked.py MUST be detected
+    res_worktree = scanner.scan_workspace(worktree_bad.parent, step_id="worktree_scan")
+    wt_files = [f.file_path for f in res_worktree.findings]
+    assert any("leaked.py" in fp for fp in wt_files)
+
+
+def test_scan_workspace_target_file_escape_fails_gate(tmp_path: Path) -> None:
+    """Path traversal or symlink escape in target_files must emit CRITICAL finding and fail gate."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    outside_file = tmp_path / "outside.py"
+    outside_file.write_text("# outside", encoding="utf-8")
+
+    scanner = SecurityScannerRegistry()
+    res = scanner.scan_workspace(root, step_id="escape_test", target_files=["../outside.py"])
+
+    assert res.passed_gate is False
+    assert any(f.rule_id == "ESCAPE-001" and f.severity == SecuritySeverity.CRITICAL for f in res.findings)
