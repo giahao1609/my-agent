@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import pytest
 from pathlib import Path
+
+import pytest
 
 from core.test_runner import (
     GoTestRunnerAdapter,
@@ -81,10 +82,75 @@ def test_pytest_crash_or_usage_error_never_reports_pass() -> None:
 @pytest.mark.asyncio
 async def test_test_runner_registry_run_tests(tmp_path: Path) -> None:
     registry = TestRunnerRegistry()
-    # Path without indicator returns empty test result with details
+    # Path without indicator must fail closed
     res = await registry.run_tests(tmp_path, "step-1")
     assert res.step_id == "step-1"
+    assert res.failed_tests == 1
+    assert res.execution_success is False
+    assert res.success is False
     assert "No supported test runner detected" in res.failure_details[0]
+
+
+def test_go_runner_pass_exit_0_success() -> None:
+    """Go tests passing with exit code 0 must report success."""
+    output = "--- PASS: TestAdd (0.01s)\n--- PASS: TestSub (0.02s)\nPASS\nok  \tmy/pkg\t0.035s"
+    res = GoTestRunnerAdapter._parse_go_output("step-go-pass", output, exit_code=0)
+    assert res.passed_tests == 2
+    assert res.failed_tests == 0
+    assert res.execution_success is True
+    assert res.success is True
+
+
+def test_go_runner_pass_with_nonzero_exit_fails() -> None:
+    """Go tests reporting PASS but ending with exit code != 0 must fail closed."""
+    output = "--- PASS: TestAdd (0.01s)\nFAIL"
+    res = GoTestRunnerAdapter._parse_go_output("step-go-fail", output, exit_code=1)
+    assert res.passed_tests == 1
+    assert res.failed_tests >= 1
+    assert res.execution_success is False
+    assert res.success is False
+
+
+def test_go_runner_build_failure_fails() -> None:
+    """Go build failure with exit code 2 must fail closed without phantom passed tests."""
+    output = "# my/pkg\n./app.go:5:2: undefined: nonExistentFunc\nFAIL\tmy/pkg [build failed]"
+    res = GoTestRunnerAdapter._parse_go_output("step-go-build", output, exit_code=2)
+    assert res.passed_tests == 0
+    assert res.failed_tests >= 1
+    assert res.execution_success is False
+    assert res.success is False
+    assert any("[build failed]" in f for f in res.failure_details)
+
+
+def test_go_runner_panic_fails() -> None:
+    """Go test panic must fail closed and record panic detail."""
+    output = "--- PASS: TestOne (0.01s)\npanic: runtime error: index out of range\nFAIL\tmy/pkg\t0.02s"
+    res = GoTestRunnerAdapter._parse_go_output("step-go-panic", output, exit_code=2)
+    assert res.failed_tests >= 1
+    assert res.execution_success is False
+    assert res.success is False
+    assert any("panic:" in f for f in res.failure_details)
+
+
+def test_go_runner_no_tests_exit_0_does_not_invent_pass() -> None:
+    """Go package with [no test files] and exit code 0 must have 0 passed tests, not phantom 1."""
+    output = "?   \tmy/pkg\t[no test files]"
+    res = GoTestRunnerAdapter._parse_go_output("step-go-empty", output, exit_code=0)
+    assert res.passed_tests == 0
+    assert res.failed_tests == 0
+    assert res.total_tests == 0
+    assert res.execution_success is True
+    assert res.success is True
+
+
+def test_go_runner_package_ok_exit_0_success() -> None:
+    """Go package reporting ok without individual test lines must count package as passed."""
+    output = "ok  \tmy/pkg\t0.045s\nok  \tmy/pkg2\t0.012s"
+    res = GoTestRunnerAdapter._parse_go_output("step-go-pkg", output, exit_code=0)
+    assert res.passed_tests == 2
+    assert res.failed_tests == 0
+    assert res.execution_success is True
+    assert res.success is True
 
 
 @pytest.mark.asyncio

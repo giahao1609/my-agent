@@ -77,6 +77,7 @@ class PytestRunnerAdapter:
                 passed_tests=0,
                 failed_tests=1,
                 failure_details=(f"Pytest execution timed out after {timeout_seconds}s",),
+                execution_success=False,
             )
         except Exception as e:
             return TestResult(
@@ -85,6 +86,7 @@ class PytestRunnerAdapter:
                 passed_tests=0,
                 failed_tests=1,
                 failure_details=(f"Failed to execute pytest: {e}",),
+                execution_success=False,
             )
 
     @staticmethod
@@ -132,6 +134,8 @@ class PytestRunnerAdapter:
             cov_match = re.search(r"(\d+(?:\.\d+)?)%\s+coverage", output, re.IGNORECASE)
         coverage = float(cov_match.group(1)) if cov_match else None
 
+        execution_success = exit_code == 0 and total_failed == 0
+
         return TestResult(
             step_id=step_id,
             total_tests=total,
@@ -139,6 +143,7 @@ class PytestRunnerAdapter:
             failed_tests=total_failed,
             failure_details=tuple(failures[:10]),
             coverage_percentage=coverage,
+            execution_success=execution_success,
         )
 
 
@@ -184,6 +189,7 @@ class NpmTestRunnerAdapter:
                 passed_tests=0,
                 failed_tests=1,
                 failure_details=(f"Npm test execution timed out after {timeout_seconds}s",),
+                execution_success=False,
             )
         except Exception as e:
             return TestResult(
@@ -192,6 +198,7 @@ class NpmTestRunnerAdapter:
                 passed_tests=0,
                 failed_tests=1,
                 failure_details=(f"Failed to execute npm test: {e}",),
+                execution_success=False,
             )
 
     @staticmethod
@@ -209,6 +216,8 @@ class NpmTestRunnerAdapter:
             cov_match = re.search(r"Coverage:\s*(\d+(?:\.\d+)?)%", output, re.IGNORECASE)
         coverage = float(cov_match.group(1)) if cov_match else None
 
+        execution_success = exit_code == 0 and failed == 0
+
         return TestResult(
             step_id=step_id,
             total_tests=total,
@@ -216,6 +225,7 @@ class NpmTestRunnerAdapter:
             failed_tests=failed,
             failure_details=tuple(line.strip() for line in output.splitlines() if "FAIL" in line or "Error:" in line)[:10],
             coverage_percentage=coverage,
+            execution_success=execution_success,
         )
 
 
@@ -263,6 +273,7 @@ class GoTestRunnerAdapter:
                 passed_tests=0,
                 failed_tests=1,
                 failure_details=(f"Go test execution timed out after {timeout_seconds}s",),
+                execution_success=False,
             )
         except Exception as e:
             return TestResult(
@@ -271,32 +282,69 @@ class GoTestRunnerAdapter:
                 passed_tests=0,
                 failed_tests=1,
                 failure_details=(f"Failed to execute go test: {e}",),
+                execution_success=False,
             )
 
     @staticmethod
     def _parse_go_output(step_id: str, output: str, exit_code: int) -> TestResult:
-        passed_count = len(re.findall(r"--- PASS:", output))
-        failed_count = len(re.findall(r"--- FAIL:", output))
+        passed_count = len(re.findall(r"^--- PASS:", output, re.MULTILINE))
+        failed_count = len(re.findall(r"^--- FAIL:", output, re.MULTILINE))
+
+        pkg_ok_count = len(re.findall(r"^ok\s+", output, re.MULTILINE))
+        pkg_fail_count = len(re.findall(r"^FAIL\s+", output, re.MULTILINE))
+
+        has_no_test_files = bool(re.search(r"\[no test files\]|\[no tests to run\]", output))
 
         if passed_count == 0 and failed_count == 0:
-            if exit_code == 0:
-                passed_count, failed_count = 1, 0
+            if pkg_ok_count > 0 and exit_code == 0:
+                passed_count = pkg_ok_count
+            elif exit_code == 0 and has_no_test_files:
+                passed_count = 0
+                failed_count = 0
+            elif exit_code != 0:
+                failed_count = max(1, pkg_fail_count)
             else:
-                passed_count, failed_count = 0, 1
+                passed_count = 0
+                failed_count = 0
+
+        # Strict invariant for F02: exit_code != 0 MUST ALWAYS result in failed_count >= 1
+        if exit_code != 0 and failed_count == 0:
+            failed_count = max(1, pkg_fail_count)
 
         total = passed_count + failed_count
-        failures = tuple(line.strip() for line in output.splitlines() if "--- FAIL:" in line or "FAIL\t" in line)[:10]
+
+        failures: list[str] = []
+        if failed_count > 0 or exit_code != 0:
+            for line in output.splitlines():
+                stripped = line.strip()
+                if (
+                    stripped.startswith("--- FAIL:")
+                    or stripped.startswith("FAIL\t")
+                    or stripped.startswith("FAIL ")
+                    or "panic:" in stripped
+                    or "[build failed]" in stripped
+                    or "[setup failed]" in stripped
+                    or "cannot find package" in stripped
+                ):
+                    failures.append(stripped)
+            if not failures and exit_code != 0:
+                failures.append(f"Go test command failed with exit code {exit_code}")
+                tail_lines = [l.strip() for l in output.splitlines() if l.strip()][-3:]
+                failures.extend(tail_lines)
 
         cov_match = re.search(r"coverage:\s*(\d+(?:\.\d+)?)%", output)
         coverage = float(cov_match.group(1)) if cov_match else None
+
+        execution_success = exit_code == 0 and failed_count == 0
 
         return TestResult(
             step_id=step_id,
             total_tests=total,
             passed_tests=passed_count,
             failed_tests=failed_count,
-            failure_details=failures,
+            failure_details=tuple(failures[:10]),
             coverage_percentage=coverage,
+            execution_success=execution_success,
         )
 
 
@@ -334,8 +382,9 @@ class TestRunnerRegistry:
                 step_id=step_id,
                 total_tests=0,
                 passed_tests=0,
-                failed_tests=0,
+                failed_tests=1,
                 failure_details=("No supported test runner detected",),
+                execution_success=False,
             )
         return await adapter.run_tests(
             path,

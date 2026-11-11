@@ -503,10 +503,11 @@ class WholePlanCoordinator:
         except TypeError:
             test_res = await self._test_runner.run_tests(workspace_path, step_id)
 
+        sec_targets = list(reported_files) if reported_files else None
         sec_res = self._security_scanner.scan_workspace(
             workspace_path,
             step_id,
-            target_files=target_selection.selected_tests or None,
+            target_files=sec_targets,
         )
 
         # ── 4. Final gate evaluation ──────────────────────────────────────────
@@ -759,7 +760,12 @@ class WholePlanCoordinator:
                 root_path,
                 step_id="final_plan_verification",
             )
-            final_gate_passed = (final_test_res.failed_tests == 0) and final_sec_res.passed_gate
+            final_gate_passed = (
+                final_test_res.success
+                and (final_test_res.failed_tests == 0)
+                and getattr(final_test_res, "execution_success", True)
+                and final_sec_res.passed_gate
+            )
             if final_gate_passed:
                 await self._plan_service.complete_plan(plan_id)
                 await self._task_service.complete_task(plan.task_id)
@@ -861,10 +867,11 @@ class WholePlanCoordinator:
         except TypeError:
             test_res = await self._test_runner.run_tests(root_path, step_id)
 
+        sec_targets = list(modified_files) if modified_files else None
         sec_res = self._security_scanner.scan_workspace(
             root_path,
             step_id,
-            target_files=target_selection.selected_tests or None,
+            target_files=sec_targets,
         )
 
         # 5. Evaluate Verification Gate
@@ -949,7 +956,12 @@ class WholePlanCoordinator:
                 root_path,
                 step_id="final_plan_verification",
             )
-            if final_test_res.failed_tests == 0 and final_sec_res.passed_gate:
+            if (
+                final_test_res.success
+                and final_test_res.failed_tests == 0
+                and getattr(final_test_res, "execution_success", True)
+                and final_sec_res.passed_gate
+            ):
                 await self._plan_service.complete_plan(plan.plan_id)
                 await self._task_service.complete_task(plan.task_id)
                 return StepAdvanceResult(

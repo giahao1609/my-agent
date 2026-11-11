@@ -173,10 +173,15 @@ class TestResult:
     duration_ms: int = 0
     failure_details: tuple[str, ...] = field(default_factory=tuple)
     coverage_percentage: float | None = None
+    execution_success: bool = True
 
     @property
     def success(self) -> bool:
-        return self.failed_tests == 0
+        return (
+            self.execution_success
+            and self.failed_tests == 0
+            and not (self.total_tests == 0 and bool(self.failure_details))
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -187,6 +192,7 @@ class TestResult:
             'duration_ms': self.duration_ms,
             'failure_details': list(self.failure_details),
             'coverage_percentage': self.coverage_percentage,
+            'execution_success': self.execution_success,
             'success': self.success,
         }
 
@@ -200,6 +206,7 @@ class TestResult:
             duration_ms=data.get('duration_ms', 0),
             failure_details=tuple(data.get('failure_details', ())),
             coverage_percentage=data.get('coverage_percentage'),
+            execution_success=data.get('execution_success', True),
         )
 
 

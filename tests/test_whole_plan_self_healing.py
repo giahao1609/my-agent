@@ -55,6 +55,12 @@ async def _setup_workspace_env(tmp_path: Path):
     plan_svc = PlanService(task_store=task_store, plan_store=plan_store)
     decision_svc = DecisionService(decision_store)
 
+    # Provide valid test runner baseline in tmp_path
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    (test_dir / "test_baseline.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+
     return task_svc, plan_svc, plan_store, task_store, decision_svc
 
 

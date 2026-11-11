@@ -4,8 +4,8 @@ import math
 import re
 import shutil
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from .handoff_contracts import SecurityFinding, SecurityReviewResult, SecuritySeverity
 
@@ -79,6 +79,19 @@ class SecretDetectorAdapter:
         findings: list[SecurityFinding] = []
         try:
             content = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return [
+                SecurityFinding(
+                    rule_id="SCAN-ERR-READ",
+                    severity=SecuritySeverity.HIGH,
+                    file_path=relative_path,
+                    line_number=0,
+                    description=f"Failed to read file for secret detection ({type(e).__name__})",
+                    remediation="Ensure file exists, has read permissions, and is valid text",
+                )
+            ]
+
+        try:
             for line_idx, line in enumerate(content.splitlines(), start=1):
                 # Check regex patterns
                 for pattern, name in self.SECRET_PATTERNS:
@@ -110,8 +123,17 @@ class SecretDetectorAdapter:
                                     remediation="Verify whether this token is an unencrypted credential and externalize it",
                                 )
                             )
-        except Exception:
-            pass
+        except Exception as e:
+            findings.append(
+                SecurityFinding(
+                    rule_id="SCAN-ERR-SECRET",
+                    severity=SecuritySeverity.HIGH,
+                    file_path=relative_path,
+                    line_number=0,
+                    description=f"Secret detection adapter failed during analysis ({type(e).__name__})",
+                    remediation="Check file formatting and scanner configuration",
+                )
+            )
         return findings
 
 
@@ -140,6 +162,19 @@ class SastScannerAdapter:
         findings: list[SecurityFinding] = []
         try:
             content = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return [
+                SecurityFinding(
+                    rule_id="SCAN-ERR-READ",
+                    severity=SecuritySeverity.HIGH,
+                    file_path=relative_path,
+                    line_number=0,
+                    description=f"Failed to read file for SAST scan ({type(e).__name__})",
+                    remediation="Ensure file exists, has read permissions, and is valid text",
+                )
+            ]
+
+        try:
             for line_idx, line in enumerate(content.splitlines(), start=1):
                 for pattern, rule_id, severity, desc in self.SAST_PATTERNS:
                     if pattern.search(line):
@@ -153,8 +188,17 @@ class SastScannerAdapter:
                                 remediation="Refactor to use parameterized queries, safe parsers, or strict input validation",
                             )
                         )
-        except Exception:
-            pass
+        except Exception as e:
+            findings.append(
+                SecurityFinding(
+                    rule_id="SCAN-ERR-SAST",
+                    severity=SecuritySeverity.HIGH,
+                    file_path=relative_path,
+                    line_number=0,
+                    description=f"SAST scanner adapter failed during analysis ({type(e).__name__})",
+                    remediation="Inspect file format and resolve scanning error",
+                )
+            )
         return findings
 
 
@@ -206,6 +250,19 @@ class DependencyScaScannerAdapter:
 
         try:
             content = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return [
+                SecurityFinding(
+                    rule_id="SCAN-ERR-READ",
+                    severity=SecuritySeverity.HIGH,
+                    file_path=relative_path,
+                    line_number=0,
+                    description=f"Failed to read file for SCA scan ({type(e).__name__})",
+                    remediation="Ensure file exists, has read permissions, and is valid text",
+                )
+            ]
+
+        try:
             for line_idx, line in enumerate(content.splitlines(), start=1):
                 # 1. requirements.txt style: package==1.2.3 or package<=1.2.3
                 m_req = re.match(r"^\s*([a-zA-Z0-9_\-]+)\s*(?:==|<=|~=)\s*([0-9a-zA-Z_.\-]+)", line)
@@ -240,8 +297,17 @@ class DependencyScaScannerAdapter:
                                     remediation=f"Upgrade {pkg_raw} to >={fixed_v}",
                                 )
                             )
-        except Exception:
-            pass
+        except Exception as e:
+            findings.append(
+                SecurityFinding(
+                    rule_id="SCAN-ERR-SCA",
+                    severity=SecuritySeverity.HIGH,
+                    file_path=relative_path,
+                    line_number=0,
+                    description=f"SCA scanner adapter failed during analysis ({type(e).__name__})",
+                    remediation="Inspect file format and resolve scanning error",
+                )
+            )
         return findings
 
 
@@ -407,8 +473,21 @@ class SecurityScannerRegistry:
                     ))
                     continue
 
-                if full_p.is_file() and not self.is_ignored_path(full_p, root):
-                    files_to_scan.append(full_p)
+                if self.is_ignored_path(full_p, root):
+                    continue
+
+                if not full_p.exists() or not full_p.is_file():
+                    findings.append(SecurityFinding(
+                        rule_id="SCAN-ERR-NOTFOUND",
+                        severity=SecuritySeverity.HIGH,
+                        file_path=str(rel),
+                        line_number=0,
+                        description=f"Target file for security scan does not exist or is unreadable: '{rel}'",
+                        remediation="Ensure all targeted files exist and are readable within the workspace",
+                    ))
+                    continue
+
+                files_to_scan.append(full_p)
         else:
             # Default scan source files, manifests, configs, and skill/rule documents, ignoring standard exclusions
             for p in root.rglob("*"):
@@ -425,13 +504,44 @@ class SecurityScannerRegistry:
             except ValueError:
                 rel_path = str(file_p)
 
-            sec_findings = self.secret_detector.scan_file(file_p, rel_path)
-            sast_findings = self.sast_scanner.scan_file(file_p, rel_path)
-            sca_findings = self.sca_scanner.scan_file(file_p, rel_path)
+            try:
+                sec_findings = self.secret_detector.scan_file(file_p, rel_path)
+                findings.extend(sec_findings)
+            except Exception as e:
+                findings.append(SecurityFinding(
+                    rule_id="SCAN-ERR-ADAPTER",
+                    severity=SecuritySeverity.HIGH,
+                    file_path=rel_path,
+                    line_number=0,
+                    description=f"Secret detector adapter raised unhandled exception ({type(e).__name__})",
+                    remediation="Check scanner adapter implementation",
+                ))
 
-            findings.extend(sec_findings)
-            findings.extend(sast_findings)
-            findings.extend(sca_findings)
+            try:
+                sast_findings = self.sast_scanner.scan_file(file_p, rel_path)
+                findings.extend(sast_findings)
+            except Exception as e:
+                findings.append(SecurityFinding(
+                    rule_id="SCAN-ERR-ADAPTER",
+                    severity=SecuritySeverity.HIGH,
+                    file_path=rel_path,
+                    line_number=0,
+                    description=f"SAST scanner adapter raised unhandled exception ({type(e).__name__})",
+                    remediation="Check scanner adapter implementation",
+                ))
+
+            try:
+                sca_findings = self.sca_scanner.scan_file(file_p, rel_path)
+                findings.extend(sca_findings)
+            except Exception as e:
+                findings.append(SecurityFinding(
+                    rule_id="SCAN-ERR-ADAPTER",
+                    severity=SecuritySeverity.HIGH,
+                    file_path=rel_path,
+                    line_number=0,
+                    description=f"SCA scanner adapter raised unhandled exception ({type(e).__name__})",
+                    remediation="Check scanner adapter implementation",
+                ))
 
         # Redact any findings text
         clean_findings = [

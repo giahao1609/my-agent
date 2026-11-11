@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from core.handoff_contracts import SecuritySeverity
 from core.security_scanner import (
     SecretDetectorAdapter,
@@ -205,3 +207,71 @@ def test_scan_workspace_detects_secrets_in_skill_md_and_configs(tmp_path: Path) 
     assert any("config.yaml" in fp for fp in findings_files)
     # user_guide.md was not scanned
     assert not any("user_guide.md" in fp for fp in findings_files)
+
+
+def test_scan_workspace_target_file_not_found_fails_gate(tmp_path: Path) -> None:
+    """Target file that does not exist must fail closed with SCAN-ERR-NOTFOUND."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    scanner = SecurityScannerRegistry()
+    res = scanner.scan_workspace(repo, step_id="missing_target", target_files=["src/non_existent.py"])
+
+    assert res.passed_gate is False
+    assert any(f.rule_id == "SCAN-ERR-NOTFOUND" and f.severity == SecuritySeverity.HIGH for f in res.findings)
+
+
+def test_scan_workspace_file_read_error_fails_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If file reading raises OSError/PermissionError, security gate must fail closed."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target_file = repo / "core.py"
+    target_file.write_text("print('test')", encoding="utf-8")
+
+    def broken_read_text(*args, **kwargs):
+        raise PermissionError("Access denied")
+
+    monkeypatch.setattr(Path, "read_text", broken_read_text)
+
+    scanner = SecurityScannerRegistry()
+    res = scanner.scan_workspace(repo, step_id="read_err", target_files=["core.py"])
+
+    assert res.passed_gate is False
+    assert any(f.rule_id == "SCAN-ERR-READ" and f.severity == SecuritySeverity.HIGH for f in res.findings)
+    # Ensure error message does not expose unredacted sensitive content
+    for f in res.findings:
+        assert "PermissionError" in f.description
+
+
+def test_scan_workspace_adapter_exception_fails_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If a scanner adapter raises an unhandled exception, security gate must fail closed."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target_file = repo / "app.py"
+    target_file.write_text("def app(): pass", encoding="utf-8")
+
+    scanner = SecurityScannerRegistry()
+
+    def broken_scan_file(*args, **kwargs):
+        raise RuntimeError("Unexpected internal AST parser failure")
+
+    monkeypatch.setattr(scanner.sast_scanner, "scan_file", broken_scan_file)
+
+    res = scanner.scan_workspace(repo, step_id="adapter_err", target_files=["app.py"])
+
+    assert res.passed_gate is False
+    assert any(f.rule_id == "SCAN-ERR-ADAPTER" and f.severity == SecuritySeverity.HIGH for f in res.findings)
+
+
+def test_scan_workspace_clean_file_passes_gate(tmp_path: Path) -> None:
+    """Clean workspace with valid files and no findings must pass security gate."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    clean_file = repo / "math.py"
+    clean_file.write_text("def add(a: int, b: int) -> int:\n    return a + b\n", encoding="utf-8")
+
+    scanner = SecurityScannerRegistry()
+    res = scanner.scan_workspace(repo, step_id="clean_pass", target_files=["math.py"])
+
+    assert res.passed_gate is True
+    assert len(res.findings) == 0
+    assert "Security scan completed: 0 findings" in res.summary

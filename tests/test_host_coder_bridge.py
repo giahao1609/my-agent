@@ -81,7 +81,7 @@ async def test_external_coder_step_execution_waiting_for_host(tmp_path: Path):
 
     It enqueues the prompt, marks AgentRun as WAITING, and returns WAITING_FOR_HOST evidence.
     """
-    task_svc, plan_svc, plan_store, task_store, run_svc = await _setup_bridge_env(tmp_path)
+    task_svc, plan_svc, _plan_store, _task_store, run_svc = await _setup_bridge_env(tmp_path)
 
     task = await task_svc.create_task(
         task_id="task-ext-1",
@@ -263,6 +263,11 @@ async def test_advance_step_flow_and_final_verification_gate(tmp_path: Path):
     summary = await coordinator.execute_whole_plan(plan.plan_id, tmp_path)
     assert summary.execution_state == "WAITING_FOR_HOST"
     assert summary.current_step_id == "step-s1"
+
+    # Create dummy source files for real execution evidence
+    (tmp_path / "core").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "core" / "feature.py").write_text("# Feature 1 implementation\n", encoding="utf-8")
+    (tmp_path / "core" / "feature2.py").write_text("# Feature 2 implementation\n", encoding="utf-8")
 
     # 2. Host advances Step 1 with evidence
     advance_res1 = await coordinator.advance_step(
@@ -502,3 +507,161 @@ async def test_mcp_advance_plan_step_tool_registration():
     from my_agent_mcp import server
     assert hasattr(server, "advance_plan_step")
     assert callable(server.advance_plan_step)
+
+
+@pytest.mark.asyncio
+async def test_security_scanner_scans_actual_source_files_not_tests(tmp_path: Path):
+    """F03: Security scanner must inspect actual modified source files, not just selected_tests."""
+    task_svc, plan_svc, plan_store, task_store, run_svc = await _setup_bridge_env(tmp_path)
+
+    task = await task_svc.create_task(
+        task_id="task-f03-sec",
+        project_id="proj-ext",
+        objective="Verify source scanning for F03",
+    )
+    await task_svc.start_task(task.task_id)
+
+    plan = await plan_svc.materialize_plan(
+        task_id=task.task_id,
+        plan_id="plan-f03-sec",
+        steps=(("step-f03-1", "Feature with secret", "Implement feature"),),
+    )
+
+    orchestrator = MockOrchestrator()
+    mock_stack = SimpleNamespace(
+        orchestrator=orchestrator,
+        agent=MockCoderAgent(orchestrator),
+    )
+
+    executor = CoderRuntimeStepExecutor(
+        coder_stack=mock_stack,
+        workspace_path=tmp_path,
+        project_id="proj-ext",
+        task_id=task.task_id,
+        plan_id=plan.plan_id,
+        agent_run_service=run_svc,
+        worker_task_launcher=None,
+    )
+
+    coordinator = WholePlanCoordinator(
+        task_service=task_svc,
+        plan_service=plan_svc,
+        plan_store=plan_store,
+        step_executor=executor,
+        agent_run_service=run_svc,
+        project_id="proj-ext",
+    )
+
+    await coordinator.execute_whole_plan(plan.plan_id, tmp_path)
+
+    # Create source file WITH secret
+    src_file = tmp_path / "app_logic.py"
+    src_file.write_text("API_KEY = 'sk-ant-api012345678901234567890'\n", encoding="utf-8")
+
+    # Create test file WITHOUT secret
+    test_file = tmp_path / "tests" / "test_app_logic.py"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text("def test_dummy(): assert True\n", encoding="utf-8")
+
+    # Advance step providing modified source file
+    advance_res = await coordinator.advance_step(
+        step_id="step-f03-1",
+        workspace_path=tmp_path,
+        execution_evidence={
+            "is_real": True,
+            "executor_identity": "external_host_coder",
+            "session_id": "session-1",
+            "files_changed": ["app_logic.py"],
+        },
+    )
+
+    # Security gate must catch the secret in app_logic.py and reject the step!
+    assert advance_res.status == "step_rejected"
+    assert advance_res.review["status"] == "rejected"
+    assert any("app_logic.py" in str(r) and "Potential hardcoded secret" in str(r) for r in advance_res.review.get("required_repairs", []))
+
+
+@pytest.mark.asyncio
+async def test_final_plan_verification_rejects_missing_or_failed_runner(tmp_path: Path):
+    """F01: Final Plan Verification Gate must fail if test runner is missing or fails execution."""
+    task_svc, plan_svc, plan_store, task_store, run_svc = await _setup_bridge_env(tmp_path)
+
+    task = await task_svc.create_task(
+        task_id="task-f01-runner",
+        project_id="proj-ext",
+        objective="Verify runner requirement in final gate",
+    )
+    await task_svc.start_task(task.task_id)
+
+    plan = await plan_svc.materialize_plan(
+        task_id=task.task_id,
+        plan_id="plan-f01-runner",
+        steps=(("step-f01-1", "Only step", "Implement feature"),),
+    )
+
+    orchestrator = MockOrchestrator()
+    mock_stack = SimpleNamespace(
+        orchestrator=orchestrator,
+        agent=MockCoderAgent(orchestrator),
+    )
+
+    executor = CoderRuntimeStepExecutor(
+        coder_stack=mock_stack,
+        workspace_path=tmp_path,
+        project_id="proj-ext",
+        task_id=task.task_id,
+        plan_id=plan.plan_id,
+        agent_run_service=run_svc,
+        worker_task_launcher=None,
+    )
+
+    class MissingRunnerRegistry:
+        async def run_tests(self, workspace_path, step_id, target_files=None, timeout_seconds=120.0):
+            if step_id == "final_plan_verification":
+                return TestResult(
+                    step_id=step_id,
+                    total_tests=0,
+                    passed_tests=0,
+                    failed_tests=1,
+                    failure_details=("No supported test runner detected",),
+                    execution_success=False,
+                )
+            return TestResult(
+                step_id=step_id,
+                total_tests=1,
+                passed_tests=1,
+                failed_tests=0,
+                execution_success=True,
+            )
+
+    coordinator = WholePlanCoordinator(
+        task_service=task_svc,
+        plan_service=plan_svc,
+        plan_store=plan_store,
+        step_executor=executor,
+        test_runner_registry=MissingRunnerRegistry(),
+        agent_run_service=run_svc,
+        project_id="proj-ext",
+    )
+
+    await coordinator.execute_whole_plan(plan.plan_id, tmp_path)
+
+    clean_src = tmp_path / "app.py"
+    clean_src.write_text("def ok(): pass\n", encoding="utf-8")
+
+    advance_res = await coordinator.advance_step(
+        step_id="step-f01-1",
+        workspace_path=tmp_path,
+        execution_evidence={
+            "is_real": True,
+            "executor_identity": "external_host_coder",
+            "session_id": "session-1",
+            "files_changed": ["app.py"],
+        },
+    )
+
+    # Must fail at Final Verification Gate because runner is missing/failed!
+    assert advance_res.status == "final_verification_failed"
+    assert advance_res.execution_state == "FINAL_GATE_FAILED"
+    assert advance_res.plan_completed is False
+    assert any("No supported test runner detected" in str(d) for d in advance_res.failure_details)
