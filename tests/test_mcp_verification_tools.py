@@ -136,13 +136,16 @@ async def test_mcp_run_whole_plan(tmp_path, monkeypatch):
     # In EXTERNAL mode without an active coder worker or model, steps cannot be completed.
     # A simulated execution must never falsely report COMPLETED.
     #
-    # NEW CONTRACT:
-    # When run_whole_plan executes without an active real worker, it truthfully reports
-    # that the plan is NOT completed (plan_completed=False, steps_completed=0, steps_failed>=1).
+    # P1A CONTRACT:
+    # In EXTERNAL mode without an in-process worker, run_whole_plan transitions the step to
+    # WAITING_FOR_HOST, dispatches the prompt to session queue, and truthfully reports that
+    # the plan is in WAITING_FOR_HOST state without blocking or failing prematurely.
     assert summary["plan_id"] == "plan-1"
     assert summary["plan_completed"] is False
     assert summary["steps_completed"] == 0
-    assert summary["steps_failed"] >= 1
+    assert summary["execution_state"] == "WAITING_FOR_HOST"
+    assert summary["current_step_id"] == "s1"
+    assert "waiting for host" in summary["action_required"].lower()
     assert len(summary["review_history"]) >= 1
 
 

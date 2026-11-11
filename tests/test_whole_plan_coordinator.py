@@ -44,6 +44,13 @@ async def _setup_db(tmp_path: Path):
     await project_store.create(ProjectRecord(project_id="proj", name="P", workspace_path=str(tmp_path)))
     task_svc = TaskService(project_store=project_store, task_store=task_store)
     plan_svc = PlanService(task_store=task_store, plan_store=plan_store)
+
+    # Provide valid test runner baseline in tmp_path
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    (test_dir / "test_baseline.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+
     return task_svc, plan_svc, plan_store, task_store
 
 

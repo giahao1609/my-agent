@@ -2,35 +2,31 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
-from core.agent_role import AgentRole
-from core.agent_run import AgentRunRecord, AgentRunState
+from agents.coder_agent import CoderAgent
+from agents.coder_runtime_worker import CoderRuntimeWorker
+from core.agent_run import AgentRunState
 from core.agent_run_service import AgentRunService
-from core.capabilities import Availability, default_capability_registry
-from core.context import ExecutionContext
+from core.capabilities import Availability
 from core.handoff_contracts import (
     ImplementationResult,
-    ReviewResult,
     ReviewStatus,
     TestResult,
 )
-from core.model import ModelMessage, ModelTurn, ModelToolCall
+from core.model import ModelToolCall, ModelTurn
 from core.orchestrator import Orchestrator
 from core.plan import PlanState, PlanStepState
 from core.plan_service import PlanService
-from core.step_execution import CoderRuntimeStepExecutor, StepExecutionEvidence
+from core.step_execution import CoderRuntimeStepExecutor
 from core.task import TaskState
 from core.task_service import TaskService
 from core.tool_executor import ToolExecutor
 from core.tool_policy import ToolPolicy
-from core.tools import ToolDefinition, ToolPermission
 from core.verification_gate_coordinator import VerificationGateCoordinator
 from core.whole_plan_coordinator import (
-    StepExecutor,
     WholePlanCoordinator,
     _NoOpStepExecutor,
 )
@@ -41,9 +37,6 @@ from persistence.sqlite_plan_store import SQLitePlanStore
 from persistence.sqlite_project_store import SQLiteProjectStore
 from persistence.sqlite_task_store import SQLiteTaskStore
 from tools.coder_tools import build_coder_tool_registry
-from agents.coder_agent import CoderAgent
-from agents.coder_runtime_worker import CoderRuntimeWorker
-from agents.coder_stack import CoderAgentStack
 
 
 class _FakeMemory:
@@ -69,6 +62,12 @@ async def _setup_env(tmp_path: Path):
     await task_store.initialize()
     await plan_store.initialize()
     await agent_run_store.initialize()
+
+    # Provide valid test runner baseline in tmp_path
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    (test_dir / "test_baseline.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
 
     from core.project import ProjectRecord
     await proj_store.create(ProjectRecord(project_id="proj-1", name="P1", workspace_path=str(tmp_path)))
@@ -177,7 +176,7 @@ class _FileWritingModel:
 @pytest.mark.asyncio
 async def test_real_executor_success_with_workspace_mutation(tmp_path: Path) -> None:
     """Real CoderRuntimeStepExecutor runs tool loop, mutates workspace, passes gates, and completes step."""
-    task_svc, plan_svc, plan_store, task_store, agent_run_svc = await _setup_env(tmp_path)
+    task_svc, plan_svc, plan_store, _task_store, agent_run_svc = await _setup_env(tmp_path)
     task = await task_svc.create_task(task_id="task-real", project_id="proj-1", objective="Real execution")
     await task_svc.start_task(task.task_id)
     await plan_svc.materialize_plan(
@@ -255,7 +254,7 @@ class _FailingModel:
 @pytest.mark.asyncio
 async def test_executor_failure_propagates_truthfully(tmp_path: Path) -> None:
     """When the executor encounters an error, the step is NOT marked COMPLETED."""
-    task_svc, plan_svc, plan_store, task_store, agent_run_svc = await _setup_env(tmp_path)
+    task_svc, plan_svc, plan_store, _task_store, agent_run_svc = await _setup_env(tmp_path)
     task = await task_svc.create_task(task_id="task-fail", project_id="proj-1", objective="Fail test")
     await task_svc.start_task(task.task_id)
     await plan_svc.materialize_plan(
@@ -511,13 +510,6 @@ async def test_whole_plan_refuses_step_with_empty_or_false_evidence(tmp_path: Pa
 @pytest.mark.asyncio
 async def test_mcp_run_whole_plan_truth(tmp_path: Path) -> None:
     """run_whole_plan tool executes real coordinator and does not report completion on simulated steps."""
-    from persistence.sqlite_project_store import SQLiteProjectStore
-    from persistence.sqlite_task_store import SQLiteTaskStore
-    from persistence.sqlite_plan_store import SQLitePlanStore
-    import my_agent_mcp.server as srv
-
-    db_path = srv.DB_PATH
-    plan = await srv.plans.get_plan("non-existent-plan")
     res = await run_whole_plan(plan_id="non-existent-plan", workspace_path=str(tmp_path))
     assert res["plan_completed"] is False
     assert res["steps_completed"] == 0
@@ -530,7 +522,7 @@ async def test_mcp_run_whole_plan_truth(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_agent_run_ledger_contains_execution_evidence(tmp_path: Path) -> None:
     """Real execution creates and completes an AgentRun record containing structured evidence."""
-    task_svc, plan_svc, plan_store, task_store, agent_run_svc = await _setup_env(tmp_path)
+    task_svc, plan_svc, plan_store, _task_store, agent_run_svc = await _setup_env(tmp_path)
     task = await task_svc.create_task(task_id="task-ledger", project_id="proj-1", objective="Ledger test")
     await task_svc.start_task(task.task_id)
     await plan_svc.materialize_plan(
@@ -701,7 +693,7 @@ class _ApprovalRequiringModel:
 @pytest.mark.asyncio
 async def test_governance_approval_preserved_in_real_execution(tmp_path: Path) -> None:
     """Dangerous commands trigger approval requirement and prevent auto-completion."""
-    task_svc, plan_svc, plan_store, task_store, agent_run_svc = await _setup_env(tmp_path)
+    task_svc, plan_svc, plan_store, _task_store, agent_run_svc = await _setup_env(tmp_path)
     task = await task_svc.create_task(task_id="task-gov", project_id="proj-1", objective="Governance test")
     await task_svc.start_task(task.task_id)
     await plan_svc.materialize_plan(

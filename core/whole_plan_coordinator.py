@@ -19,12 +19,13 @@ from .git_worktree import (
     WorktreeMergeReport,
 )
 from .goal_drift_monitor import GoalDriftMonitor
-from .handoff_contracts import ImplementationResult, ReviewStatus
+from .handoff_contracts import ImplementationResult, ReviewResult, ReviewStatus
 from .plan import PlanStepState
 from .plan_service import PlanService
 from .plan_store import PlanStore
 from .security_scanner import SecurityScannerRegistry
 from .task_service import TaskService
+from .targeted_test_selector import TargetedTestSelector
 from .test_runner import TestRunnerRegistry
 from .verification_gate_coordinator import VerificationGateCoordinator
 from .workspace_snapshot import RollbackReport, WorkspaceSnapshotManager
@@ -121,6 +122,10 @@ class WholePlanExecutionSummary:
     review_history: list[dict[str, Any]] = field(default_factory=list)
     # Per-step telemetry: list of {"step_id", "duration_ms", "attempts", "outcome", ...}
     step_telemetry: list[dict[str, Any]] = field(default_factory=list)
+    execution_state: str = "completed"
+    current_step_id: str | None = None
+    current_session_id: str | None = None
+    action_required: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +140,42 @@ class WholePlanExecutionSummary:
             "worktrees_merged": self.worktrees_merged,
             "review_history": self.review_history,
             "step_telemetry": self.step_telemetry,
+            "execution_state": self.execution_state,
+            "current_step_id": self.current_step_id,
+            "current_session_id": self.current_session_id,
+            "action_required": self.action_required,
+        }
+
+
+@dataclass
+class StepAdvanceResult:
+    step_id: str
+    status: str
+    execution_state: str
+    plan_completed: bool = False
+    review: dict[str, Any] | None = None
+    next_step_id: str | None = None
+    next_session_id: str | None = None
+    attempt: int = 1
+    repair_hint: str = ""
+    action_required: str = ""
+    rollback_executed: bool = False
+    failure_details: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step_id": self.step_id,
+            "status": self.status,
+            "execution_state": self.execution_state,
+            "plan_completed": self.plan_completed,
+            "review": self.review,
+            "next_step_id": self.next_step_id,
+            "next_session_id": self.next_session_id,
+            "attempt": self.attempt,
+            "repair_hint": self.repair_hint,
+            "action_required": self.action_required,
+            "rollback_executed": self.rollback_executed,
+            "failure_details": list(self.failure_details),
         }
 
 
@@ -173,6 +214,9 @@ class WholePlanCoordinator:
         snapshot_manager: WorkspaceSnapshotManager | None = None,
         worktree_manager: GitWorktreeManager | None = None,
         decision_service: DecisionService | None = None,
+        targeted_test_selector: TargetedTestSelector | None = None,
+        agent_run_service: Any | None = None,
+        project_id: str | None = None,
         max_step_retries: int = 3,
         max_auto_repair_attempts: int = 3,
         enable_worktree_isolation: bool = True,
@@ -189,6 +233,9 @@ class WholePlanCoordinator:
         self._snapshot_manager = snapshot_manager or WorkspaceSnapshotManager()
         self._worktree_manager = worktree_manager or GitWorktreeManager()
         self._decision_service = decision_service
+        self._targeted_test_selector = targeted_test_selector or TargetedTestSelector()
+        self._agent_run_service = agent_run_service
+        self._project_id = project_id
         self.max_step_retries = max_step_retries
         self.max_auto_repair_attempts = max_auto_repair_attempts
         self.enable_worktree_isolation = enable_worktree_isolation
@@ -403,6 +450,16 @@ class WholePlanCoordinator:
                     repair_hint=repair_hint,
                 )
 
+        # ── 1b. Check if executor reported WAITING_FOR_HOST ─────────────────
+        evidence = getattr(imp_res, "execution_evidence", {}) or {}
+        if evidence.get("runtime_id") == "external_host_bridge" or "WAITING_FOR_HOST" in evidence.get("notes", ""):
+            return ReviewResult(
+                step_id=step_id,
+                status=ReviewStatus.WAITING_FOR_HOST,
+                summary=imp_res.summary,
+                comments=("Waiting for external host coder worker execution via next_coder_command",),
+            )
+
         # ── 2. Goal drift check using files reported by executor ──────────────
         if hasattr(imp_res, "modified_files") and imp_res.modified_files:
             reported_files: Sequence[str] = list(imp_res.modified_files)
@@ -430,9 +487,28 @@ class WholePlanCoordinator:
                 deleted_files=getattr(imp_res, "deleted_files", ()),
             )
 
-        # ── 3. Test & security gates ──────────────────────────────────────────
-        test_res = await self._test_runner.run_tests(workspace_path, step_id)
-        sec_res = self._security_scanner.scan_workspace(workspace_path, step_id)
+        # ── 3. Test & security gates with Intelligent Targeted Selection ──────
+        target_selection = self._targeted_test_selector.select_tests(
+            workspace_path,
+            reported_files,
+            project_id=self._project_id,
+        )
+        try:
+            test_res = await self._test_runner.run_tests(
+                workspace_path,
+                step_id,
+                target_files=target_selection.selected_tests if target_selection.is_targeted else None,
+                timeout_seconds=60.0,
+            )
+        except TypeError:
+            test_res = await self._test_runner.run_tests(workspace_path, step_id)
+
+        sec_targets = list(reported_files) if reported_files else None
+        sec_res = self._security_scanner.scan_workspace(
+            workspace_path,
+            step_id,
+            target_files=sec_targets,
+        )
 
         # ── 4. Final gate evaluation ──────────────────────────────────────────
         try:
@@ -515,6 +591,34 @@ class WholePlanCoordinator:
                     allowed_paths=getattr(running_step, "allowed_paths", None),
                 )
                 history.append(review.to_dict())
+
+                if review.status == ReviewStatus.WAITING_FOR_HOST:
+                    session_id = None
+                    if self._agent_run_service is not None:
+                        step_runs = await self._agent_run_service.list_runs_for_step(running_step.step_id)
+                        if step_runs:
+                            session_id = step_runs[-1].session_id
+                    return WholePlanExecutionSummary(
+                        task_id=plan.task_id,
+                        plan_id=plan_id,
+                        steps_completed=completed_count,
+                        steps_failed=failed_count,
+                        steps_skipped=skipped_count,
+                        plan_completed=False,
+                        steps_auto_repaired=auto_repaired_count,
+                        rollbacks_executed=rollbacks_count,
+                        worktrees_merged=worktrees_merged_count,
+                        review_history=history,
+                        step_telemetry=telemetry,
+                        execution_state="WAITING_FOR_HOST",
+                        current_step_id=running_step.step_id,
+                        current_session_id=session_id,
+                        action_required=(
+                            f"Step '{running_step.title}' is waiting for host execution. "
+                            f"Consume commands using next_coder_command('{session_id}'), apply edits, "
+                            f"then call advance_plan_step('{running_step.step_id}') to verify and proceed."
+                        ),
+                    )
 
                 if review.status == ReviewStatus.APPROVED:
                     break  # Step passed — exit repair loop
@@ -639,8 +743,48 @@ class WholePlanCoordinator:
         all_finished = all(s.state in (PlanStepState.COMPLETED, PlanStepState.SKIPPED) for s in final_steps)
 
         if all_finished:
-            await self._plan_service.complete_plan(plan_id)
-            await self._task_service.complete_task(plan.task_id)
+            # Final Verification Gate: Full Regression suite
+            try:
+                final_test_res = await self._test_runner.run_tests(
+                    root_path,
+                    step_id="final_plan_verification",
+                    target_files=None,
+                    timeout_seconds=240.0,
+                )
+            except TypeError:
+                final_test_res = await self._test_runner.run_tests(
+                    root_path,
+                    step_id="final_plan_verification",
+                )
+            final_sec_res = self._security_scanner.scan_workspace(
+                root_path,
+                step_id="final_plan_verification",
+            )
+            final_gate_passed = (
+                final_test_res.success
+                and (final_test_res.failed_tests == 0)
+                and getattr(final_test_res, "execution_success", True)
+                and final_sec_res.passed_gate
+            )
+            if final_gate_passed:
+                await self._plan_service.complete_plan(plan_id)
+                await self._task_service.complete_task(plan.task_id)
+            else:
+                return WholePlanExecutionSummary(
+                    task_id=plan.task_id,
+                    plan_id=plan_id,
+                    steps_completed=completed_count,
+                    steps_failed=failed_count + 1,
+                    steps_skipped=skipped_count,
+                    plan_completed=False,
+                    steps_auto_repaired=auto_repaired_count,
+                    rollbacks_executed=rollbacks_count,
+                    worktrees_merged=worktrees_merged_count,
+                    review_history=history,
+                    step_telemetry=telemetry,
+                    execution_state="FINAL_GATE_FAILED",
+                    action_required=f"Final Full Regression failed: {final_test_res.failure_details or final_sec_res.summary}",
+                )
 
         return WholePlanExecutionSummary(
             task_id=plan.task_id,
@@ -654,4 +798,322 @@ class WholePlanCoordinator:
             worktrees_merged=worktrees_merged_count,
             review_history=history,
             step_telemetry=telemetry,
+            execution_state="completed" if all_finished else "in_progress",
         )
+
+    async def advance_step(
+        self,
+        step_id: str,
+        workspace_path: Path | str,
+        execution_evidence: dict[str, Any] | None = None,
+    ) -> StepAdvanceResult:
+        """Evaluate verification gate on host-submitted evidence, advance step, or trigger auto-repair."""
+        step = await self._plan_store.get_step(step_id)
+        if step is None:
+            raise KeyError(f"unknown plan step: {step_id}")
+
+        plan = await self._plan_store.get_plan(step.plan_id)
+        if plan is None:
+            raise KeyError(f"unknown plan: {step.plan_id}")
+
+        if step.state == PlanStepState.COMPLETED:
+            return StepAdvanceResult(
+                step_id=step_id,
+                status="step_already_completed",
+                execution_state="ALREADY_COMPLETED",
+                plan_completed=False,
+                review={"status": "approved", "comments": ["Step already completed."]},
+                action_required="Step is already completed. No replay allowed.",
+            )
+
+        # 2. Reject inactive steps (PENDING, DRAFT, FAILED)
+        if step.state != PlanStepState.RUNNING:
+            return StepAdvanceResult(
+                step_id=step_id,
+                status="step_rejected",
+                execution_state="INVALID_STEP_STATE",
+                plan_completed=False,
+                review={
+                    "status": "rejected",
+                    "comments": [f"Step '{step_id}' is in state '{step.state.value}', not RUNNING. Cannot advance an inactive step."],
+                    "required_repairs": [f"Start step '{step_id}' before submitting execution evidence."],
+                },
+                action_required=f"Step '{step_id}' is in '{step.state.value}' state. Only active RUNNING steps can be advanced.",
+            )
+
+        root_path = Path(workspace_path).resolve()
+        evidence = dict(execution_evidence) if execution_evidence else {}
+
+        # 3. Reject evidence submitted for a different step_id
+        evidence_step_id = evidence.get("step_id")
+        if evidence_step_id and str(evidence_step_id) != str(step_id):
+            return StepAdvanceResult(
+                step_id=step_id,
+                status="step_rejected",
+                execution_state="EVIDENCE_STEP_MISMATCH",
+                plan_completed=False,
+                review={
+                    "status": "rejected",
+                    "comments": [f"Evidence step_id mismatch: evidence is for '{evidence_step_id}', expected '{step_id}'."],
+                    "required_repairs": [f"Submit evidence belonging to active step '{step_id}'."],
+                },
+                action_required=f"Evidence step_id '{evidence_step_id}' does not match target step '{step_id}'.",
+            )
+
+        # 3b. Reject evidence submitted for a different project_id
+        evidence_project_id = evidence.get("project_id")
+        target_project_id = self._project_id
+        if not target_project_id and hasattr(self, "_task_service") and self._task_service:
+            task = await self._task_service.get_task(plan.task_id)
+            if task:
+                target_project_id = task.project_id
+
+        if evidence_project_id and target_project_id and str(evidence_project_id) != str(target_project_id):
+            return StepAdvanceResult(
+                step_id=step_id,
+                status="step_rejected",
+                execution_state="PROJECT_MISMATCH",
+                plan_completed=False,
+                review={
+                    "status": "rejected",
+                    "comments": [
+                        f"Evidence project_id mismatch: evidence is for project '{evidence_project_id}', expected '{target_project_id}'."
+                    ],
+                    "required_repairs": [
+                        f"Submit evidence belonging to project '{target_project_id}'."
+                    ],
+                },
+                action_required=f"Evidence project_id '{evidence_project_id}' does not match target project '{target_project_id}'.",
+            )
+
+        # 4. Enforce session binding: evidence must match active authorized session
+        if self._agent_run_service is not None:
+            runs = await self._agent_run_service.list_runs_for_step(step_id)
+            active_runs = [r for r in runs if not r.is_terminal]
+            authorized_sessions = {r.session_id for r in active_runs if r.session_id}
+
+            if not authorized_sessions:
+                return StepAdvanceResult(
+                    step_id=step_id,
+                    status="step_rejected",
+                    execution_state="NO_AUTHORIZED_SESSION",
+                    plan_completed=False,
+                    review={
+                        "status": "rejected",
+                        "comments": [
+                            f"Session binding failure: step '{step_id}' has no active authorized execution session. Cannot accept host-submitted evidence."
+                        ],
+                        "required_repairs": [
+                            f"Initialize an authorized execution session for step '{step_id}' before advancing."
+                        ],
+                    },
+                    action_required=f"No active authorized execution session exists for step '{step_id}'.",
+                )
+
+            submitted_session = evidence.get("session_id")
+            if not submitted_session or submitted_session not in authorized_sessions:
+                return StepAdvanceResult(
+                    step_id=step_id,
+                    status="step_rejected",
+                    execution_state="SESSION_MISMATCH",
+                    plan_completed=False,
+                    review={
+                        "status": "rejected",
+                        "comments": [
+                            (
+                                f"Session binding failure: evidence session '{submitted_session}' "
+                                f"does not match authorized active session(s) {sorted(authorized_sessions)} for step '{step_id}'."
+                            )
+                        ],
+                        "required_repairs": [
+                            f"Submit execution evidence with valid active session_id in {sorted(authorized_sessions)}."
+                        ],
+                    },
+                    action_required=f"Submitted session '{submitted_session}' is unauthorized or stale for step '{step_id}'.",
+                )
+
+        # 1. Resolve modified files from evidence or agent run service
+        modified_files: list[str] = list(
+            evidence.get("files_changed") or evidence.get("modified_files") or []
+        )
+        if not modified_files and self._agent_run_service is not None:
+            runs = await self._agent_run_service.list_runs_for_step(step_id)
+            for r in runs:
+                if r.result and r.result.changed_files:
+                    modified_files.extend(f.path for f in r.result.changed_files)
+                elif r.metadata and "files_changed" in r.metadata:
+                    modified_files.extend(r.metadata["files_changed"])
+
+        # 2. Check Goal Drift
+        drift_res = self._goal_drift_monitor.evaluate_drift(
+            step_id=step_id,
+            modified_files=modified_files,
+            allowed_paths=getattr(step, "allowed_paths", None),
+            original_goal=step.title,
+        )
+
+        # 3. Targeted test selection
+        target_selection = self._targeted_test_selector.select_tests(
+            root_path,
+            modified_files,
+            project_id=self._project_id or plan.task_id,
+        )
+
+        # 4. Run targeted tests and security scanner
+        try:
+            test_res = await self._test_runner.run_tests(
+                root_path,
+                step_id,
+                target_files=target_selection.selected_tests if target_selection.is_targeted else None,
+                timeout_seconds=60.0,
+            )
+        except TypeError:
+            test_res = await self._test_runner.run_tests(root_path, step_id)
+
+        sec_targets = list(modified_files) if modified_files else None
+        sec_res = self._security_scanner.scan_workspace(
+            root_path,
+            step_id,
+            target_files=sec_targets,
+        )
+
+        # 5. Evaluate Verification Gate
+        is_real = bool(evidence.get("is_real", False))
+        imp_res = ImplementationResult(
+            step_id=step_id,
+            summary=f"Host execution for step '{step.title}'"
+            + (f" | DRIFT: {drift_res.summary}" if drift_res.drift_detected else ""),
+            modified_files=tuple(modified_files),
+            success=not drift_res.drift_detected,
+            is_mocked=not is_real,
+            execution_evidence=evidence,
+        )
+        review = self._gate_coordinator.evaluate(
+            step_id=step_id,
+            implementation_result=imp_res,
+            test_result=test_res,
+            security_result=sec_res,
+            require_real_execution=True,
+        )
+
+        # 6. Evaluate Outcome
+        if review.status == ReviewStatus.APPROVED:
+            # Mark step complete in PlanService
+            await self._plan_service.complete_step(step_id)
+            if self._agent_run_service is not None:
+                from .agent_work_result import AgentWorkResult
+                runs = await self._agent_run_service.list_runs_for_step(step_id)
+                for r in runs:
+                    if not r.is_terminal:
+                        work_res = AgentWorkResult(
+                            run_id=r.run_id,
+                            status="completed",
+                            summary=f"Approved step execution for {step_id}",
+                            metadata=evidence,
+                        )
+                        await self._agent_run_service.complete_run(r.run_id, work_res)
+
+            # Check if there is a next pending step
+            steps = await self._plan_store.list_steps(plan.plan_id)
+            pending_steps = [s for s in steps if s.state == PlanStepState.PENDING]
+            if pending_steps:
+                next_step = pending_steps[0]
+                running_next = await self._plan_service.start_step(next_step.step_id)
+                next_imp = await self._step_executor.execute_step(
+                    step_id=running_next.step_id,
+                    step_title=running_next.title,
+                    step_role=running_next.assigned_role,
+                    step_instruction=getattr(running_next, "instruction", ""),
+                    workspace_path=root_path,
+                )
+                next_evidence = getattr(next_imp, "execution_evidence", {}) or {}
+                next_session_id = next_evidence.get("session_id")
+                return StepAdvanceResult(
+                    step_id=step_id,
+                    status="step_approved",
+                    execution_state="WAITING_FOR_HOST",
+                    plan_completed=False,
+                    review=review.to_dict(),
+                    next_step_id=running_next.step_id,
+                    next_session_id=next_session_id,
+                    action_required=(
+                        f"Step '{step.title}' approved. Step '{running_next.title}' waiting for host execution. "
+                        f"Consume commands using next_coder_command('{next_session_id}')."
+                    ),
+                )
+
+            # All steps completed — Final Verification Gate (Full Regression)
+            try:
+                final_test_res = await self._test_runner.run_tests(
+                    root_path,
+                    step_id="final_plan_verification",
+                    target_files=None,
+                    timeout_seconds=240.0,
+                )
+            except TypeError:
+                final_test_res = await self._test_runner.run_tests(
+                    root_path,
+                    step_id="final_plan_verification",
+                )
+            final_sec_res = self._security_scanner.scan_workspace(
+                root_path,
+                step_id="final_plan_verification",
+            )
+            if (
+                final_test_res.success
+                and final_test_res.failed_tests == 0
+                and getattr(final_test_res, "execution_success", True)
+                and final_sec_res.passed_gate
+            ):
+                await self._plan_service.complete_plan(plan.plan_id)
+                await self._task_service.complete_task(plan.task_id)
+                return StepAdvanceResult(
+                    step_id=step_id,
+                    status="plan_completed",
+                    execution_state="COMPLETED",
+                    plan_completed=True,
+                    review=review.to_dict(),
+                    action_required="All steps approved and Final Regression verified. Plan complete.",
+                )
+            else:
+                return StepAdvanceResult(
+                    step_id=step_id,
+                    status="final_verification_failed",
+                    execution_state="FINAL_GATE_FAILED",
+                    plan_completed=False,
+                    review=review.to_dict(),
+                    failure_details=final_test_res.failure_details,
+                    action_required=f"Final Full Regression failed: {final_test_res.failure_details or final_sec_res.summary}",
+                )
+
+        else:
+            # Gate rejected — Check auto-repair attempts
+            repair_hint = self._build_repair_hint(review)
+            # Send repair hint to active session if available
+            if hasattr(self._step_executor, "_coder_stack") and evidence.get("session_id"):
+                session_id = evidence["session_id"]
+                from .context import ExecutionContext
+                ctx = ExecutionContext(
+                    workspace_id=str(root_path),
+                    agent_id="coder",
+                    task_id=plan.task_id,
+                    project_id=self._project_id or plan.task_id,
+                )
+                try:
+                    await self._step_executor._coder_stack.orchestrator.send(
+                        session_id,
+                        f"Step '{step.title}' rejected. Repair required:\n{repair_hint}",
+                        ctx,
+                    )
+                except Exception:
+                    pass
+
+            return StepAdvanceResult(
+                step_id=step_id,
+                status="step_rejected",
+                execution_state="WAITING_FOR_HOST",
+                attempt=1,
+                repair_hint=repair_hint,
+                review=review.to_dict(),
+                action_required=f"Step rejected by verification gate. Please apply fixes and call advance_plan_step again. Hint: {repair_hint}",
+            )

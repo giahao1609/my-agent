@@ -128,3 +128,28 @@ def test_multiple_agent_runs_per_step_with_different_identities():
     assert run1.agent_id != run2.agent_id
     assert run1.execution_role != run2.execution_role
     assert run1.model_id != run2.model_id
+
+
+def test_agent_run_waiting_state():
+    run = AgentRunRecord(
+        run_id="run-wait-1",
+        project_id="proj-1",
+        task_id="task-1",
+        step_id="step-1",
+        agent_id="host-coder",
+        execution_role=AgentRole.BACKEND_CODER,
+    )
+    waiting = run.mark_waiting(reason="Waiting for external host coder worker")
+    assert waiting.state == AgentRunState.WAITING
+    assert not waiting.is_terminal
+    assert waiting.metadata.get("waiting_reason") == "Waiting for external host coder worker"
+
+    # From WAITING can transition to RUNNING
+    running = waiting.mark_running(session_id="session-xyz")
+    assert running.state == AgentRunState.RUNNING
+    assert running.session_id == "session-xyz"
+
+    # From WAITING can complete
+    completed = waiting.complete(AgentWorkResult(run_id="run-wait-1", status="completed", summary="Done"))
+    assert completed.state == AgentRunState.COMPLETED
+    assert completed.is_terminal

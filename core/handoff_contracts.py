@@ -9,6 +9,7 @@ class ReviewStatus(StrEnum):
     APPROVED = 'approved'
     REJECTED = 'rejected'
     REQUEST_REWORK = 'request_rework'
+    WAITING_FOR_HOST = 'waiting_for_host'
 
 
 class SecuritySeverity(StrEnum):
@@ -172,10 +173,25 @@ class TestResult:
     duration_ms: int = 0
     failure_details: tuple[str, ...] = field(default_factory=tuple)
     coverage_percentage: float | None = None
+    execution_success: bool = True
+
+    @property
+    def tests_verified(self) -> bool:
+        """True if and only if the command succeeded and at least one test executed and passed."""
+        return (
+            self.execution_success
+            and self.total_tests > 0
+            and self.passed_tests > 0
+            and self.failed_tests == 0
+        )
 
     @property
     def success(self) -> bool:
-        return self.failed_tests == 0
+        """Evaluates whether tests were verified for gate evaluation.
+
+        A successful process exit alone without executing any tests is NOT verified.
+        """
+        return self.tests_verified
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -186,6 +202,8 @@ class TestResult:
             'duration_ms': self.duration_ms,
             'failure_details': list(self.failure_details),
             'coverage_percentage': self.coverage_percentage,
+            'execution_success': self.execution_success,
+            'tests_verified': self.tests_verified,
             'success': self.success,
         }
 
@@ -199,6 +217,7 @@ class TestResult:
             duration_ms=data.get('duration_ms', 0),
             failure_details=tuple(data.get('failure_details', ())),
             coverage_percentage=data.get('coverage_percentage'),
+            execution_success=data.get('execution_success', True),
         )
 
 
