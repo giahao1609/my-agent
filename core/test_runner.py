@@ -205,7 +205,7 @@ class NpmTestRunnerAdapter:
     def _parse_npm_output(step_id: str, output: str, exit_code: int) -> TestResult:
         passed_match = re.search(r"(\d+)\s+passed", output, re.IGNORECASE)
         failed_match = re.search(r"(\d+)\s+failed", output, re.IGNORECASE)
-        passed = int(passed_match.group(1)) if passed_match else (1 if exit_code == 0 else 0)
+        passed = int(passed_match.group(1)) if passed_match else 0
         failed = int(failed_match.group(1)) if failed_match else 0
         if exit_code != 0 and failed == 0:
             failed = 1

@@ -39,7 +39,14 @@ class VerificationGateCoordinator:
 
         # Check test gate
         if test_result is not None:
-            if not test_result.success:
+            if not getattr(test_result, "execution_success", True):
+                comments.append("Test gate execution failed: exit code non-zero or runner error.")
+                for detail in test_result.failure_details:
+                    required_repairs.append(f"Test failure: {detail}")
+            elif test_result.total_tests == 0:
+                comments.append("Test command succeeded but executed 0 tests (unverified).")
+                required_repairs.append("Zero tests executed: verification requires at least one passing test.")
+            elif not test_result.success:
                 comments.append(f"Test gate failed: {test_result.failed_tests}/{test_result.total_tests} tests failed.")
                 for detail in test_result.failure_details:
                     required_repairs.append(f"Test failure: {detail}")
@@ -132,7 +139,10 @@ class VerificationGateCoordinator:
             implementation_result is not None and not implementation_result.success
         ):
             status = ReviewStatus.REQUEST_REWORK
-            summary = f"Step '{step_id}' requires REWORK due to test/implementation failures."
+            if test_result is not None and test_result.total_tests == 0 and getattr(test_result, "execution_success", True):
+                summary = f"Step '{step_id}' requires REWORK: zero tests executed (unverified test success)."
+            else:
+                summary = f"Step '{step_id}' requires REWORK due to test/implementation failures."
         else:
             status = ReviewStatus.APPROVED
             summary = f"Step '{step_id}' APPROVED: all verification gates passed."

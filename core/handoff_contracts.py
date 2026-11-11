@@ -176,12 +176,22 @@ class TestResult:
     execution_success: bool = True
 
     @property
-    def success(self) -> bool:
+    def tests_verified(self) -> bool:
+        """True if and only if the command succeeded and at least one test executed and passed."""
         return (
             self.execution_success
+            and self.total_tests > 0
+            and self.passed_tests > 0
             and self.failed_tests == 0
-            and not (self.total_tests == 0 and bool(self.failure_details))
         )
+
+    @property
+    def success(self) -> bool:
+        """Evaluates whether tests were verified for gate evaluation.
+
+        A successful process exit alone without executing any tests is NOT verified.
+        """
+        return self.tests_verified
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -193,6 +203,7 @@ class TestResult:
             'failure_details': list(self.failure_details),
             'coverage_percentage': self.coverage_percentage,
             'execution_success': self.execution_success,
+            'tests_verified': self.tests_verified,
             'success': self.success,
         }
 

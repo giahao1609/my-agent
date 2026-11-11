@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from core.handoff_contracts import (
     ImplementationResult,
     ReviewStatus,
@@ -112,3 +110,29 @@ def test_verification_gate_implementation_failure_no_test_no_security_rework() -
 
     assert review.status == ReviewStatus.REQUEST_REWORK
     assert len(review.required_repairs) > 0
+
+
+def test_verification_gate_zero_tests_requires_rework() -> None:
+    """AC-02: Test command exiting 0 but executing 0 tests must be treated as unverified (REQUEST_REWORK)."""
+    coordinator = VerificationGateCoordinator()
+
+    imp = ImplementationResult(step_id="step-zero", summary="Code written", success=True)
+    test_res = TestResult(
+        step_id="step-zero",
+        total_tests=0,
+        passed_tests=0,
+        failed_tests=0,
+        execution_success=True,
+    )
+    sec_res = SecurityReviewResult(step_id="step-zero", passed_gate=True, summary="Clean")
+
+    review = coordinator.evaluate(
+        step_id="step-zero",
+        implementation_result=imp,
+        test_result=test_res,
+        security_result=sec_res,
+    )
+
+    assert review.status == ReviewStatus.REQUEST_REWORK
+    assert any("zero tests executed" in r.lower() or "0 tests" in r.lower() for r in review.required_repairs)
+    assert any("0 tests" in c.lower() for c in review.comments)

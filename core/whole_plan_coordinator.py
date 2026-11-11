@@ -826,8 +826,111 @@ class WholePlanCoordinator:
                 action_required="Step is already completed. No replay allowed.",
             )
 
+        # 2. Reject inactive steps (PENDING, DRAFT, FAILED)
+        if step.state != PlanStepState.RUNNING:
+            return StepAdvanceResult(
+                step_id=step_id,
+                status="step_rejected",
+                execution_state="INVALID_STEP_STATE",
+                plan_completed=False,
+                review={
+                    "status": "rejected",
+                    "comments": [f"Step '{step_id}' is in state '{step.state.value}', not RUNNING. Cannot advance an inactive step."],
+                    "required_repairs": [f"Start step '{step_id}' before submitting execution evidence."],
+                },
+                action_required=f"Step '{step_id}' is in '{step.state.value}' state. Only active RUNNING steps can be advanced.",
+            )
+
         root_path = Path(workspace_path).resolve()
         evidence = dict(execution_evidence) if execution_evidence else {}
+
+        # 3. Reject evidence submitted for a different step_id
+        evidence_step_id = evidence.get("step_id")
+        if evidence_step_id and str(evidence_step_id) != str(step_id):
+            return StepAdvanceResult(
+                step_id=step_id,
+                status="step_rejected",
+                execution_state="EVIDENCE_STEP_MISMATCH",
+                plan_completed=False,
+                review={
+                    "status": "rejected",
+                    "comments": [f"Evidence step_id mismatch: evidence is for '{evidence_step_id}', expected '{step_id}'."],
+                    "required_repairs": [f"Submit evidence belonging to active step '{step_id}'."],
+                },
+                action_required=f"Evidence step_id '{evidence_step_id}' does not match target step '{step_id}'.",
+            )
+
+        # 3b. Reject evidence submitted for a different project_id
+        evidence_project_id = evidence.get("project_id")
+        target_project_id = self._project_id
+        if not target_project_id and hasattr(self, "_task_service") and self._task_service:
+            task = await self._task_service.get_task(plan.task_id)
+            if task:
+                target_project_id = task.project_id
+
+        if evidence_project_id and target_project_id and str(evidence_project_id) != str(target_project_id):
+            return StepAdvanceResult(
+                step_id=step_id,
+                status="step_rejected",
+                execution_state="PROJECT_MISMATCH",
+                plan_completed=False,
+                review={
+                    "status": "rejected",
+                    "comments": [
+                        f"Evidence project_id mismatch: evidence is for project '{evidence_project_id}', expected '{target_project_id}'."
+                    ],
+                    "required_repairs": [
+                        f"Submit evidence belonging to project '{target_project_id}'."
+                    ],
+                },
+                action_required=f"Evidence project_id '{evidence_project_id}' does not match target project '{target_project_id}'.",
+            )
+
+        # 4. Enforce session binding: evidence must match active authorized session
+        if self._agent_run_service is not None:
+            runs = await self._agent_run_service.list_runs_for_step(step_id)
+            active_runs = [r for r in runs if not r.is_terminal]
+            authorized_sessions = {r.session_id for r in active_runs if r.session_id}
+
+            if not authorized_sessions:
+                return StepAdvanceResult(
+                    step_id=step_id,
+                    status="step_rejected",
+                    execution_state="NO_AUTHORIZED_SESSION",
+                    plan_completed=False,
+                    review={
+                        "status": "rejected",
+                        "comments": [
+                            f"Session binding failure: step '{step_id}' has no active authorized execution session. Cannot accept host-submitted evidence."
+                        ],
+                        "required_repairs": [
+                            f"Initialize an authorized execution session for step '{step_id}' before advancing."
+                        ],
+                    },
+                    action_required=f"No active authorized execution session exists for step '{step_id}'.",
+                )
+
+            submitted_session = evidence.get("session_id")
+            if not submitted_session or submitted_session not in authorized_sessions:
+                return StepAdvanceResult(
+                    step_id=step_id,
+                    status="step_rejected",
+                    execution_state="SESSION_MISMATCH",
+                    plan_completed=False,
+                    review={
+                        "status": "rejected",
+                        "comments": [
+                            (
+                                f"Session binding failure: evidence session '{submitted_session}' "
+                                f"does not match authorized active session(s) {sorted(authorized_sessions)} for step '{step_id}'."
+                            )
+                        ],
+                        "required_repairs": [
+                            f"Submit execution evidence with valid active session_id in {sorted(authorized_sessions)}."
+                        ],
+                    },
+                    action_required=f"Submitted session '{submitted_session}' is unauthorized or stale for step '{step_id}'.",
+                )
 
         # 1. Resolve modified files from evidence or agent run service
         modified_files: list[str] = list(

@@ -98,6 +98,7 @@ def test_go_runner_pass_exit_0_success() -> None:
     assert res.passed_tests == 2
     assert res.failed_tests == 0
     assert res.execution_success is True
+    assert res.tests_verified is True
     assert res.success is True
 
 
@@ -140,7 +141,8 @@ def test_go_runner_no_tests_exit_0_does_not_invent_pass() -> None:
     assert res.failed_tests == 0
     assert res.total_tests == 0
     assert res.execution_success is True
-    assert res.success is True
+    assert res.tests_verified is False
+    assert res.success is False
 
 
 def test_go_runner_package_ok_exit_0_success() -> None:
@@ -150,6 +152,7 @@ def test_go_runner_package_ok_exit_0_success() -> None:
     assert res.passed_tests == 2
     assert res.failed_tests == 0
     assert res.execution_success is True
+    assert res.tests_verified is True
     assert res.success is True
 
 
@@ -214,3 +217,39 @@ async def test_pytest_runner_with_target_files(tmp_path: Path, monkeypatch: pyte
     assert res.passed_tests == 1
     assert "tests/test_foo.py" in executed_cmd
     assert "tests/test_bar.py" in executed_cmd
+
+
+def test_pytest_zero_tests_exit_0_is_unverified() -> None:
+    """AC-02: Pytest exiting 0 without executing tests must report unverified (success=False)."""
+    output = "collected 0 items\n\n============================ no tests ran in 0.01s ============================="
+    res = PytestRunnerAdapter._parse_pytest_output("step-zero-pytest", output, exit_code=0)
+    assert res.total_tests == 0
+    assert res.passed_tests == 0
+    assert res.failed_tests == 0
+    assert res.execution_success is True
+    assert res.tests_verified is False
+    assert res.success is False
+
+
+def test_npm_zero_tests_exit_0_does_not_fabricate_pass() -> None:
+    """AC-02: Npm test with exit code 0 but no passed tests must not fabricate passed=1."""
+    output = "No tests found related to files changed since last commit."
+    res = NpmTestRunnerAdapter._parse_npm_output("step-zero-npm", output, exit_code=0)
+    assert res.total_tests == 0
+    assert res.passed_tests == 0
+    assert res.failed_tests == 0
+    assert res.execution_success is True
+    assert res.tests_verified is False
+    assert res.success is False
+
+
+def test_npm_genuine_pass() -> None:
+    """AC-02: Npm test with genuine passed tests must report verified success."""
+    output = "Tests:       5 passed, 5 total\nSnapshots:   0 total\nTime:        1.25s"
+    res = NpmTestRunnerAdapter._parse_npm_output("step-npm-pass", output, exit_code=0)
+    assert res.total_tests == 5
+    assert res.passed_tests == 5
+    assert res.failed_tests == 0
+    assert res.execution_success is True
+    assert res.tests_verified is True
+    assert res.success is True

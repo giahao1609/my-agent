@@ -439,11 +439,11 @@ async def test_advance_step_rejects_missing_or_fake_evidence(tmp_path: Path):
 
     await coordinator.execute_whole_plan(plan.plan_id, tmp_path)
 
-    # 1. Test completely empty evidence
+    # 1. Test empty evidence with valid session (missing is_real / executor_identity)
     res_empty = await coordinator.advance_step(
         step_id="step-fake-1",
         workspace_path=tmp_path,
-        execution_evidence={},
+        execution_evidence={"session_id": "session-1"},
     )
     assert res_empty.status == "step_rejected"
     assert res_empty.plan_completed is False
@@ -453,7 +453,7 @@ async def test_advance_step_rejects_missing_or_fake_evidence(tmp_path: Path):
     res_fake = await coordinator.advance_step(
         step_id="step-fake-1",
         workspace_path=tmp_path,
-        execution_evidence={"is_real": False, "executor_identity": "mock"},
+        execution_evidence={"session_id": "session-1", "is_real": False, "executor_identity": "mock"},
     )
     assert res_fake.status == "step_rejected"
     assert "Implementation was simulated/mocked without real execution" in str(res_fake.review)
@@ -462,7 +462,7 @@ async def test_advance_step_rejects_missing_or_fake_evidence(tmp_path: Path):
     res_no_id = await coordinator.advance_step(
         step_id="step-fake-1",
         workspace_path=tmp_path,
-        execution_evidence={"is_real": True},
+        execution_evidence={"session_id": "session-1", "is_real": True},
     )
     assert res_no_id.status == "step_rejected"
     assert "lacks valid executor identity" in str(res_no_id.review)
@@ -665,3 +665,314 @@ async def test_final_plan_verification_rejects_missing_or_failed_runner(tmp_path
     assert advance_res.execution_state == "FINAL_GATE_FAILED"
     assert advance_res.plan_completed is False
     assert any("No supported test runner detected" in str(d) for d in advance_res.failure_details)
+
+
+@pytest.mark.asyncio
+async def test_advance_step_rejects_pending_or_inactive_step(tmp_path: Path):
+    """AC-01: advance_step must reject advancing an inactive/pending step."""
+    task_svc, plan_svc, plan_store, _task_store, run_svc = await _setup_bridge_env(tmp_path)
+
+    task = await task_svc.create_task(
+        task_id="task-ac01-inactive",
+        project_id="proj-ext",
+        objective="Verify inactive step advance rejection",
+    )
+    await task_svc.start_task(task.task_id)
+
+    plan = await plan_svc.materialize_plan(
+        task_id=task.task_id,
+        plan_id="plan-ac01-inactive",
+        steps=(
+            ("step-active-1", "Step 1", "Active step"),
+            ("step-pending-2", "Step 2", "Pending step"),
+        ),
+    )
+
+    orchestrator = MockOrchestrator()
+    mock_stack = SimpleNamespace(
+        orchestrator=orchestrator,
+        agent=MockCoderAgent(orchestrator),
+    )
+
+    executor = CoderRuntimeStepExecutor(
+        coder_stack=mock_stack,
+        workspace_path=tmp_path,
+        project_id="proj-ext",
+        task_id=task.task_id,
+        plan_id=plan.plan_id,
+        agent_run_service=run_svc,
+        worker_task_launcher=None,
+    )
+
+    coordinator = WholePlanCoordinator(
+        task_service=task_svc,
+        plan_service=plan_svc,
+        plan_store=plan_store,
+        step_executor=executor,
+        agent_run_service=run_svc,
+        project_id="proj-ext",
+    )
+
+    await coordinator.execute_whole_plan(plan.plan_id, tmp_path)
+
+    # Attempt to advance step-pending-2 directly while it is in PENDING state
+    res = await coordinator.advance_step(
+        step_id="step-pending-2",
+        workspace_path=tmp_path,
+        execution_evidence={
+            "is_real": True,
+            "executor_identity": "external_host_coder",
+            "session_id": "session-1",
+            "files_changed": ["foo.py"],
+        },
+    )
+
+    assert res.status == "step_rejected"
+    assert res.execution_state == "INVALID_STEP_STATE"
+    assert "is in state 'pending', not RUNNING" in str(res.review)
+
+
+@pytest.mark.asyncio
+async def test_advance_step_rejects_evidence_step_id_mismatch(tmp_path: Path):
+    """AC-01: advance_step must reject evidence containing a different step_id."""
+    task_svc, plan_svc, plan_store, _task_store, run_svc = await _setup_bridge_env(tmp_path)
+
+    task = await task_svc.create_task(
+        task_id="task-ac01-step-mismatch",
+        project_id="proj-ext",
+        objective="Verify evidence step_id mismatch rejection",
+    )
+    await task_svc.start_task(task.task_id)
+
+    plan = await plan_svc.materialize_plan(
+        task_id=task.task_id,
+        plan_id="plan-ac01-step-mismatch",
+        steps=(("step-run-1", "Step 1", "Active step"),),
+    )
+
+    orchestrator = MockOrchestrator()
+    mock_stack = SimpleNamespace(
+        orchestrator=orchestrator,
+        agent=MockCoderAgent(orchestrator),
+    )
+
+    executor = CoderRuntimeStepExecutor(
+        coder_stack=mock_stack,
+        workspace_path=tmp_path,
+        project_id="proj-ext",
+        task_id=task.task_id,
+        plan_id=plan.plan_id,
+        agent_run_service=run_svc,
+        worker_task_launcher=None,
+    )
+
+    coordinator = WholePlanCoordinator(
+        task_service=task_svc,
+        plan_service=plan_svc,
+        plan_store=plan_store,
+        step_executor=executor,
+        agent_run_service=run_svc,
+        project_id="proj-ext",
+    )
+
+    await coordinator.execute_whole_plan(plan.plan_id, tmp_path)
+
+    # Evidence has step_id="step-other-99" instead of "step-run-1"
+    res = await coordinator.advance_step(
+        step_id="step-run-1",
+        workspace_path=tmp_path,
+        execution_evidence={
+            "step_id": "step-other-99",
+            "is_real": True,
+            "executor_identity": "external_host_coder",
+            "session_id": "session-1",
+            "files_changed": ["foo.py"],
+        },
+    )
+
+    assert res.status == "step_rejected"
+    assert res.execution_state == "EVIDENCE_STEP_MISMATCH"
+    assert "Evidence step_id mismatch" in str(res.review)
+
+
+@pytest.mark.asyncio
+async def test_advance_step_rejects_unauthorized_or_stale_session_id(tmp_path: Path):
+    """AC-01: advance_step must reject evidence with mismatched, stale, or missing session_id."""
+    task_svc, plan_svc, plan_store, _task_store, run_svc = await _setup_bridge_env(tmp_path)
+
+    task = await task_svc.create_task(
+        task_id="task-ac01-session-mismatch",
+        project_id="proj-ext",
+        objective="Verify session binding rejection",
+    )
+    await task_svc.start_task(task.task_id)
+
+    plan = await plan_svc.materialize_plan(
+        task_id=task.task_id,
+        plan_id="plan-ac01-session-mismatch",
+        steps=(("step-sess-1", "Step 1", "Active step"),),
+    )
+
+    orchestrator = MockOrchestrator()
+    mock_stack = SimpleNamespace(
+        orchestrator=orchestrator,
+        agent=MockCoderAgent(orchestrator),
+    )
+
+    executor = CoderRuntimeStepExecutor(
+        coder_stack=mock_stack,
+        workspace_path=tmp_path,
+        project_id="proj-ext",
+        task_id=task.task_id,
+        plan_id=plan.plan_id,
+        agent_run_service=run_svc,
+        worker_task_launcher=None,
+    )
+
+    coordinator = WholePlanCoordinator(
+        task_service=task_svc,
+        plan_service=plan_svc,
+        plan_store=plan_store,
+        step_executor=executor,
+        agent_run_service=run_svc,
+        project_id="proj-ext",
+    )
+
+    await coordinator.execute_whole_plan(plan.plan_id, tmp_path)
+
+    # 1. Missing session_id entirely
+    res_no_sess = await coordinator.advance_step(
+        step_id="step-sess-1",
+        workspace_path=tmp_path,
+        execution_evidence={
+            "is_real": True,
+            "executor_identity": "external_host_coder",
+            "files_changed": ["foo.py"],
+        },
+    )
+    assert res_no_sess.status == "step_rejected"
+    assert res_no_sess.execution_state == "SESSION_MISMATCH"
+    assert "Session binding failure" in str(res_no_sess.review)
+
+    # 2. Wrong / unauthorized session_id
+    res_wrong_sess = await coordinator.advance_step(
+        step_id="step-sess-1",
+        workspace_path=tmp_path,
+        execution_evidence={
+            "session_id": "session-unauthorized-999",
+            "is_real": True,
+            "executor_identity": "external_host_coder",
+            "files_changed": ["foo.py"],
+        },
+    )
+    assert res_wrong_sess.status == "step_rejected"
+    assert res_wrong_sess.execution_state == "SESSION_MISMATCH"
+    assert "Session binding failure" in str(res_wrong_sess.review)
+
+
+@pytest.mark.asyncio
+async def test_advance_step_rejects_running_step_without_authorized_session(tmp_path: Path):
+    """AC-01: A RUNNING step without any authorized execution session cannot accept evidence."""
+    task_svc, plan_svc, plan_store, _task_store, run_svc = await _setup_bridge_env(tmp_path)
+
+    task = await task_svc.create_task(
+        task_id="task-ac01-no-run",
+        project_id="proj-ext",
+        objective="Verify no authorized session rejection",
+    )
+    await task_svc.start_task(task.task_id)
+
+    plan = await plan_svc.materialize_plan(
+        task_id=task.task_id,
+        plan_id="plan-ac01-no-run",
+        steps=(("step-no-run-1", "Step 1", "Active step"),),
+    )
+
+    coordinator = WholePlanCoordinator(
+        task_service=task_svc,
+        plan_service=plan_svc,
+        plan_store=plan_store,
+        agent_run_service=run_svc,
+        project_id="proj-ext",
+    )
+
+    # Activate plan and transition step to RUNNING manually without creating an agent run / session
+    await plan_svc.activate_plan(plan.plan_id)
+    await plan_svc.start_step("step-no-run-1")
+
+    res = await coordinator.advance_step(
+        step_id="step-no-run-1",
+        workspace_path=tmp_path,
+        execution_evidence={
+            "session_id": "arbitrary-session-id",
+            "is_real": True,
+            "executor_identity": "external_host_coder",
+            "files_changed": ["foo.py"],
+        },
+    )
+
+    assert res.status == "step_rejected"
+    assert res.execution_state == "NO_AUTHORIZED_SESSION"
+    assert "has no active authorized execution session" in str(res.review)
+
+
+@pytest.mark.asyncio
+async def test_advance_step_rejects_evidence_project_id_mismatch(tmp_path: Path):
+    """AC-01: advance_step must reject evidence submitted with mismatched project_id."""
+    task_svc, plan_svc, plan_store, _task_store, run_svc = await _setup_bridge_env(tmp_path)
+
+    task = await task_svc.create_task(
+        task_id="task-ac01-proj-mismatch",
+        project_id="proj-ext",
+        objective="Verify project_id mismatch rejection",
+    )
+    await task_svc.start_task(task.task_id)
+
+    plan = await plan_svc.materialize_plan(
+        task_id=task.task_id,
+        plan_id="plan-ac01-proj-mismatch",
+        steps=(("step-proj-1", "Step 1", "Active step"),),
+    )
+
+    orchestrator = MockOrchestrator()
+    mock_stack = SimpleNamespace(
+        orchestrator=orchestrator,
+        agent=MockCoderAgent(orchestrator),
+    )
+
+    executor = CoderRuntimeStepExecutor(
+        coder_stack=mock_stack,
+        workspace_path=tmp_path,
+        project_id="proj-ext",
+        task_id=task.task_id,
+        plan_id=plan.plan_id,
+        agent_run_service=run_svc,
+        worker_task_launcher=None,
+    )
+
+    coordinator = WholePlanCoordinator(
+        task_service=task_svc,
+        plan_service=plan_svc,
+        plan_store=plan_store,
+        step_executor=executor,
+        agent_run_service=run_svc,
+        project_id="proj-ext",
+    )
+
+    await coordinator.execute_whole_plan(plan.plan_id, tmp_path)
+
+    res = await coordinator.advance_step(
+        step_id="step-proj-1",
+        workspace_path=tmp_path,
+        execution_evidence={
+            "project_id": "other-unauthorized-project",
+            "session_id": "session-1",
+            "is_real": True,
+            "executor_identity": "external_host_coder",
+            "files_changed": ["foo.py"],
+        },
+    )
+
+    assert res.status == "step_rejected"
+    assert res.execution_state == "PROJECT_MISMATCH"
+    assert "Evidence project_id mismatch" in str(res.review)
