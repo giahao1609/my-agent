@@ -137,6 +137,7 @@ from core.runtime_environment import (
     ProductionDatabaseProtectionError,
     RuntimeConfig,
     RuntimeEnvironment,
+    assert_not_in_immutable_release,
     get_protected_production_db,
     is_same_file,
     resolve_runtime_environment,
@@ -173,7 +174,7 @@ _unified_context_builder = UnifiedContextBuilder(
     code_graph=code_graph,
     memory_service=_memory_service,
     user_model_engine=_user_model_engine,
-    design_dir=ROOT / "data" / "designs",
+    design_dir=_runtime_config.designs_dir,
 )
 _auth_manager = SecurityAuthorizationManager(projects)
 
@@ -185,8 +186,15 @@ def rebind_stores(new_db_path: Path) -> None:
     global _handoff_context_builder, pending_approvals, _handoff_history_store
     global _resume_assembler, memory_store, _memory_service, _user_model_engine
     global _unified_context_builder, _auth_manager, _handoff_coordinator
+    global _design_md_generator, _playwright_browser
 
     DB_PATH = new_db_path
+    resolved_db = Path(new_db_path).expanduser().resolve()
+    active_data_dir = (
+        _runtime_config.data_dir
+        if resolved_db == _runtime_config.database_path
+        else resolved_db.parent
+    )
     projects = SQLiteProjectStore(DB_PATH)
     _global_projects = projects
     conversations = SQLiteConversationStore(DB_PATH)
@@ -214,7 +222,13 @@ def rebind_stores(new_db_path: Path) -> None:
         code_graph=code_graph,
         memory_service=_memory_service,
         user_model_engine=_user_model_engine,
-        design_dir=ROOT / "data" / "designs",
+        design_dir=active_data_dir / "designs",
+    )
+    _design_md_generator = DesignMdGenerator(
+        storage_dir=None if resolved_db == _runtime_config.database_path else active_data_dir / "designs"
+    )
+    _playwright_browser = PlaywrightBrowserAdapter(
+        artifacts_dir=active_data_dir / "browser_artifacts"
     )
     _auth_manager = SecurityAuthorizationManager(projects)
     _handoff_coordinator = HandoffCoordinator(
@@ -238,7 +252,7 @@ _test_runner_registry = TestRunnerRegistry()
 _verification_gate_coordinator = VerificationGateCoordinator()
 _evaluation_harness = EvaluationHarness()
 _playwright_browser = PlaywrightBrowserAdapter(
-    artifacts_dir=ROOT / "data" / "browser_artifacts"
+    artifacts_dir=_runtime_config.browser_artifacts_dir
 )
 
 # Phase 7 singletons
@@ -2502,6 +2516,10 @@ async def browser_navigate(
     Enforces BrowserPolicy (domain whitelist, private network isolation).
     Returns action result with screenshot path if capture is enabled.
     """
+    if _playwright_browser._artifacts_dir == _runtime_config.browser_artifacts_dir:
+        _playwright_browser._artifacts_dir = resolve_runtime_environment().browser_artifacts_dir
+    assert_not_in_immutable_release(Path(_playwright_browser._artifacts_dir))
+
     policy = BrowserPolicy(
         allowed_domains=tuple(allowed_domains or []),
         allow_private_network=allow_private_network,

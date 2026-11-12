@@ -12,19 +12,62 @@ if str(ROOT) not in sys.path:
 
 from core.code_graph_sync import sync_code_graph
 from core.project import ProjectRecord
+from core.runtime_environment import (
+    RuntimeConfig,
+    RuntimeIsolationError,
+    resolve_runtime_environment,
+)
 from persistence.sqlite_checkpoint_store import SQLiteCheckpointStore
 from persistence.sqlite_code_graph_store import SQLiteCodeGraphStore
 from persistence.sqlite_project_store import SQLiteProjectStore
 
 ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = ROOT / "data" / "my_agent.db"
+
+
+def resolve_hook_runtime_config(
+    env_override: str | None = None,
+    db_override: str | None = None,
+    source_root_override: Path | None = None,
+) -> RuntimeConfig:
+    """Resolves the validated runtime configuration for Antigravity workspace hooks."""
+    return resolve_runtime_environment(
+        env_override=env_override,
+        db_override=db_override,
+        source_root_override=source_root_override,
+        legacy_hook_compat=True,
+    )
+
+
+_runtime_config: RuntimeConfig = resolve_hook_runtime_config()
+DB_PATH = _runtime_config.database_path
 
 projects = SQLiteProjectStore(DB_PATH)
 checkpoints = SQLiteCheckpointStore(DB_PATH)
 code_graph = SQLiteCodeGraphStore(DB_PATH)
 
 
+def rebind_hook_stores(new_db_path: Path | None = None) -> Path:
+    """Rebinds hook SQLite store instances to the validated runtime database path."""
+    global _runtime_config, DB_PATH, projects, checkpoints, code_graph
+    if new_db_path is None:
+        _runtime_config = resolve_hook_runtime_config()
+        DB_PATH = _runtime_config.database_path
+    else:
+        DB_PATH = Path(new_db_path).expanduser().resolve()
+    projects = SQLiteProjectStore(DB_PATH)
+    checkpoints = SQLiteCheckpointStore(DB_PATH)
+    code_graph = SQLiteCodeGraphStore(DB_PATH)
+    return DB_PATH
+
+
 async def main() -> None:
+    if (
+        isinstance(projects, SQLiteProjectStore)
+        and isinstance(checkpoints, SQLiteCheckpointStore)
+        and isinstance(code_graph, SQLiteCodeGraphStore)
+    ):
+        rebind_hook_stores()
+
     payload = json.load(sys.stdin)
     workspace_paths = payload.get("workspacePaths") or []
 

@@ -15,11 +15,34 @@ if str(ROOT) not in sys.path:
 
 from core.conversation import ConversationRecord
 from core.message import MessageRecord, MessageRole
+from core.runtime_environment import (
+    RuntimeConfig,
+    RuntimeIsolationError,
+    resolve_runtime_environment,
+)
 from persistence.sqlite_conversation_store import SQLiteConversationStore
 from persistence.sqlite_project_store import SQLiteProjectStore
 
-DB_PATH = ROOT / "data" / "my_agent.db"
 logger = logging.getLogger(__name__)
+
+
+def resolve_sync_runtime_config(
+    env_override: str | None = None,
+    db_override: str | None = None,
+    source_root_override: Path | None = None,
+) -> RuntimeConfig:
+    """Resolves the validated runtime configuration for Antigravity transcript synchronization."""
+    return resolve_runtime_environment(
+        env_override=env_override,
+        db_override=db_override,
+        source_root_override=source_root_override,
+        legacy_hook_compat=True,
+    )
+
+
+_runtime_config: RuntimeConfig = resolve_sync_runtime_config()
+DB_PATH = _runtime_config.database_path
+_INITIAL_DB_PATH = DB_PATH
 
 
 def _parse_time(value: object) -> datetime:
@@ -113,7 +136,21 @@ async def _find_project_id(
     return None
 
 
-async def sync(payload: dict[str, object]) -> int:
+async def sync(
+    payload: dict[str, object],
+    *,
+    db_path: Path | None = None,
+) -> int:
+    global _runtime_config
+
+    if db_path is not None:
+        active_db_path = Path(db_path).expanduser().resolve()
+    elif DB_PATH != _INITIAL_DB_PATH:
+        active_db_path = Path(DB_PATH).expanduser().resolve()
+    else:
+        _runtime_config = resolve_sync_runtime_config()
+        active_db_path = _runtime_config.database_path
+
     conversation_id = payload.get("conversationId")
     transcript_path = payload.get("transcriptPath")
     workspace_paths = payload.get("workspacePaths") or []
@@ -129,8 +166,8 @@ async def sync(payload: dict[str, object]) -> int:
     if not transcript.is_file():
         return 0
 
-    projects = SQLiteProjectStore(DB_PATH)
-    conversations = SQLiteConversationStore(DB_PATH)
+    projects = SQLiteProjectStore(active_db_path)
+    conversations = SQLiteConversationStore(active_db_path)
     await projects.initialize()
     await conversations.initialize()
 
