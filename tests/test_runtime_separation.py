@@ -1031,3 +1031,421 @@ def test_regression_cache_suppression_and_release_integrity(
     check_4 = manager.verify_release_integrity(rel_dir)
     assert check_4["valid"] is False
     assert "TAMPERING_DETECTED" in check_4.get("reason", "")
+
+
+def test_p1c_b1_hooks_runtime_resolution_and_legacy_pre_merge_compatibility(
+    mock_release_sandbox: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1C-B1: Hooks resolve Stable/Dev DB paths properly and never redirect legacy unconfigured hooks to dev DB."""
+    from my_agent_mcp import transcript_sync, workspace_hook
+
+    dev_root = mock_release_sandbox["dev_root"]
+    (dev_root / ".git").mkdir(exist_ok=True)
+    prod_db = dev_root / "data" / "my_agent.db"
+    dev_db = dev_root / "data" / "my_agent_dev.db"
+
+    isolated_perm_dir = mock_release_sandbox["root"] / "isolated_perm_p1c_b1"
+    isolated_perm_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("MYAGENT_PERMANENT_DATA_DIR", str(isolated_perm_dir))
+
+    rel_dir = mock_release_sandbox["releases_root"] / "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    rel_dir.mkdir(parents=True)
+    (rel_dir / "release_metadata.json").write_text(
+        json.dumps({"commit_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "file_hashes": {}}),
+        encoding="utf-8",
+    )
+
+    # 1. Pre-merge compatibility: Legacy global hooks running in git checkout WITHOUT env vars (outside pytest)
+    # MUST preserve binding to legacy production DB and NEVER silently redirect writes into my_agent_dev.db!
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("MYAGENT_RUNTIME_ENV", raising=False)
+    monkeypatch.delenv("MYAGENT_DB_PATH", raising=False)
+
+    hook_legacy_cfg = workspace_hook.resolve_hook_runtime_config(source_root_override=dev_root)
+    sync_legacy_cfg = transcript_sync.resolve_sync_runtime_config(source_root_override=dev_root)
+    assert hook_legacy_cfg.environment == RuntimeEnvironment.STABLE
+    assert sync_legacy_cfg.environment == RuntimeEnvironment.STABLE
+    assert is_same_file(hook_legacy_cfg.database_path, prod_db)
+    assert is_same_file(sync_legacy_cfg.database_path, prod_db)
+    assert not is_same_file(hook_legacy_cfg.database_path, dev_db)
+    assert is_same_file(hook_legacy_cfg.data_dir, dev_root / "data")
+
+    # 2. Post-cutover Stable release hooks: Running from staged/promoted release resolves to permanent Stable DB
+    hook_stable_cfg = workspace_hook.resolve_hook_runtime_config(source_root_override=rel_dir)
+    sync_stable_cfg = transcript_sync.resolve_sync_runtime_config(source_root_override=rel_dir)
+    assert hook_stable_cfg.environment == RuntimeEnvironment.STABLE
+    assert sync_stable_cfg.environment == RuntimeEnvironment.STABLE
+    assert is_same_file(hook_stable_cfg.database_path, isolated_perm_dir / "my_agent.db")
+    assert is_same_file(sync_stable_cfg.database_path, isolated_perm_dir / "my_agent.db")
+    assert is_same_file(hook_stable_cfg.data_dir, isolated_perm_dir)
+    assert not hook_stable_cfg.database_path.is_relative_to(rel_dir)
+
+    # 3. Development hooks: Explicit MYAGENT_RUNTIME_ENV=development resolves to my_agent_dev.db
+    monkeypatch.setenv("MYAGENT_RUNTIME_ENV", "development")
+    hook_dev_cfg = workspace_hook.resolve_hook_runtime_config(source_root_override=dev_root)
+    sync_dev_cfg = transcript_sync.resolve_sync_runtime_config(source_root_override=dev_root)
+    assert hook_dev_cfg.environment == RuntimeEnvironment.DEVELOPMENT
+    assert sync_dev_cfg.environment == RuntimeEnvironment.DEVELOPMENT
+    assert is_same_file(hook_dev_cfg.database_path, dev_db)
+    assert is_same_file(sync_dev_cfg.database_path, dev_db)
+    assert is_same_file(hook_dev_cfg.data_dir, dev_root / "data")
+
+
+@pytest.mark.asyncio
+async def test_p1c_b1_hooks_end_to_end_and_cross_workspace_isolation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """P1C-B1: End-to-end workspace_hook and transcript_sync execution with cross-workspace isolation."""
+    from my_agent_mcp import transcript_sync, workspace_hook
+    from persistence.sqlite_conversation_store import SQLiteConversationStore
+    from persistence.sqlite_project_store import SQLiteProjectStore
+
+    disposable_db = tmp_path / "hook_e2e" / "my_agent_dev.db"
+    disposable_db.parent.mkdir(parents=True)
+    untouched_prod_db = tmp_path / "untouched_prod.db"
+    untouched_prod_db.write_text("UNTOUCHED_PROD", encoding="utf-8")
+
+    ws_alpha = tmp_path / "ws_alpha"
+    ws_beta = tmp_path / "ws_beta"
+    ws_alpha.mkdir()
+    ws_beta.mkdir()
+
+    monkeypatch.setenv("MYAGENT_RUNTIME_ENV", "development")
+    monkeypatch.setenv("MYAGENT_DB_PATH", str(disposable_db))
+    monkeypatch.setenv("MYAGENT_PRODUCTION_DB_PATH", str(untouched_prod_db))
+
+    # 1. Run workspace_hook for ws_alpha
+    hook_payload = {"workspacePaths": [str(ws_alpha)], "invocationNum": 0}
+    monkeypatch.setattr(
+        workspace_hook.sys,
+        "stdin",
+        type("FakeStdin", (), {"read": lambda self: json.dumps(hook_payload)})(),
+    )
+    await workspace_hook.main()
+    out = json.loads(capsys.readouterr().out)
+    assert len(out["injectSteps"]) == 1
+    assert "ws_alpha" in out["injectSteps"][0]["ephemeralMessage"]
+
+    # Verify ws_alpha is registered in disposable_db and untouched_prod_db is unchanged
+    pstore = SQLiteProjectStore(disposable_db)
+    await pstore.initialize()
+    projs = await pstore.list()
+    assert len(projs) == 1
+    assert projs[0].project_id == "ws_alpha"
+    assert untouched_prod_db.read_text(encoding="utf-8") == "UNTOUCHED_PROD"
+
+    # 2. Run transcript_sync for unregistered ws_beta -> must NOT cross-pollute ws_alpha
+    transcript_file = tmp_path / "transcript.jsonl"
+    transcript_file.write_text(
+        json.dumps({
+            "step_index": 1,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "content": "<USER_REQUEST>Hello from session</USER_REQUEST>",
+            "created_at": "2026-11-12T10:00:00Z",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    added_unregistered = await transcript_sync.sync({
+        "conversationId": "conv-beta-1",
+        "transcriptPath": str(transcript_file),
+        "workspacePaths": [str(ws_beta)],
+    })
+    assert added_unregistered == 0
+
+    # 3. Run transcript_sync for registered ws_alpha -> syncs cleanly into disposable_db
+    added_alpha = await transcript_sync.sync({
+        "conversationId": "conv-alpha-1",
+        "transcriptPath": str(transcript_file),
+        "workspacePaths": [str(ws_alpha)],
+    })
+    assert added_alpha == 1
+
+    cstore = SQLiteConversationStore(disposable_db)
+    await cstore.initialize()
+    msgs = await cstore.history("ws_alpha", "conv-alpha-1")
+    assert len(msgs) == 1
+    assert msgs[0].content == "Hello from session"
+    assert untouched_prod_db.read_text(encoding="utf-8") == "UNTOUCHED_PROD"
+
+
+@pytest.mark.asyncio
+async def test_p1c_b1_negative_hooks_reject_protected_db_and_aliases(
+    mock_release_sandbox: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1C-B1 Negative: Hooks in development fail closed when targeting legacy/permanent prod DB or symlink aliases."""
+    from my_agent_mcp import transcript_sync, workspace_hook
+
+    dev_root = mock_release_sandbox["dev_root"]
+    (dev_root / ".git").mkdir(exist_ok=True)
+    prod_db = dev_root / "data" / "my_agent.db"
+
+    isolated_perm_dir = mock_release_sandbox["root"] / "isolated_perm_neg_b1"
+    isolated_perm_dir.mkdir(parents=True, exist_ok=True)
+    perm_db = isolated_perm_dir / "my_agent.db"
+    perm_db.write_text("PERM_STABLE_DB", encoding="utf-8")
+
+    monkeypatch.setenv("MYAGENT_PERMANENT_DATA_DIR", str(isolated_perm_dir))
+    monkeypatch.setenv("MYAGENT_SOURCE_ROOT", str(dev_root))
+    monkeypatch.setenv("MYAGENT_RUNTIME_ENV", "development")
+
+    alias_link = dev_root / "data" / "prod_alias.db"
+    os.symlink(prod_db, alias_link)
+
+    for forbidden_target in (prod_db, perm_db, alias_link):
+        monkeypatch.setenv("MYAGENT_DB_PATH", str(forbidden_target))
+        with pytest.raises(ProductionDatabaseProtectionError):
+            workspace_hook.resolve_hook_runtime_config(source_root_override=dev_root)
+        with pytest.raises(ProductionDatabaseProtectionError):
+            transcript_sync.resolve_sync_runtime_config(source_root_override=dev_root)
+        with pytest.raises(ProductionDatabaseProtectionError):
+            await transcript_sync.sync({"conversationId": "c1", "transcriptPath": "/tmp/none", "workspacePaths": []})
+
+
+def test_p1c_b2_persistent_assets_resolution_and_provenance_key_preservation(
+    mock_release_sandbox: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1C-B2: Provenance keys, designs, and browser artifacts use runtime data_dir and never overwrite existing keys."""
+    from core.design_md_generator import DesignMdGenerator
+    from core.ui_design_style_engine import UiDesignStyleEngine
+    from core.user_model import TrustedProvenanceAuthority
+
+    dev_root = mock_release_sandbox["dev_root"]
+    (dev_root / ".git").mkdir(exist_ok=True)
+
+    isolated_perm_dir = tmp_path / "perm_stable_data"
+    isolated_perm_dir.mkdir(parents=True)
+    monkeypatch.setenv("MYAGENT_PERMANENT_DATA_DIR", str(isolated_perm_dir))
+
+    rel_dir = mock_release_sandbox["releases_root"] / "ffffffffffffffffffffffffffffffffffffffff"
+    rel_dir.mkdir(parents=True)
+    (rel_dir / "release_metadata.json").write_text(
+        json.dumps({"commit_sha": "ffffffffffffffffffffffffffffffffffffffff", "file_hashes": {}}),
+        encoding="utf-8",
+    )
+
+    # 1. Verify Stable release resolves data_dir, designs_dir, provenance_key_path, browser_artifacts_dir to ~/.my-agent/data
+    cfg_stable = resolve_runtime_environment(env_override="stable", source_root_override=rel_dir)
+    assert cfg_stable.data_dir == isolated_perm_dir.resolve()
+    assert cfg_stable.designs_dir == (isolated_perm_dir / "designs").resolve()
+    assert cfg_stable.provenance_key_path == (isolated_perm_dir / "provenance.key").resolve()
+    assert cfg_stable.browser_artifacts_dir == (isolated_perm_dir / "browser_artifacts").resolve()
+
+    # 2. Verify Development resolves data_dir to dev_root / "data"
+    cfg_dev = resolve_runtime_environment(env_override="development", source_root_override=dev_root)
+    assert cfg_dev.data_dir == (dev_root / "data").resolve()
+    assert cfg_dev.designs_dir == (dev_root / "data" / "designs").resolve()
+    assert cfg_dev.provenance_key_path == (dev_root / "data" / "provenance.key").resolve()
+    assert cfg_dev.browser_artifacts_dir == (dev_root / "data" / "browser_artifacts").resolve()
+
+    # 3. Provenance key preservation: pre-existing key in Stable data_dir is NEVER regenerated or overwritten
+    existing_key_file = isolated_perm_dir / "provenance.key"
+    expected_secret = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    existing_key_file.write_text(expected_secret, encoding="utf-8")
+    existing_key_file.chmod(0o600)
+    original_inode = existing_key_file.stat().st_ino
+
+    monkeypatch.setenv("MYAGENT_SOURCE_ROOT", str(rel_dir))
+    monkeypatch.setenv("MYAGENT_RUNTIME_ENV", "stable")
+    monkeypatch.delenv("MYAGENT_DB_PATH", raising=False)
+    monkeypatch.delenv("MYAGENT_PROVENANCE_SECRET", raising=False)
+
+    TrustedProvenanceAuthority.set_key_path(None)
+    TrustedProvenanceAuthority.set_secret(None)
+    try:
+        resolved_key_path = TrustedProvenanceAuthority.get_key_path()
+        assert resolved_key_path == existing_key_file.resolve()
+        loaded_secret = TrustedProvenanceAuthority.get_secret()
+        assert loaded_secret == expected_secret
+        assert existing_key_file.read_text(encoding="utf-8") == expected_secret
+        assert existing_key_file.stat().st_ino == original_inode
+
+        token = TrustedProvenanceAuthority.issue_token()
+        assert TrustedProvenanceAuthority.validate_token(token) is True
+
+        # Empty/corrupted key file must fail closed rather than silently regenerating
+        empty_key = tmp_path / "empty_provenance.key"
+        empty_key.write_text("   \n", encoding="utf-8")
+        TrustedProvenanceAuthority.set_key_path(empty_key)
+        with pytest.raises(RuntimeError, match="refusing to regenerate or overwrite"):
+            TrustedProvenanceAuthority.get_secret()
+    finally:
+        TrustedProvenanceAuthority.set_key_path(None)
+        TrustedProvenanceAuthority.set_secret(None)
+    # 4. DesignMdGenerator writes to Stable designs_dir (outside rel_dir) and preserves release cleanliness
+    ui_engine = UiDesignStyleEngine()
+    ctx = ui_engine.analyze_context(description="Fintech trading portal", sector="fintech")
+    profile = ui_engine.generate_style_profile(ctx)
+    gen = DesignMdGenerator()
+    out_design = gen.write_to_agent_repo(profile, project_id="fintech-portal")
+    assert out_design == (isolated_perm_dir / "designs" / "fintech-portal.design.md").resolve()
+    assert out_design.exists()
+    assert not (rel_dir / "data").exists()
+    assert gen.read_from_agent_repo("fintech-portal") is not None
+
+
+def test_p1c_b2_negative_immutable_release_rejects_mutable_writes_and_preserves_integrity(
+    mock_release_sandbox: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1C-B2 Negative: Immutable release directories reject DB, data_dir, key, and design writes."""
+    from core.design_md_generator import DesignMdGenerator
+    from core.ui_design_style_engine import UiDesignStyleEngine
+    from core.user_model import TrustedProvenanceAuthority
+
+    releases_root = mock_release_sandbox["releases_root"]
+    manager = ReleaseManager(releases_root=releases_root)
+    sha = "1212121212121212121212121212121212121212"
+    rel_dir = releases_root / sha
+    rel_dir.mkdir(parents=True)
+    (rel_dir / "core").mkdir()
+    (rel_dir / "my_agent_mcp").mkdir()
+    (rel_dir / "persistence").mkdir()
+    app_file = rel_dir / "core" / "app.py"
+    app_file.write_text("IMMUTABLE = True\n", encoding="utf-8")
+    (rel_dir / "release_metadata.json").write_text(
+        json.dumps({
+            "commit_sha": sha,
+            "short_sha": "1212121",
+            "source_ref": "v1.4.0",
+            "file_hashes": {"core/app.py": _compute_file_sha256(app_file)},
+        }),
+        encoding="utf-8",
+    )
+
+    # 1. Attempting to place database_path inside immutable release fails closed
+    with pytest.raises(RuntimeIsolationError, match="IMMUTABLE RELEASE PROTECTION"):
+        resolve_runtime_environment(
+            env_override="stable",
+            db_override=str(rel_dir / "data" / "my_agent.db"),
+            source_root_override=rel_dir,
+        )
+
+    # 2. Attempting to place data_dir inside immutable release fails closed
+    with pytest.raises(RuntimeIsolationError, match="IMMUTABLE RELEASE PROTECTION"):
+        resolve_runtime_environment(
+            env_override="stable",
+            data_dir_override=rel_dir / "data",
+            source_root_override=rel_dir,
+        )
+
+    # 3. Attempting to write provenance.key inside immutable release fails closed
+    TrustedProvenanceAuthority.set_key_path(rel_dir / "data" / "provenance.key")
+    try:
+        with pytest.raises(RuntimeIsolationError, match="IMMUTABLE RELEASE PROTECTION"):
+            TrustedProvenanceAuthority.get_secret()
+    finally:
+        TrustedProvenanceAuthority.set_key_path(None)
+        TrustedProvenanceAuthority.set_secret(None)
+    # 4. Attempting to write design contract inside immutable release fails closed
+    ui_engine = UiDesignStyleEngine()
+    ctx = ui_engine.analyze_context(description="Test", sector="saas_b2b")
+    profile = ui_engine.generate_style_profile(ctx)
+    gen = DesignMdGenerator()
+    with pytest.raises(RuntimeIsolationError, match="IMMUTABLE RELEASE PROTECTION"):
+        gen.write_to_agent_repo(profile, project_id="bad-proj", storage_dir=rel_dir / "data" / "designs")
+
+    # 5. Release integrity remains 100% valid with zero unexpected files created
+    integrity = manager.verify_release_integrity(rel_dir)
+    assert integrity["valid"] is True
+    assert not (rel_dir / "data").exists()
+
+
+def test_pr20_p1_1_development_custom_data_dir_does_not_conflict_with_permanent_stable_dir(
+    mock_release_sandbox: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR20 P1-1: Valid Development MYAGENT_DATA_DIR does not conflict with permanent Stable directory protection."""
+    dev_root = mock_release_sandbox["dev_root"]
+    (dev_root / ".git").mkdir(exist_ok=True)
+    custom_dev_data = tmp_path / "custom_dev_data_dir"
+    custom_dev_data.mkdir(parents=True)
+
+    # 1. With MYAGENT_PERMANENT_DATA_DIR unset, MYAGENT_DATA_DIR in development resolves cleanly
+    monkeypatch.delenv("MYAGENT_PERMANENT_DATA_DIR", raising=False)
+    monkeypatch.setenv("MYAGENT_RUNTIME_ENV", "development")
+    monkeypatch.setenv("MYAGENT_DATA_DIR", str(custom_dev_data))
+
+    assert get_permanent_stable_data_dir() == (Path.home() / ".my-agent" / "data").resolve()
+    cfg = resolve_runtime_environment(source_root_override=dev_root)
+    assert cfg.environment == RuntimeEnvironment.DEVELOPMENT
+    assert cfg.data_dir == custom_dev_data.resolve()
+    assert cfg.designs_dir == (custom_dev_data / "designs").resolve()
+    assert cfg.provenance_key_path == (custom_dev_data / "provenance.key").resolve()
+    assert cfg.browser_artifacts_dir == (custom_dev_data / "browser_artifacts").resolve()
+
+    # 2. Negative: Development MYAGENT_DATA_DIR targeting permanent Stable data_dir, subdirectory, or symlink fails closed
+    isolated_perm_dir = tmp_path / "isolated_perm_stable_dir"
+    isolated_perm_dir.mkdir(parents=True)
+    perm_sub_dir = isolated_perm_dir / "designs"
+    perm_sub_dir.mkdir(parents=True)
+    perm_alias = tmp_path / "perm_dir_alias"
+    os.symlink(isolated_perm_dir, perm_alias)
+
+    monkeypatch.setenv("MYAGENT_PERMANENT_DATA_DIR", str(isolated_perm_dir))
+    for forbidden_dir in (isolated_perm_dir, perm_sub_dir, perm_alias):
+        monkeypatch.setenv("MYAGENT_DATA_DIR", str(forbidden_dir))
+        with pytest.raises(ProductionDatabaseProtectionError, match="permanent Stable data directory"):
+            resolve_runtime_environment(source_root_override=dev_root)
+
+
+def test_pr20_p1_2_provenance_key_creation_fails_closed_on_persistence_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR20 P1-2: Provenance key creation fails closed on any persistence error and never caches or returns an unpersisted secret."""
+    from core.user_model import TrustedProvenanceAuthority
+
+    key_path = tmp_path / "secure_data" / "provenance.key"
+    TrustedProvenanceAuthority.set_key_path(key_path)
+    TrustedProvenanceAuthority.set_secret(None)
+    monkeypatch.delenv("MYAGENT_PROVENANCE_SECRET", raising=False)
+
+    try:
+        # 1. Simulate os.open failure (e.g. PermissionError)
+        def _fail_open(*args: object, **kwargs: object) -> int:
+            raise PermissionError("Simulated permission refusal on provenance.key")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(os, "open", _fail_open)
+            with pytest.raises(PermissionError, match="Simulated permission refusal"):
+                TrustedProvenanceAuthority.get_secret()
+
+        assert TrustedProvenanceAuthority._SECRET is None
+        assert TrustedProvenanceAuthority._CACHED_KEY_PATH is None
+        assert not key_path.exists()
+
+        # 2. Simulate write failure after file descriptor creation (ensuring partial file is cleaned up and nothing is cached)
+        real_fdopen = os.fdopen
+
+        def _failing_fdopen(fd: int, *args: object, **kwargs: object) -> object:
+            os.close(fd)
+            raise OSError("Simulated disk full during provenance key write")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(os, "fdopen", _failing_fdopen)
+            with pytest.raises(OSError, match="Simulated disk full"):
+                TrustedProvenanceAuthority.issue_token()
+
+        assert TrustedProvenanceAuthority._SECRET is None
+        assert TrustedProvenanceAuthority._CACHED_KEY_PATH is None
+        assert not key_path.exists()
+
+        # 3. Once persistence succeeds, secret is written, verified, and cached
+        secret = TrustedProvenanceAuthority.get_secret()
+        assert len(secret) == 64
+        assert key_path.exists()
+        assert key_path.read_text(encoding="utf-8").strip() == secret
+        assert TrustedProvenanceAuthority._SECRET == secret
+        assert TrustedProvenanceAuthority._CACHED_KEY_PATH == key_path.resolve()
+    finally:
+        TrustedProvenanceAuthority.set_key_path(None)
+        TrustedProvenanceAuthority.set_secret(None)

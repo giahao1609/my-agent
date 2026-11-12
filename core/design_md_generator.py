@@ -10,9 +10,18 @@ import re
 from pathlib import Path
 
 from .config import PROJECT_ROOT
+from .runtime_environment import (
+    assert_not_in_immutable_release,
+    resolve_runtime_environment,
+)
 from .ui_design_style_engine import DesignStyleProfile, UiDesignStyleEngine, DesignContext
 
 DEFAULT_DESIGNS_DIR = PROJECT_ROOT / "data" / "designs"
+
+
+def get_runtime_designs_dir() -> Path:
+    """Returns the active runtime's persistent designs directory."""
+    return resolve_runtime_environment().designs_dir
 
 
 class DesignMdGenerator:
@@ -26,10 +35,20 @@ class DesignMdGenerator:
 
         gen = DesignMdGenerator()
         path = gen.write_to_agent_repo(profile, project_id="my-project")
-        # -> data/designs/my-project.design.md (kept in MyAgent repo, never polluting user repo)
+        # -> <runtime_data_dir>/designs/my-project.design.md (isolated from user repo and immutable releases)
     """
 
     FILENAME = "DESIGN.md"
+
+    def __init__(self, storage_dir: Path | None = None) -> None:
+        self._storage_dir = Path(storage_dir).expanduser().resolve() if storage_dir is not None else None
+
+    def _resolve_storage_dir(self, storage_dir: Path | None = None) -> Path:
+        if storage_dir is not None:
+            return Path(storage_dir).expanduser().resolve()
+        if self._storage_dir is not None:
+            return self._storage_dir
+        return get_runtime_designs_dir()
 
     def generate(self, profile: DesignStyleProfile, project_name: str = "Project") -> str:
         """Generate DESIGN.md markdown content from a DesignStyleProfile."""
@@ -42,8 +61,9 @@ class DesignMdGenerator:
         project_name: str = "Project",
         storage_dir: Path | None = None,
     ) -> Path:
-        """Write DESIGN.md to MyAgent's internal data directory, isolated from user repos."""
-        target_dir = storage_dir or DEFAULT_DESIGNS_DIR
+        """Write DESIGN.md to MyAgent's runtime data directory, isolated from user repos and immutable releases."""
+        target_dir = self._resolve_storage_dir(storage_dir)
+        assert_not_in_immutable_release(target_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         safe_id = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in project_id)
         output_path = target_dir / f"{safe_id}.design.md"
@@ -56,8 +76,8 @@ class DesignMdGenerator:
         project_id: str,
         storage_dir: Path | None = None,
     ) -> str | None:
-        """Read design contract from MyAgent's internal data directory."""
-        target_dir = storage_dir or DEFAULT_DESIGNS_DIR
+        """Read design contract from MyAgent's runtime data directory."""
+        target_dir = self._resolve_storage_dir(storage_dir)
         safe_id = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in project_id)
         path = target_dir / f"{safe_id}.design.md"
         if not path.exists():

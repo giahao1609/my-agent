@@ -234,45 +234,118 @@ class ServerBoundaryToken:
 class TrustedProvenanceAuthority:
     """Server-owned authority responsible for issuing boundary tokens and signing/verifying record attestations."""
 
-    _KEY_PATH: Path = Path("/Users/haohg/Project/my-agent/data/provenance.key")
+    _KEY_PATH: Path | None = None
     _SECRET: str | None = None
+    _CACHED_KEY_PATH: Path | None = None
 
     @classmethod
     def set_secret(cls, secret: str | None) -> None:
         """Explicitly set or override in-memory secret (useful for isolated testing)."""
         cls._SECRET = secret
+        cls._CACHED_KEY_PATH = None
 
     @classmethod
-    def set_key_path(cls, path: Path) -> None:
-        """Set custom key file path."""
-        cls._KEY_PATH = path
+    def set_key_path(cls, path: Path | None) -> None:
+        """Set custom key file path or clear override when None."""
+        cls._KEY_PATH = Path(path).expanduser().resolve() if path is not None else None
         cls._SECRET = None
+        cls._CACHED_KEY_PATH = None
+
+    @classmethod
+    def get_key_path(cls) -> Path:
+        """Resolve the runtime-appropriate provenance key path and forbid immutable release writes."""
+        from .runtime_environment import (
+            assert_not_in_immutable_release,
+            resolve_runtime_environment,
+        )
+
+        if cls._KEY_PATH is not None:
+            resolved = cls._KEY_PATH.expanduser().resolve()
+            assert_not_in_immutable_release(resolved)
+            return resolved
+
+        env_path = os.environ.get("MYAGENT_PROVENANCE_KEY_PATH")
+        if env_path and env_path.strip():
+            resolved = Path(env_path.strip()).expanduser().resolve()
+            assert_not_in_immutable_release(resolved)
+            return resolved
+
+        cfg = resolve_runtime_environment()
+        resolved = cfg.provenance_key_path
+        assert_not_in_immutable_release(resolved, cfg.canonical_source_root)
+        return resolved
 
     @classmethod
     def get_secret(cls) -> str:
-        """Get or load persistent HMAC secret key."""
-        if cls._SECRET is not None:
+        """Get or load persistent HMAC secret key without regenerating existing keys."""
+        from .runtime_environment import assert_not_in_immutable_release
+
+        if cls._SECRET is not None and cls._CACHED_KEY_PATH is None:
             return cls._SECRET
+
         env_key = os.environ.get("MYAGENT_PROVENANCE_SECRET")
         if env_key and env_key.strip():
-            cls._SECRET = env_key.strip()
+            return env_key.strip()
+
+        key_path = cls.get_key_path()
+        if cls._SECRET is not None and cls._CACHED_KEY_PATH == key_path:
             return cls._SECRET
-        if cls._KEY_PATH.exists():
-            try:
-                content = cls._KEY_PATH.read_text(encoding="utf-8").strip()
-                if content:
-                    cls._SECRET = content
-                    return cls._SECRET
-            except OSError:
-                pass
+
+        if key_path.exists():
+            content = key_path.read_text(encoding="utf-8").strip()
+            if not content:
+                raise RuntimeError(
+                    f"Existing provenance key file '{key_path}' is empty; refusing to regenerate or overwrite."
+                )
+            cls._SECRET = content
+            cls._CACHED_KEY_PATH = key_path
+            return cls._SECRET
+
+        assert_not_in_immutable_release(key_path)
         new_secret = secrets.token_hex(32)
+        fd: int | None = None
+        created_file = False
         try:
-            cls._KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
-            cls._KEY_PATH.write_text(new_secret, encoding="utf-8")
-            cls._KEY_PATH.chmod(0o600)
-        except OSError:
-            pass
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            created_file = True
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fd = None
+                fh.write(new_secret)
+                fh.flush()
+                os.fsync(fh.fileno())
+            key_path.chmod(0o600)
+            persisted = key_path.read_text(encoding="utf-8").strip()
+            if persisted != new_secret:
+                raise OSError(f"Provenance key verification failed after write to '{key_path}'.")
+        except FileExistsError as exc:
+            content = key_path.read_text(encoding="utf-8").strip()
+            if not content:
+                cls._SECRET = None
+                cls._CACHED_KEY_PATH = None
+                raise RuntimeError(
+                    f"Existing provenance key file '{key_path}' is empty; refusing to regenerate or overwrite."
+                ) from exc
+            cls._SECRET = content
+            cls._CACHED_KEY_PATH = key_path
+            return cls._SECRET
+        except Exception:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if created_file:
+                try:
+                    key_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            cls._SECRET = None
+            cls._CACHED_KEY_PATH = None
+            raise
+
         cls._SECRET = new_secret
+        cls._CACHED_KEY_PATH = key_path
         return cls._SECRET
 
     @classmethod
