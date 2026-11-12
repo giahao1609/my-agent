@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_MYAGENT_HOME = Path.home() / ".my-agent"
 
 
+def normalize_link_path(path: Path) -> Path:
+    """Normalizes a symlink path without dereferencing the symlink itself."""
+    expanded = path.expanduser()
+    return expanded.parent.resolve() / expanded.name
+
+
 def _compute_file_sha256(filepath: Path) -> str:
     """Computes SHA-256 checksum of a file."""
     h = hashlib.sha256()
@@ -68,10 +74,11 @@ class ReleaseManager:
             releases_root
             or Path(os.getenv("MYAGENT_RELEASES_ROOT", str(base_home / "releases")))
         ).expanduser().resolve()
-        self.stable_link = (
+        raw_link = (
             stable_link
             or Path(os.getenv("MYAGENT_STABLE_LINK", str(base_home / "stable")))
-        ).expanduser().resolve()
+        )
+        self.stable_link = normalize_link_path(raw_link)
         self.venvs_root = (
             venvs_root
             or Path(os.getenv("MYAGENT_VENVS_ROOT", str(base_home / "venvs")))
@@ -239,14 +246,11 @@ class ReleaseManager:
         venv_path: Path | None = None
         if create_venv:
             venv_path = self.venvs_root / full_sha
-            if not venv_path.exists():
-                py_bin = python_executable or sys.executable
-                subprocess.check_call(
-                    [py_bin, "-m", "venv", str(venv_path)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                # Note: dependencies can be installed via pip in the created venv if needed
+            self.prepare_and_verify_release_venv(
+                release_path=target_release_dir,
+                venv_path=venv_path,
+                python_executable=python_executable,
+            )
 
         # 5. Atomically activate as stable if requested
         if activate_as_stable:
@@ -263,6 +267,95 @@ class ReleaseManager:
             tree_hash=tree_hash,
             venv_path=venv_path,
         )
+
+    def prepare_and_verify_release_venv(
+        self,
+        release_path: Path,
+        venv_path: Path,
+        python_executable: str | None = None,
+    ) -> None:
+        """Prepares an isolated virtual environment and verifies self-contained imports.
+
+        Guarantees:
+        - Bootstraps Python virtual environment using specified or active Python interpreter.
+        - Populates required third-party runtime dependencies into release site-packages.
+        - Binds the release source root to the environment via .pth file.
+        - Executes an isolated verification script confirming the release MCP server
+          and its dependencies load cleanly without PYTHONPATH or Development leakage.
+        """
+        py_bin = python_executable or sys.executable
+        if not venv_path.exists():
+            subprocess.check_call(
+                [py_bin, "-m", "venv", str(venv_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        v_sites = list(venv_path.glob("lib/python*/site-packages"))
+        if not v_sites:
+            raise ReleaseVerificationError(f"Cannot locate site-packages in created venv at '{venv_path}'")
+        v_site = v_sites[0]
+
+        # Bind release source via .pth file
+        (v_site / "my_agent.pth").write_text(f"{release_path}\n", encoding="utf-8")
+
+        # Replicate third-party site packages from active interpreter venv
+        py_path = Path(py_bin)
+        base_prefix = py_path.parent.parent
+        src_sites = list((base_prefix / "lib").glob("python*/site-packages"))
+        if not src_sites:
+            base_prefix = py_path.resolve().parent.parent
+            src_sites = list((base_prefix / "lib").glob("python*/site-packages"))
+
+        if src_sites:
+            src_site = src_sites[0]
+            for item in src_site.iterdir():
+                if item.name.startswith((".", "tests", "data", "docs", "_editable")):
+                    continue
+                if item.name in ["core", "my_agent_mcp", "persistence", "agents", "integrations", "eval", "scripts"]:
+                    continue
+                dest = v_site / item.name
+                if not dest.exists():
+                    try:
+                        if item.is_dir():
+                            shutil.copytree(item, dest, symlinks=True)
+                        else:
+                            shutil.copy2(item, dest)
+                    except OSError as exc:
+                        logger.debug("Failed copying site-package item '%s': %s", item.name, exc)
+
+        # Isolated verification using the release-specific interpreter
+        vpy = venv_path / "bin" / "python"
+        if not vpy.exists():
+            raise ReleaseVerificationError(f"Release python interpreter not found at '{vpy}'")
+
+        test_code = (
+            "import sys, mcp, core.runtime_environment, my_agent_mcp.server; "
+            "rel = sys.argv[1]; "
+            "srv_path = str(my_agent_mcp.server.__file__); "
+            "assert srv_path.startswith(rel), f'Isolation leakage: {srv_path} is outside {rel}'; "
+            "print('OK')"
+        )
+        clean_env = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home())}
+        try:
+            res = subprocess.run(
+                [str(vpy), "-c", test_code, str(release_path)],
+                cwd="/tmp",
+                capture_output=True,
+                text=True,
+                env=clean_env,
+                timeout=15.0,
+            )
+            if res.returncode != 0:
+                raise ReleaseVerificationError(
+                    f"Release venv verification failed (exit code {res.returncode}): {res.stderr.strip()}"
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise ReleaseVerificationError(f"Release venv verification timed out: {exc}") from exc
+        except Exception as exc:
+            if not isinstance(exc, ReleaseVerificationError):
+                raise ReleaseVerificationError(f"Release venv verification error: {exc}") from exc
+            raise
 
     def _atomic_symlink_switch(self, target_dir: Path) -> None:
         """Atomically points self.stable_link to target_dir via a temporary symlink."""

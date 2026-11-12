@@ -264,24 +264,15 @@ def get_permanent_stable_db_path() -> Path:
 
 
 def is_legacy_mcp_server_entrypoint() -> bool:
-    """Detects whether the active process is the legacy unconfigured MCP server process.
+    """Detects explicit legacy MCP server authorization.
 
-    Verified criteria:
-    - Explicit opt-in via MYAGENT_LEGACY_MCP_SERVER='1'
-    - Execution of my_agent_mcp.server via sys.argv (-m my_agent_mcp.server or direct script path)
-    - Execution where __main__.__file__ points to my_agent_mcp/server.py
+    Note (R3 resolution):
+    Execution of the shared module entrypoint 'my_agent_mcp.server' alone is ambiguous
+    because both 'my-agent' and 'my-agent-dev' share it. Therefore, entrypoint string matching
+    alone does NOT grant Stable production database access. Explicit declaration via
+    MYAGENT_LEGACY_MCP_SERVER='1' or MYAGENT_RUNTIME_ENV='stable' is required.
     """
-    if os.getenv("MYAGENT_LEGACY_MCP_SERVER") == "1":
-        return True
-    for arg in sys.argv:
-        if "my_agent_mcp.server" in arg or "my_agent_mcp/server.py" in arg:
-            return True
-    main_mod = sys.modules.get("__main__")
-    if main_mod:
-        main_file = getattr(main_mod, "__file__", "") or ""
-        if "my_agent_mcp/server.py" in main_file or "my_agent_mcp.server" in getattr(main_mod, "__name__", ""):
-            return True
-    return False
+    return os.getenv("MYAGENT_LEGACY_MCP_SERVER") == "1"
 
 
 def resolve_runtime_environment(

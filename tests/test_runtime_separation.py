@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 from typing import Generator
 import pytest
@@ -416,8 +419,15 @@ def test_p1b_03_permanent_stable_data_dir() -> None:
     assert perm_dir == (Path.home() / ".my-agent" / "data").resolve()
 
 
-def test_r02_development_cannot_bind_to_permanent_stable_database(mock_release_sandbox: dict[str, Path]) -> None:
+def test_r02_development_cannot_bind_to_permanent_stable_database(
+    mock_release_sandbox: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """R02: Development environment is strictly prohibited from binding to the permanent Stable database."""
+    isolated_perm_dir = mock_release_sandbox["root"] / "isolated_perm_data_r02"
+    isolated_perm_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("MYAGENT_PERMANENT_DATA_DIR", str(isolated_perm_dir))
+
     from core.runtime_environment import get_permanent_stable_db_path
     perm_db = get_permanent_stable_db_path()
     dev_root = mock_release_sandbox["dev_root"]
@@ -680,16 +690,21 @@ def test_negative_backup_missing_source(tmp_path: Path) -> None:
         create_safe_sqlite_backup(missing_db, dest_db)
 
 
-def test_negative_dev_cannot_target_permanent_stable_db_symlink(mock_release_sandbox: dict[str, Path]) -> None:
+def test_negative_dev_cannot_target_permanent_stable_db_symlink(
+    mock_release_sandbox: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """F10 / Negative: Symlink to permanent Stable DB in development environment fails closed."""
+    isolated_perm_dir = mock_release_sandbox["root"] / "isolated_perm_data_symlink"
+    isolated_perm_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("MYAGENT_PERMANENT_DATA_DIR", str(isolated_perm_dir))
+
     from core.runtime_environment import get_permanent_stable_db_path
     perm_db = get_permanent_stable_db_path()
-    dev_root = mock_release_sandbox["dev_root"]
+    assert str(isolated_perm_dir) in str(perm_db)
 
-    # Ensure parent dir exists
-    perm_db.parent.mkdir(parents=True, exist_ok=True)
-    if not perm_db.exists():
-        perm_db.write_text("MOCK_PERM_DATA", encoding="utf-8")
+    perm_db.write_text("MOCK_PERM_DATA", encoding="utf-8")
+    dev_root = mock_release_sandbox["dev_root"]
 
     symlink_path = dev_root / "data" / "symlink_to_permanent.db"
     try:
@@ -723,3 +738,187 @@ def test_server_rebind_stores_dynamically(tmp_path: Path) -> None:
     finally:
         # Restore initial binding
         srv.rebind_stores(initial_db)
+
+
+def test_regression_r1_multicycle_symlink_reinstantiation(mock_release_sandbox: dict[str, Path]) -> None:
+    """R1: Multi-cycle promotion and rollback with re-instantiated ReleaseManager preserves symlink and data."""
+    releases_root = mock_release_sandbox["releases_root"]
+    stable_link = mock_release_sandbox["stable_link"]
+    data_dir = mock_release_sandbox["data_dir"]
+
+    # Persistent database with initial records
+    persistent_db = data_dir / "my_agent.db"
+    conn = sqlite3.connect(str(persistent_db))
+    conn.execute("CREATE TABLE r1_data (id INT, item TEXT);")
+    conn.execute("INSERT INTO r1_data VALUES (1, 'unmodified_production_payload');")
+    conn.commit()
+    conn.close()
+
+    # 1. Setup Release A
+    sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    rel_a = releases_root / sha_a
+    rel_a.mkdir(parents=True)
+    (rel_a / "core").mkdir()
+    (rel_a / "my_agent_mcp").mkdir()
+    (rel_a / "persistence").mkdir()
+    f_a = rel_a / "core" / "app.py"
+    f_a.write_text("VERSION = 'A'\n", encoding="utf-8")
+    (rel_a / "release_metadata.json").write_text(
+        json.dumps({
+            "commit_sha": sha_a,
+            "short_sha": "aaaaaaa",
+            "source_ref": "v1.0",
+            "installed_at": "2026-11-10T10:00:00Z",
+            "file_hashes": {"core/app.py": _compute_file_sha256(f_a)},
+        }),
+        encoding="utf-8",
+    )
+
+    # 2. Setup Release B
+    sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    rel_b = releases_root / sha_b
+    rel_b.mkdir(parents=True)
+    (rel_b / "core").mkdir()
+    (rel_b / "my_agent_mcp").mkdir()
+    (rel_b / "persistence").mkdir()
+    f_b = rel_b / "core" / "app.py"
+    f_b.write_text("VERSION = 'B'\n", encoding="utf-8")
+    (rel_b / "release_metadata.json").write_text(
+        json.dumps({
+            "commit_sha": sha_b,
+            "short_sha": "bbbbbbb",
+            "source_ref": "v2.0",
+            "installed_at": "2026-11-11T10:00:00Z",
+            "file_hashes": {"core/app.py": _compute_file_sha256(f_b)},
+        }),
+        encoding="utf-8",
+    )
+
+    # Cycle 1: Manager 1 stages and promotes A
+    m1 = ReleaseManager(releases_root=releases_root, stable_link=stable_link, data_dir=data_dir)
+    rec_a = m1.promote_release(sha_a)
+    assert rec_a.is_active_stable is True
+    assert os.path.islink(stable_link)
+    assert stable_link.resolve() == rel_a
+    del m1
+
+    # Cycle 2: Fresh Manager 2 promotes B
+    m2 = ReleaseManager(releases_root=releases_root, stable_link=stable_link, data_dir=data_dir)
+    assert m2.stable_link == stable_link
+    assert os.path.islink(m2.stable_link)
+    rec_b = m2.promote_release(sha_b)
+    assert rec_b.is_active_stable is True
+    assert os.path.islink(stable_link)
+    assert stable_link.resolve() == rel_b
+    del m2
+
+    # Cycle 3: Fresh Manager 3 rolls back to A
+    m3 = ReleaseManager(releases_root=releases_root, stable_link=stable_link, data_dir=data_dir)
+    assert m3.stable_link == stable_link
+    rec_roll = m3.rollback_release(sha_a)
+    assert rec_roll.commit_sha == sha_a
+    assert os.path.islink(stable_link)
+    assert stable_link.resolve() == rel_a
+    del m3
+
+    # Assert persistent database was never modified
+    conn2 = sqlite3.connect(str(persistent_db))
+    rows = conn2.execute("SELECT item FROM r1_data;").fetchall()
+    conn2.close()
+    assert rows == [("unmodified_production_payload",)]
+
+
+def test_regression_r2_tests_never_touch_real_permanent_stable_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """R2: Validates that test suites use isolated directory hierarchies and never mutate real permanent DB."""
+    fake_perm_dir = tmp_path / "fake_perm"
+    monkeypatch.setenv("MYAGENT_PERMANENT_DATA_DIR", str(fake_perm_dir))
+
+    from core.runtime_environment import get_permanent_stable_db_path
+    resolved_path = get_permanent_stable_db_path()
+    assert str(fake_perm_dir) in str(resolved_path)
+    assert str(Path.home() / ".my-agent" / "data") not in str(resolved_path)
+
+
+def test_regression_r3_shared_module_launch_shape_fails_safe_to_dev(
+    mock_release_sandbox: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3: Real module-launch shape (python -m my_agent_mcp.server) in dev repository fails safe to dev without env."""
+    dev_root = mock_release_sandbox["dev_root"]
+    (dev_root / ".git").mkdir(exist_ok=True)
+    dev_db = dev_root / "data" / "my_agent_dev.db"
+    prod_db = dev_root / "data" / "my_agent.db"
+
+    # Simulate sys.argv containing the shared entrypoint
+    monkeypatch.setattr("sys.argv", ["python", "-m", "my_agent_mcp.server"])
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("MYAGENT_RUNTIME_ENV", raising=False)
+    monkeypatch.delenv("MYAGENT_DB_PATH", raising=False)
+    monkeypatch.delenv("MYAGENT_LEGACY_MCP_SERVER", raising=False)
+
+    # Unconfigured module execution MUST fail safe to DEVELOPMENT
+    cfg = resolve_runtime_environment(source_root_override=dev_root)
+    assert cfg.environment == RuntimeEnvironment.DEVELOPMENT
+    assert is_same_file(cfg.database_path, dev_db)
+    assert not is_same_file(cfg.database_path, prod_db)
+
+    # Attempting to bind to production DB without explicit declaration fails closed
+    with pytest.raises(ProductionDatabaseProtectionError) as exc:
+        resolve_runtime_environment(
+            db_override=str(prod_db),
+            source_root_override=dev_root,
+        )
+    assert "prohibited from binding to production database" in str(exc.value)
+
+    # Explicit declaration via MYAGENT_RUNTIME_ENV=stable successfully resolves to STABLE
+    monkeypatch.setenv("MYAGENT_RUNTIME_ENV", "stable")
+    cfg_stable = resolve_runtime_environment(source_root_override=dev_root)
+    assert cfg_stable.environment == RuntimeEnvironment.STABLE
+    assert is_same_file(cfg_stable.database_path, prod_db)
+
+
+def test_regression_r4_staged_candidate_venv_dependency_isolation(
+    mock_release_sandbox: dict[str, Path],
+) -> None:
+    """R4: Candidate release venv is fully populated, verified, and free of dev PYTHONPATH leakage."""
+    releases_root = mock_release_sandbox["releases_root"]
+    venvs_root = mock_release_sandbox["venvs_root"]
+    manager = ReleaseManager(releases_root=releases_root, venvs_root=venvs_root)
+
+    sha = "cccccccccccccccccccccccccccccccccccccccc"
+    rel_dir = releases_root / sha
+    rel_dir.mkdir(parents=True)
+
+    # Mock release directory with required structure
+    repo_root = Path(__file__).resolve().parent.parent
+    for mod in ["core", "my_agent_mcp", "persistence", "agents", "integrations", "eval"]:
+        if (repo_root / mod).exists():
+            shutil.copytree(repo_root / mod, rel_dir / mod)
+
+    venv_target = venvs_root / sha
+    manager.prepare_and_verify_release_venv(
+        release_path=rel_dir,
+        venv_path=venv_target,
+        python_executable=sys.executable,
+    )
+
+    assert venv_target.exists()
+    vpy = venv_target / "bin" / "python"
+    assert vpy.exists()
+
+    # Verify that the release interpreter imports my_agent_mcp directly from rel_dir
+    res = subprocess.run(
+        [
+            str(vpy),
+            "-c",
+            "import my_agent_mcp, mcp; print(my_agent_mcp.__file__)",
+        ],
+        cwd="/tmp",
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
+        timeout=15.0,
+    )
+    assert res.returncode == 0
+    assert str(rel_dir) in res.stdout
+    assert str(repo_root) not in res.stdout
