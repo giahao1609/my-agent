@@ -26,8 +26,10 @@ def isolate_mcp_security_per_test(
     - If the test requests 'tmp_path', binds server._auth_manager and MYAGENT_WORKSPACE to tmp_path.
     - Otherwise, binds server._auth_manager to repository ROOT (/Users/haohg/Project/my-agent).
     - Always syncs with server.projects.
+    - Explicitly sets MYAGENT_RUNTIME_ENV to 'development' to shield production database.
     - Restores clean state on teardown to eliminate cross-test pollution.
     """
+    monkeypatch.setenv("MYAGENT_RUNTIME_ENV", "development")
     repo_root = server.ROOT
 
     # Determine test workspace
