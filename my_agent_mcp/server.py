@@ -133,9 +133,18 @@ from persistence.sqlite_handoff_history_store import SqliteHandoffHistoryStore
 from persistence.sqlite_pending_approval_store import SqlitePendingApprovalStore
 from core.resume_assembler import ResumeAssembler
 from core.git_review_coordinator import GitReviewCoordinator, parse_github_remote
+from core.runtime_environment import (
+    ProductionDatabaseProtectionError,
+    RuntimeConfig,
+    RuntimeEnvironment,
+    get_protected_production_db,
+    is_same_file,
+    resolve_runtime_environment,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = Path(os.environ.get("MYAGENT_DB_PATH", ROOT / "data" / "my_agent.db"))
+_runtime_config: RuntimeConfig = resolve_runtime_environment()
+DB_PATH = _runtime_config.database_path
 
 projects = SQLiteProjectStore(DB_PATH)
 _global_projects = projects
@@ -167,6 +176,51 @@ _unified_context_builder = UnifiedContextBuilder(
     design_dir=ROOT / "data" / "designs",
 )
 _auth_manager = SecurityAuthorizationManager(projects)
+
+
+def rebind_stores(new_db_path: Path) -> None:
+    """Rebinds all SQLite store singletons to new_db_path and reinitializes dependent services."""
+    global DB_PATH, projects, _global_projects, conversations, checkpoints, code_graph
+    global tasks, plans, decisions, _decision_service, agent_runs, _agent_run_service
+    global _handoff_context_builder, pending_approvals, _handoff_history_store
+    global _resume_assembler, memory_store, _memory_service, _user_model_engine
+    global _unified_context_builder, _auth_manager, _handoff_coordinator
+
+    DB_PATH = new_db_path
+    projects = SQLiteProjectStore(DB_PATH)
+    _global_projects = projects
+    conversations = SQLiteConversationStore(DB_PATH)
+    checkpoints = SQLiteCheckpointStore(DB_PATH)
+    code_graph = SQLiteCodeGraphStore(DB_PATH)
+    tasks = SQLiteTaskStore(DB_PATH)
+    plans = SQLitePlanStore(DB_PATH)
+    decisions = SQLiteDecisionStore(DB_PATH)
+    _decision_service = DecisionService(decisions)
+    agent_runs = SQLiteAgentRunStore(DB_PATH)
+    _agent_run_service = AgentRunService(agent_runs)
+    _handoff_context_builder = AgentHandoffContextBuilder(agent_runs, require_project_id=True)
+    pending_approvals = SqlitePendingApprovalStore(DB_PATH)
+    _handoff_history_store = SqliteHandoffHistoryStore(DB_PATH)
+    _resume_assembler = ResumeAssembler(
+        conversation_store=conversations,
+        checkpoint_store=checkpoints,
+        task_store=tasks,
+        handoff_builder=_handoff_context_builder,
+    )
+    memory_store = SQLiteMemoryStore(DB_PATH)
+    _memory_service = DurableMemoryService(memory_store)
+    _user_model_engine = UserModelEngine(_memory_service, store=memory_store)
+    _unified_context_builder = UnifiedContextBuilder(
+        code_graph=code_graph,
+        memory_service=_memory_service,
+        user_model_engine=_user_model_engine,
+        design_dir=ROOT / "data" / "designs",
+    )
+    _auth_manager = SecurityAuthorizationManager(projects)
+    _handoff_coordinator = HandoffCoordinator(
+        guardrail_engine=None,
+        history_store=_handoff_history_store,
+    )
 
 
 
@@ -219,6 +273,14 @@ mcp = MCPServer("my-agent")
 
 
 async def _initialize() -> None:
+    global _runtime_config, DB_PATH
+    # Dynamic re-resolution to prevent import-time stale binding or env bypass
+    _runtime_config = resolve_runtime_environment()
+    _runtime_config.validate()
+
+    if _runtime_config.database_path != DB_PATH:
+        rebind_stores(_runtime_config.database_path)
+
     await projects.initialize()
     await conversations.initialize()
     await checkpoints.initialize()
@@ -510,7 +572,11 @@ async def my_agent_status() -> dict[str, object]:
 
     return {
         "status": "ready",
+        "runtime_environment": _runtime_config.environment.value,
+        "release_commit": _runtime_config.release_commit,
         "database": str(DB_PATH),
+        "database_isolation": "verified",
+        "canonical_source_root": str(_runtime_config.canonical_source_root),
         "active_project": _project_payload(active) if active is not None else None,
         "coder_runtime_mode": settings.coder_runtime_mode.value,
         "active_coder_workers": active_coder_workers,

@@ -26,12 +26,14 @@ async def test_mcp_agent_run_tools_lifecycle():
     # Ensure active project
     active = await projects.get_active()
     if active is None:
-        proj = ProjectRecord(
-            project_id="my-agent",
-            name="my-agent",
-            workspace_path="/Users/haohg/Project/my-agent",
-        )
-        await projects.create(proj)
+        existing = await projects.get("my-agent")
+        if existing is None:
+            proj = ProjectRecord(
+                project_id="my-agent",
+                name="my-agent",
+                workspace_path="/Users/haohg/Project/my-agent",
+            )
+            await projects.create(proj)
         await projects.set_active("my-agent")
 
     # Ensure task and step exist for authorized project
