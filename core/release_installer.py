@@ -242,6 +242,11 @@ class ReleaseManager:
                     shutil.rmtree(tmp_build_dir, ignore_errors=True)
                 raise ReleaseVerificationError(f"Failed installing release {full_sha}: {exc}") from exc
 
+        # Clean any accidental bytecode caches before venv preparation
+        for p in target_release_dir.glob("**/__pycache__"):
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+
         # 4. Handle isolated virtual environment if requested
         venv_path: Path | None = None
         if create_venv:
@@ -296,8 +301,11 @@ class ReleaseManager:
             raise ReleaseVerificationError(f"Cannot locate site-packages in created venv at '{venv_path}'")
         v_site = v_sites[0]
 
-        # Bind release source via .pth file
-        (v_site / "my_agent.pth").write_text(f"{release_path}\n", encoding="utf-8")
+        # Bind release source and enforce bytecode suppression in release venv via .pth
+        (v_site / "my_agent.pth").write_text(
+            f"import sys; sys.dont_write_bytecode = True\n{release_path}\n",
+            encoding="utf-8",
+        )
 
         # Replicate third-party site packages from active interpreter venv
         py_path = Path(py_bin)
@@ -334,9 +342,14 @@ class ReleaseManager:
             "rel = sys.argv[1]; "
             "srv_path = str(my_agent_mcp.server.__file__); "
             "assert srv_path.startswith(rel), f'Isolation leakage: {srv_path} is outside {rel}'; "
+            "assert sys.dont_write_bytecode is True, 'sys.dont_write_bytecode not enabled in release venv'; "
             "print('OK')"
         )
-        clean_env = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home())}
+        clean_env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(Path.home()),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
         try:
             res = subprocess.run(
                 [str(vpy), "-c", test_code, str(release_path)],
@@ -356,6 +369,11 @@ class ReleaseManager:
             if not isinstance(exc, ReleaseVerificationError):
                 raise ReleaseVerificationError(f"Release venv verification error: {exc}") from exc
             raise
+
+        # Ensure no bytecode caches were written into the release directory
+        for p in release_path.glob("**/__pycache__"):
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
 
     def _atomic_symlink_switch(self, target_dir: Path) -> None:
         """Atomically points self.stable_link to target_dir via a temporary symlink."""

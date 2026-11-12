@@ -355,12 +355,23 @@ def resolve_runtime_environment(
             else:
                 env = RuntimeEnvironment.DEVELOPMENT
 
+    metadata_file = canonical_root / "release_metadata.json"
+    is_release_source = metadata_file.exists()
+
+    # Enforce bytecode suppression on immutable releases and stable execution
+    if is_release_source or env == RuntimeEnvironment.STABLE:
+        sys.dont_write_bytecode = True
+
     # 3. Resolve database path
     if raw_db:
         db_path = Path(raw_db).expanduser().resolve()
     else:
         if env == RuntimeEnvironment.STABLE:
-            db_path = prod_db
+            if is_release_source:
+                # Immutable staged or promoted releases must not write into release root
+                db_path = perm_db
+            else:
+                db_path = prod_db
         else:
             db_path = (canonical_root / "data" / "my_agent_dev.db").resolve()
 
@@ -373,8 +384,7 @@ def resolve_runtime_environment(
 
     # 4. Resolve release commit / metadata
     release_commit = "unknown"
-    metadata_file = canonical_root / "release_metadata.json"
-    if metadata_file.exists():
+    if is_release_source:
         try:
             import json
             data = json.loads(metadata_file.read_text(encoding="utf-8"))
@@ -398,7 +408,10 @@ def resolve_runtime_environment(
         release_commit = "dev" if env == RuntimeEnvironment.DEVELOPMENT else "pinned-unknown"
 
     # 5. Resolve logs directory
-    log_dir = canonical_root / "logs" / env.value
+    if is_release_source:
+        log_dir = get_permanent_stable_data_dir().parent / "logs"
+    else:
+        log_dir = canonical_root / "logs" / env.value
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
     except OSError:

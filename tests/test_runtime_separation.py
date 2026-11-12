@@ -922,3 +922,112 @@ def test_regression_r4_staged_candidate_venv_dependency_isolation(
     assert res.returncode == 0
     assert str(rel_dir) in res.stdout
     assert str(repo_root) not in res.stdout
+
+
+def test_regression_cache_suppression_and_release_integrity(
+    mock_release_sandbox: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    """Regression: Enforce runtime cache suppression and strict immutable release integrity.
+
+    Verifies 4 required criteria:
+    1. A release passes integrity verification immediately after staging and venv prep.
+    2. Verification still passes after release-venv imports without generating in-tree __pycache__.
+    3. Verification still passes after an isolated MCP startup check.
+    4. Deliberate source tampering remains rejected (strict integrity maintained).
+    """
+    from core.release_installer import _compute_file_sha256
+
+    releases_root = mock_release_sandbox["releases_root"]
+    venvs_root = mock_release_sandbox["venvs_root"]
+    manager = ReleaseManager(releases_root=releases_root, venvs_root=venvs_root)
+
+    sha = "dddddddddddddddddddddddddddddddddddddddd"
+    rel_dir = releases_root / sha
+    rel_dir.mkdir(parents=True)
+
+    repo_root = Path(__file__).resolve().parent.parent
+    for mod in ["core", "my_agent_mcp", "persistence", "agents", "integrations", "eval"]:
+        if (repo_root / mod).exists():
+            shutil.copytree(
+                repo_root / mod,
+                rel_dir / mod,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+
+    # Compute valid file hashes for all files in the release directory
+    file_hashes: dict[str, str] = {}
+    for fpath in rel_dir.rglob("*"):
+        if fpath.is_file() and fpath.name != "release_metadata.json":
+            rel_posix = fpath.relative_to(rel_dir).as_posix()
+            file_hashes[rel_posix] = _compute_file_sha256(fpath)
+
+    metadata = {
+        "commit_sha": sha,
+        "short_sha": "ddddddd",
+        "source_ref": "v1.3.0",
+        "installed_at": "2026-11-12T10:00:00Z",
+        "file_hashes": file_hashes,
+    }
+    (rel_dir / "release_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    # Prepare and verify release venv
+    venv_target = venvs_root / sha
+    manager.prepare_and_verify_release_venv(
+        release_path=rel_dir,
+        venv_path=venv_target,
+        python_executable=sys.executable,
+    )
+    vpy = venv_target / "bin" / "python"
+    assert vpy.exists()
+
+    # 1. Immediately after staging and venv prep: integrity passes, no in-tree pycaches
+    check_1 = manager.verify_release_integrity(rel_dir)
+    assert check_1["valid"] is True, f"Check 1 failed: {check_1.get('reason')}"
+    assert list(rel_dir.glob("**/__pycache__")) == [], "Unexpected __pycache__ created in release source"
+
+    # 2. After release-venv imports: integrity still passes, no in-tree pycaches
+    res_import = subprocess.run(
+        [str(vpy), "-c", "import core.runtime_environment, my_agent_mcp.server; print('IMPORT_OK')"],
+        cwd="/tmp",
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
+        timeout=15.0,
+    )
+    assert res_import.returncode == 0, f"Import failed: {res_import.stderr}"
+    check_2 = manager.verify_release_integrity(rel_dir)
+    assert check_2["valid"] is True, f"Check 2 failed: {check_2.get('reason')}"
+    assert list(rel_dir.glob("**/__pycache__")) == [], "__pycache__ generated during release-venv imports"
+
+    # 3. After isolated MCP startup check: integrity still passes
+    mcp_code = (
+        "import asyncio\n"
+        "from my_agent_mcp.server import _initialize, my_agent_status\n"
+        "asyncio.run(_initialize())\n"
+        "print('MCP_INIT_OK')\n"
+    )
+    res_mcp = subprocess.run(
+        [str(vpy), "-c", mcp_code],
+        cwd="/tmp",
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(Path.home()),
+            "MYAGENT_DB_PATH": str(tmp_path / "isolated_startup.db"),
+            "MYAGENT_PERMANENT_DATA_DIR": str(tmp_path / "isolated_perm"),
+        },
+        timeout=15.0,
+    )
+    assert res_mcp.returncode == 0, f"MCP startup failed: {res_mcp.stderr}"
+    check_3 = manager.verify_release_integrity(rel_dir)
+    assert check_3["valid"] is True, f"Check 3 failed: {check_3.get('reason')}"
+    assert list(rel_dir.glob("**/__pycache__")) == [], "__pycache__ generated during MCP startup"
+
+    # 4. Deliberate source tampering remains rejected (strict integrity preserved)
+    tamper_file = rel_dir / "core" / "unauthorized_injected.py"
+    tamper_file.write_text("malicious = True\n", encoding="utf-8")
+    check_4 = manager.verify_release_integrity(rel_dir)
+    assert check_4["valid"] is False
+    assert "TAMPERING_DETECTED" in check_4.get("reason", "")
