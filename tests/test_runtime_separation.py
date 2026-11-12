@@ -1279,7 +1279,6 @@ def test_p1c_b2_persistent_assets_resolution_and_provenance_key_preservation(
     finally:
         TrustedProvenanceAuthority.set_key_path(None)
         TrustedProvenanceAuthority.set_secret(None)
-
     # 4. DesignMdGenerator writes to Stable designs_dir (outside rel_dir) and preserves release cleanliness
     ui_engine = UiDesignStyleEngine()
     ctx = ui_engine.analyze_context(description="Fintech trading portal", sector="fintech")
@@ -1345,7 +1344,6 @@ def test_p1c_b2_negative_immutable_release_rejects_mutable_writes_and_preserves_
     finally:
         TrustedProvenanceAuthority.set_key_path(None)
         TrustedProvenanceAuthority.set_secret(None)
-
     # 4. Attempting to write design contract inside immutable release fails closed
     ui_engine = UiDesignStyleEngine()
     ctx = ui_engine.analyze_context(description="Test", sector="saas_b2b")
@@ -1358,3 +1356,96 @@ def test_p1c_b2_negative_immutable_release_rejects_mutable_writes_and_preserves_
     integrity = manager.verify_release_integrity(rel_dir)
     assert integrity["valid"] is True
     assert not (rel_dir / "data").exists()
+
+
+def test_pr20_p1_1_development_custom_data_dir_does_not_conflict_with_permanent_stable_dir(
+    mock_release_sandbox: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR20 P1-1: Valid Development MYAGENT_DATA_DIR does not conflict with permanent Stable directory protection."""
+    dev_root = mock_release_sandbox["dev_root"]
+    (dev_root / ".git").mkdir(exist_ok=True)
+    custom_dev_data = tmp_path / "custom_dev_data_dir"
+    custom_dev_data.mkdir(parents=True)
+
+    # 1. With MYAGENT_PERMANENT_DATA_DIR unset, MYAGENT_DATA_DIR in development resolves cleanly
+    monkeypatch.delenv("MYAGENT_PERMANENT_DATA_DIR", raising=False)
+    monkeypatch.setenv("MYAGENT_RUNTIME_ENV", "development")
+    monkeypatch.setenv("MYAGENT_DATA_DIR", str(custom_dev_data))
+
+    assert get_permanent_stable_data_dir() == (Path.home() / ".my-agent" / "data").resolve()
+    cfg = resolve_runtime_environment(source_root_override=dev_root)
+    assert cfg.environment == RuntimeEnvironment.DEVELOPMENT
+    assert cfg.data_dir == custom_dev_data.resolve()
+    assert cfg.designs_dir == (custom_dev_data / "designs").resolve()
+    assert cfg.provenance_key_path == (custom_dev_data / "provenance.key").resolve()
+    assert cfg.browser_artifacts_dir == (custom_dev_data / "browser_artifacts").resolve()
+
+    # 2. Negative: Development MYAGENT_DATA_DIR targeting permanent Stable data_dir, subdirectory, or symlink fails closed
+    isolated_perm_dir = tmp_path / "isolated_perm_stable_dir"
+    isolated_perm_dir.mkdir(parents=True)
+    perm_sub_dir = isolated_perm_dir / "designs"
+    perm_sub_dir.mkdir(parents=True)
+    perm_alias = tmp_path / "perm_dir_alias"
+    os.symlink(isolated_perm_dir, perm_alias)
+
+    monkeypatch.setenv("MYAGENT_PERMANENT_DATA_DIR", str(isolated_perm_dir))
+    for forbidden_dir in (isolated_perm_dir, perm_sub_dir, perm_alias):
+        monkeypatch.setenv("MYAGENT_DATA_DIR", str(forbidden_dir))
+        with pytest.raises(ProductionDatabaseProtectionError, match="permanent Stable data directory"):
+            resolve_runtime_environment(source_root_override=dev_root)
+
+
+def test_pr20_p1_2_provenance_key_creation_fails_closed_on_persistence_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR20 P1-2: Provenance key creation fails closed on any persistence error and never caches or returns an unpersisted secret."""
+    from core.user_model import TrustedProvenanceAuthority
+
+    key_path = tmp_path / "secure_data" / "provenance.key"
+    TrustedProvenanceAuthority.set_key_path(key_path)
+    TrustedProvenanceAuthority.set_secret(None)
+    monkeypatch.delenv("MYAGENT_PROVENANCE_SECRET", raising=False)
+
+    try:
+        # 1. Simulate os.open failure (e.g. PermissionError)
+        def _fail_open(*args: object, **kwargs: object) -> int:
+            raise PermissionError("Simulated permission refusal on provenance.key")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(os, "open", _fail_open)
+            with pytest.raises(PermissionError, match="Simulated permission refusal"):
+                TrustedProvenanceAuthority.get_secret()
+
+        assert TrustedProvenanceAuthority._SECRET is None
+        assert TrustedProvenanceAuthority._CACHED_KEY_PATH is None
+        assert not key_path.exists()
+
+        # 2. Simulate write failure after file descriptor creation (ensuring partial file is cleaned up and nothing is cached)
+        real_fdopen = os.fdopen
+
+        def _failing_fdopen(fd: int, *args: object, **kwargs: object) -> object:
+            os.close(fd)
+            raise OSError("Simulated disk full during provenance key write")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(os, "fdopen", _failing_fdopen)
+            with pytest.raises(OSError, match="Simulated disk full"):
+                TrustedProvenanceAuthority.issue_token()
+
+        assert TrustedProvenanceAuthority._SECRET is None
+        assert TrustedProvenanceAuthority._CACHED_KEY_PATH is None
+        assert not key_path.exists()
+
+        # 3. Once persistence succeeds, secret is written, verified, and cached
+        secret = TrustedProvenanceAuthority.get_secret()
+        assert len(secret) == 64
+        assert key_path.exists()
+        assert key_path.read_text(encoding="utf-8").strip() == secret
+        assert TrustedProvenanceAuthority._SECRET == secret
+        assert TrustedProvenanceAuthority._CACHED_KEY_PATH == key_path.resolve()
+    finally:
+        TrustedProvenanceAuthority.set_key_path(None)
+        TrustedProvenanceAuthority.set_secret(None)

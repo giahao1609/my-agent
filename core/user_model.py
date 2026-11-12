@@ -303,28 +303,47 @@ class TrustedProvenanceAuthority:
 
         assert_not_in_immutable_release(key_path)
         new_secret = secrets.token_hex(32)
+        fd: int | None = None
+        created_file = False
         try:
             key_path.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(new_secret)
-            except Exception:
+            created_file = True
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fd = None
+                fh.write(new_secret)
+                fh.flush()
+                os.fsync(fh.fileno())
+            key_path.chmod(0o600)
+            persisted = key_path.read_text(encoding="utf-8").strip()
+            if persisted != new_secret:
+                raise OSError(f"Provenance key verification failed after write to '{key_path}'.")
+        except FileExistsError as exc:
+            content = key_path.read_text(encoding="utf-8").strip()
+            if not content:
+                cls._SECRET = None
+                cls._CACHED_KEY_PATH = None
+                raise RuntimeError(
+                    f"Existing provenance key file '{key_path}' is empty; refusing to regenerate or overwrite."
+                ) from exc
+            cls._SECRET = content
+            cls._CACHED_KEY_PATH = key_path
+            return cls._SECRET
+        except Exception:
+            if fd is not None:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
-                raise
-            key_path.chmod(0o600)
-        except FileExistsError:
-            content = key_path.read_text(encoding="utf-8").strip()
-            if content:
-                cls._SECRET = content
-                cls._CACHED_KEY_PATH = key_path
-                return cls._SECRET
+            if created_file:
+                try:
+                    key_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            cls._SECRET = None
+            cls._CACHED_KEY_PATH = None
             raise
-        except OSError:
-            pass
+
         cls._SECRET = new_secret
         cls._CACHED_KEY_PATH = key_path
         return cls._SECRET

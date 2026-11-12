@@ -236,9 +236,9 @@ class RuntimeConfig:
         perm_data_dir = get_permanent_stable_data_dir()
 
         # Immutable release directories must never contain mutable runtime databases or data_dir
-        if (self.canonical_source_root / "release_metadata.json").exists():
-            assert_not_in_immutable_release(self.database_path, self.canonical_source_root)
-            assert_not_in_immutable_release(self.data_dir, self.canonical_source_root)
+        release_root = self.canonical_source_root if (self.canonical_source_root / "release_metadata.json").exists() else None
+        assert_not_in_immutable_release(self.database_path, release_root)
+        assert_not_in_immutable_release(self.data_dir, release_root)
 
         if self.environment == RuntimeEnvironment.DEVELOPMENT:
             # Development must NEVER write to legacy or permanent production database
@@ -252,7 +252,9 @@ class RuntimeConfig:
                     f"[SAFETY REFUSAL] Development environment (MYAGENT_RUNTIME_ENV='development') is "
                     f"strictly prohibited from binding to the permanent Stable database '{self.database_path}'."
                 )
-            if is_same_file(self.data_dir, perm_data_dir):
+            resolved_data_dir = self.data_dir.expanduser().resolve()
+            resolved_perm_dir = perm_data_dir.expanduser().resolve()
+            if is_same_file(self.data_dir, perm_data_dir) or resolved_data_dir.is_relative_to(resolved_perm_dir):
                 raise ProductionDatabaseProtectionError(
                     f"[SAFETY REFUSAL] Development environment (MYAGENT_RUNTIME_ENV='development') is "
                     f"strictly prohibited from binding to the permanent Stable data directory '{self.data_dir}'."
@@ -303,7 +305,7 @@ DEFAULT_PERMANENT_STABLE_DATA_DIR = Path.home() / ".my-agent" / "data"
 
 def get_permanent_stable_data_dir() -> Path:
     """Returns the target permanent Stable data directory outside the dev tree."""
-    explicit = os.getenv("MYAGENT_PERMANENT_DATA_DIR") or os.getenv("MYAGENT_DATA_DIR")
+    explicit = os.getenv("MYAGENT_PERMANENT_DATA_DIR")
     if explicit:
         return Path(explicit).expanduser().resolve()
     return DEFAULT_PERMANENT_STABLE_DATA_DIR.expanduser().resolve()
