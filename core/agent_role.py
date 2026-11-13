@@ -123,6 +123,7 @@ class RolePolicyEngine:
         role: AgentRole,
         tool: ToolDefinition,
     ) -> ToolPolicyResult:
+        role_label = role.value if isinstance(role, AgentRole) else str(role)
         rules = self.ROLE_RULES.get(role)
 
         # Non-coder roles attempting production code writes
@@ -137,25 +138,59 @@ class RolePolicyEngine:
             if ToolPermission.WRITE in tool.permissions:
                 return ToolPolicyResult(
                     ToolDecision.DENY,
-                    f"role '{role.value}' is prohibited from modifying workspace files",
+                    f"role '{role_label}' is prohibited from modifying workspace files",
                 )
 
-        if rules:
-            if tool.name in rules.get('forbidden', ()):
+        from collections.abc import Mapping
+
+        if not rules:
+            return ToolPolicyResult(
+                ToolDecision.DENY,
+                f"role '{role_label}' has no configured policy rules",
+            )
+
+        if not isinstance(rules, Mapping):
+            return ToolPolicyResult(
+                ToolDecision.DENY,
+                f"role '{role_label}' defines an invalid policy rule configuration",
+            )
+
+        def _is_valid_tool_list(value: object) -> bool:
+            return isinstance(value, (tuple, list, set, frozenset)) and all(
+                isinstance(name, str) and bool(name.strip())
+                for name in value
+            )
+
+        if 'forbidden' in rules:
+            forbidden = rules['forbidden']
+            if not _is_valid_tool_list(forbidden):
                 return ToolPolicyResult(
                     ToolDecision.DENY,
-                    f"tool '{tool.name}' is explicitly forbidden for role '{role.value}'",
+                    f"role '{role_label}' defines an invalid forbidden tool configuration",
                 )
-            if rules.get('allowed') and tool.name not in rules['allowed']:
-                # Tool is not in the role's explicit allowlist — deny access.
-                # This enforces least-privilege: roles may only use tools they
-                # are explicitly permitted to use, not all non-forbidden tools.
+            if tool.name in forbidden:
                 return ToolPolicyResult(
                     ToolDecision.DENY,
-                    f"tool '{tool.name}' is not in the allowed list for role '{role.value}'",
+                    f"tool '{tool.name}' is explicitly forbidden for role '{role_label}'",
                 )
 
-        return ToolPolicyResult(ToolDecision.ALLOW, f"role '{role.value}' is authorized for tool '{tool.name}'")
+        allowed = rules.get('allowed')
+        if not _is_valid_tool_list(allowed) or not allowed:
+            return ToolPolicyResult(
+                ToolDecision.DENY,
+                f"role '{role_label}' does not define a valid nonempty allowed tool list",
+            )
+
+        if tool.name not in allowed:
+            # Tool is not in the role's explicit allowlist — deny access.
+            # This enforces least-privilege: roles may only use tools they
+            # are explicitly permitted to use, not all non-forbidden tools.
+            return ToolPolicyResult(
+                ToolDecision.DENY,
+                f"tool '{tool.name}' is not in the allowed list for role '{role_label}'",
+            )
+
+        return ToolPolicyResult(ToolDecision.ALLOW, f"role '{role_label}' is authorized for tool '{tool.name}'")
 
 
 class AgentRegistry:
