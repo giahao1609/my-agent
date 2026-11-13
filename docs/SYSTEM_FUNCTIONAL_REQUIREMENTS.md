@@ -39,7 +39,7 @@ Hiện tại, nhánh làm việc `feat/houhou-04-5h-b-handoff-hardening` đang c
        │   └── tests/test_user_model_domain.py, tests/test_user_model_engine.py (71 tests passed)
        │
        ├── NHÓM 3: PHASE 05D — UserModel Surface Integration & MCP Tooling (ĐANG LÀM DỞ / CHUẨN BỊ)
-       │   ├── Đã hoàn thành hồ sơ chuẩn bị: docs/handoffs/PHASE_05D_PREPARATION_AND_BASELINE_AUDIT.md
+       │   ├── Đã hoàn thành hồ sơ chuẩn bị Phase 05D (báo cáo chuẩn bị gốc đã được lưu trữ ngoài repository); biên bản bàn giao và kiểm chứng kỹ thuật Phase 05D hiện lưu giữ tại: docs/handoffs/PHASE_05D_HANDOFF.md
        │   ├── Chưa thực hiện: Bổ sung 4 MCP tools (get_user_profile, list_user_preferences, set_user_preference, retract_user_preference) vào my_agent_mcp/server.py
        │   └── Chưa thực hiện: Tích hợp nhận thức UserModel vào Front Agent (Houhou) để cá nhân hóa phản hồi
        │
