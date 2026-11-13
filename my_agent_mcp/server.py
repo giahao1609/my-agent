@@ -3271,13 +3271,51 @@ async def set_coder_execution_target(
     model_id: str | None = None,
 ) -> dict[str, object]:
     """Switch the active runtime/model for an existing Coder Agent session."""
+    await _initialize()
+
+    if not session_id.strip():
+        raise ValueError("session_id must not be empty")
+
+    bound_project = await _require_bound_project()
     stack = await _get_coder_stack()
 
-    session = stack.orchestrator.get_session(session_id)
+    try:
+        session = stack.orchestrator.get_session(session_id)
+    except KeyError:
+        session = None
 
-    task_id = session.context.task_id if (session and session.context) else None
+    durable = (
+        await stack.session_store.get(session_id)
+        if session is None
+        else None
+    )
+    session_record = session if session is not None else durable
+    if session_record is None:
+        raise KeyError(f"unknown session: {session_id}")
+
+    if session_record.project_id != bound_project.project_id:
+        _auth_manager._log_security_audit(
+            event="SET_CODER_EXECUTION_TARGET",
+            decision="DENIED",
+            reason="CROSS_PROJECT_IDOR_CODER_SESSION_FORBIDDEN",
+            project_id=session_record.project_id,
+            authorized_project_id=bound_project.project_id,
+        )
+        raise SecurityAuthorizationError(
+            f"CROSS_PROJECT_IDOR_VIOLATION: Coder session '{session_id}' belongs to project "
+            f"'{session_record.project_id}', which does not match authorized server project "
+            f"'{bound_project.project_id}'.",
+            requested_project_id=session_record.project_id,
+            authorized_project_id=bound_project.project_id,
+            violation_type="CROSS_PROJECT_IDOR",
+        )
+
+    if session is None:
+        raise KeyError(f"unknown session: {session_id}")
+
+    task_id = session.context.task_id if session.context else None
     durable_history = await _resume_assembler.assemble_resume_history(
-        project_id=session.project_id,
+        project_id=bound_project.project_id,
         session_id=session_id,
         task_id=task_id,
         conversation_store=conversations,
@@ -3292,13 +3330,13 @@ async def set_coder_execution_target(
         history=durable_history,
     )
 
-    session = stack.orchestrator.get_session(session_id)
+    updated_session = stack.orchestrator.get_session(session_id)
 
     return {
         "status": "switched",
         "session_id": session_id,
-        "runtime_id": session.runtime_id,
-        "model_id": session.model_id,
+        "runtime_id": updated_session.runtime_id,
+        "model_id": updated_session.model_id,
     }
 
 
@@ -3595,7 +3633,215 @@ async def resolve_coder_approval(
     approved: bool,
 ) -> dict[str, object]:
     """Approve or reject a pending Coder Agent tool call."""
+    from collections.abc import Mapping
+
+    await _initialize()
+
+    if not session_id.strip():
+        raise ValueError("session_id must not be empty")
+    if not tool_call_id.strip():
+        raise ValueError("tool_call_id must not be empty")
+
+    bound_project = await _require_bound_project()
     stack = await _get_coder_stack()
+
+    def _deny_approval(
+        *,
+        reason: str,
+        message: str,
+        violation_type: str = "CROSS_PROJECT_IDOR",
+        observed_project_id: object = None,
+    ) -> SecurityAuthorizationError:
+        audit_project = (
+            observed_project_id
+            if isinstance(observed_project_id, str) and observed_project_id.strip()
+            else "<missing>"
+        )
+        _auth_manager._log_security_audit(
+            event="RESOLVE_CODER_APPROVAL",
+            decision="DENIED",
+            reason=reason,
+            project_id=audit_project,
+            authorized_project_id=bound_project.project_id,
+            target_path=f"session={session_id};tool_call_id={tool_call_id}",
+        )
+        return SecurityAuthorizationError(
+            message,
+            authorized_project_id=bound_project.project_id,
+            violation_type=violation_type,
+        )
+
+    try:
+        session = stack.orchestrator.get_session(session_id)
+    except KeyError:
+        session = None
+
+    durable_session = (
+        await stack.session_store.get(session_id)
+        if session is None
+        else None
+    )
+    session_record = session if session is not None else durable_session
+    if session_record is None:
+        raise KeyError(f"unknown session: {session_id}")
+
+    if session_record.project_id != bound_project.project_id:
+        raise _deny_approval(
+            reason="CROSS_PROJECT_IDOR_CODER_SESSION_FORBIDDEN",
+            message=(
+                f"CROSS_PROJECT_IDOR_VIOLATION: Approval '{tool_call_id}' for session "
+                f"'{session_id}' is outside authorized server project "
+                f"'{bound_project.project_id}'."
+            ),
+            observed_project_id=session_record.project_id,
+        )
+
+    if session is None:
+        raise KeyError(f"unknown session: {session_id}")
+
+    approval_store = getattr(stack, "approval_store", None) or getattr(
+        stack.agent, "_approval_store", None
+    )
+
+    async def _load_durable_approval() -> object | None:
+        if approval_store is None:
+            return None
+        if hasattr(approval_store, "get"):
+            return await approval_store.get(tool_call_id)
+        if hasattr(approval_store, "_get_sync"):
+            return approval_store._get_sync(tool_call_id)
+        return None
+
+    def _verify_durable_approval(record: object) -> None:
+        if not isinstance(record, Mapping):
+            raise _deny_approval(
+                reason="INVALID_DURABLE_APPROVAL_RECORD",
+                message=(
+                    f"APPROVAL_OWNERSHIP_UNVERIFIABLE: Approval '{tool_call_id}' for session "
+                    f"'{session_id}' is invalid in authorized project "
+                    f"'{bound_project.project_id}'."
+                ),
+            )
+        approval_project_id = record.get("project_id")
+        if (
+            not isinstance(approval_project_id, str)
+            or not approval_project_id.strip()
+            or approval_project_id != bound_project.project_id
+        ):
+            raise _deny_approval(
+                reason="CROSS_PROJECT_IDOR_APPROVAL_PROJECT_MISMATCH",
+                message=(
+                    f"CROSS_PROJECT_IDOR_VIOLATION: Approval '{tool_call_id}' for session "
+                    f"'{session_id}' is outside authorized server project "
+                    f"'{bound_project.project_id}'."
+                ),
+                observed_project_id=approval_project_id,
+            )
+        approval_session_id = record.get("session_id")
+        if (
+            not isinstance(approval_session_id, str)
+            or not approval_session_id.strip()
+            or approval_session_id != session_id
+        ):
+            raise _deny_approval(
+                reason="APPROVAL_SESSION_OWNERSHIP_MISMATCH",
+                message=(
+                    f"APPROVAL_SESSION_MISMATCH: Approval '{tool_call_id}' does not belong to "
+                    f"session '{session_id}' in authorized project '{bound_project.project_id}'."
+                ),
+                violation_type="APPROVAL_SESSION_MISMATCH",
+                observed_project_id=approval_project_id,
+            )
+
+    durable_approval = await _load_durable_approval()
+    if durable_approval is not None:
+        _verify_durable_approval(durable_approval)
+
+    pending_map = getattr(stack.agent, "_pending_approvals", None)
+    if not isinstance(pending_map, Mapping) and durable_approval is None:
+        raise _deny_approval(
+            reason="APPROVAL_OWNERSHIP_UNVERIFIABLE",
+            message=(
+                f"APPROVAL_OWNERSHIP_UNVERIFIABLE: Approval '{tool_call_id}' for session "
+                f"'{session_id}' could not be verified in authorized project "
+                f"'{bound_project.project_id}'."
+            ),
+            violation_type="UNAUTHORIZED_ACCESS",
+        )
+
+    has_matching_pending = False
+    if isinstance(pending_map, Mapping):
+        pending_entry = pending_map.get((session_id, tool_call_id))
+        if pending_entry is not None:
+            if not isinstance(pending_entry, tuple) or len(pending_entry) < 3:
+                raise _deny_approval(
+                    reason="PENDING_APPROVAL_CONTEXT_UNVERIFIABLE",
+                    message=(
+                        f"APPROVAL_OWNERSHIP_UNVERIFIABLE: Pending approval '{tool_call_id}' for "
+                        f"session '{session_id}' lacks verifiable ownership context."
+                    ),
+                    violation_type="UNAUTHORIZED_ACCESS",
+                )
+            pending_project_id = getattr(pending_entry[2], "project_id", None)
+            if (
+                not isinstance(pending_project_id, str)
+                or not pending_project_id.strip()
+                or pending_project_id != bound_project.project_id
+            ):
+                raise _deny_approval(
+                    reason="CROSS_PROJECT_IDOR_PENDING_APPROVAL_CONTEXT_MISMATCH",
+                    message=(
+                        f"CROSS_PROJECT_IDOR_VIOLATION: Pending approval '{tool_call_id}' for "
+                        f"session '{session_id}' is outside authorized server project "
+                        f"'{bound_project.project_id}'."
+                    ),
+                    observed_project_id=pending_project_id,
+                )
+            has_matching_pending = True
+        else:
+            for (other_sid, other_call_id), other_entry in pending_map.items():
+                if other_call_id == tool_call_id and other_sid != session_id:
+                    other_ctx = (
+                        other_entry[2]
+                        if isinstance(other_entry, tuple) and len(other_entry) >= 3
+                        else None
+                    )
+                    other_proj = getattr(other_ctx, "project_id", None)
+                    is_foreign_proj = other_proj != bound_project.project_id
+                    raise _deny_approval(
+                        reason=(
+                            "CROSS_PROJECT_IDOR_APPROVAL_SESSION_MISMATCH"
+                            if is_foreign_proj
+                            else "APPROVAL_SESSION_OWNERSHIP_MISMATCH"
+                        ),
+                        message=(
+                            f"APPROVAL_SESSION_MISMATCH: Approval '{tool_call_id}' does not "
+                            f"belong to session '{session_id}' in authorized project "
+                            f"'{bound_project.project_id}'."
+                        ),
+                        violation_type=(
+                            "CROSS_PROJECT_IDOR"
+                            if is_foreign_proj
+                            else "APPROVAL_SESSION_MISMATCH"
+                        ),
+                        observed_project_id=other_proj,
+                    )
+
+    if approval_store is not None and durable_approval is None:
+        # Allow any just-scheduled background session task to finish committing its
+        # newly emitted durable approval record before failing closed with KeyError.
+        active_task = _coder_tasks.get(session_id)
+        if has_matching_pending and active_task is not None and not active_task.done():
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+                durable_approval = await _load_durable_approval()
+                if durable_approval is not None:
+                    _verify_durable_approval(durable_approval)
+                    break
+
+    if approval_store is not None and durable_approval is None:
+        raise KeyError(f"no pending approval for tool call: {tool_call_id}")
+
     event = await stack.agent.resolve_tool_approval(
         session_id,
         tool_call_id,
@@ -3603,36 +3849,34 @@ async def resolve_coder_approval(
         submit_result=False,
     )
 
-    session = stack.orchestrator.get_session(session_id)
     result = event.payload.get("result", {})
     name = event.payload.get("name")
 
-    if session.project_id is not None:
-        conversation = await conversations.get(
-            session.project_id,
-            session_id,
-        )
-        if conversation is not None:
-            await conversations.add_message(
-                MessageRecord(
-                    message_id=f"msg-{uuid4().hex}",
-                    project_id=session.project_id,
-                    conversation_id=session_id,
-                    role=MessageRole.TOOL,
-                    content=json.dumps(
-                        result,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                    metadata={
-                        "session_id": session_id,
-                        "source": "my-agent",
-                        "event_type": EventType.TOOL_RESULT.value,
-                        "tool_call_id": tool_call_id,
-                        "name": name,
-                    },
-                )
+    conversation = await conversations.get(
+        bound_project.project_id,
+        session_id,
+    )
+    if conversation is not None:
+        await conversations.add_message(
+            MessageRecord(
+                message_id=f"msg-{uuid4().hex}",
+                project_id=bound_project.project_id,
+                conversation_id=session_id,
+                role=MessageRole.TOOL,
+                content=json.dumps(
+                    result,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                metadata={
+                    "session_id": session_id,
+                    "source": "my-agent",
+                    "event_type": EventType.TOOL_RESULT.value,
+                    "tool_call_id": tool_call_id,
+                    "name": name,
+                },
             )
+        )
 
     # Release the model continuation only after the durable
     # TOOL_RESULT has been written. This preserves causal
