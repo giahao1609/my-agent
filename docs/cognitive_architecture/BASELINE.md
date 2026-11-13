@@ -277,7 +277,7 @@ docs/cognitive_architecture/contracts/agent_execution.md
 docs/cognitive_architecture/contracts/workspace_tools.md
 docs/cognitive_architecture/contracts/approvals.md
 docs/cognitive_architecture/contracts/persistence.md
-docs/handoffs/PHASE_00_HANDOFF.md
+docs/handoffs/PHASE_00_HANDOFF.md                (archived outside repository; no longer in working tree)
 ```
 
 Committed at: 20f0822  
