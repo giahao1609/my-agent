@@ -2925,3 +2925,912 @@ async def test_mcp_cancel_coder_session_rejects_project_mismatch(
         server._coder_tasks[session_id],
         timeout=1,
     )
+
+
+@pytest.mark.asyncio
+async def test_mcp_set_coder_execution_target_allows_same_project_and_updates_target(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from persistence.sqlite_project_store import SQLiteProjectStore
+
+    proj_store = SQLiteProjectStore(tmp_path / "projects.db")
+    await proj_store.initialize()
+
+    ws_owner = tmp_path / "ws_owner"
+    ws_owner.mkdir()
+    owner = ProjectRecord(
+        project_id="proj-owner",
+        name="Owner",
+        workspace_path=str(ws_owner),
+    )
+    await proj_store.create(owner)
+
+    stack = await build_coder_agent_stack(tmp_path / "agent.db")
+
+    async def fake_initialize() -> None:
+        return None
+
+    async def fake_get_coder_stack():
+        return stack
+
+    monkeypatch.setattr(server, "projects", proj_store)
+    server._auth_manager.set_server_workspace(ws_owner)
+    monkeypatch.setattr(server, "_initialize", fake_initialize)
+    monkeypatch.setattr(server, "_get_coder_stack", fake_get_coder_stack)
+
+    started = await server.start_coder_session(
+        "same project work",
+        project_id="proj-owner",
+    )
+    session_id = str(started["session_id"])
+
+    await server.next_coder_command(session_id)
+    await server.next_coder_command(session_id)
+
+    switched = await server.set_coder_execution_target(
+        session_id=session_id,
+        runtime_id="claude",
+        model_id="claude-sonnet",
+    )
+
+    session = stack.orchestrator.get_session(session_id)
+    assert switched == {
+        "status": "switched",
+        "session_id": session_id,
+        "runtime_id": "claude",
+        "model_id": "claude-sonnet",
+    }
+    assert session.runtime_id == "claude"
+    assert session.model_id == "claude-sonnet"
+
+    await server.publish_coder_event(
+        session_id=session_id,
+        event_type="stop",
+        payload={"reason": "test_complete"},
+    )
+    await asyncio.wait_for(
+        server._coder_tasks[session_id],
+        timeout=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_set_coder_execution_target_denies_cross_project_idor_before_history_or_mutation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from core.context import ExecutionContext
+    from core.security_authorization import SecurityAuthorizationError
+    from core.session import SessionRecord
+    from persistence.sqlite_project_store import SQLiteProjectStore
+
+    proj_store = SQLiteProjectStore(tmp_path / "projects.db")
+    await proj_store.initialize()
+
+    ws_owner = tmp_path / "ws_owner"
+    ws_attacker = tmp_path / "ws_attacker"
+    ws_owner.mkdir()
+    ws_attacker.mkdir()
+
+    owner = ProjectRecord(
+        project_id="proj-owner",
+        name="Owner",
+        workspace_path=str(ws_owner),
+    )
+    attacker = ProjectRecord(
+        project_id="proj-attacker",
+        name="Attacker",
+        workspace_path=str(ws_attacker),
+    )
+    await proj_store.create(owner)
+    await proj_store.create(attacker)
+
+    stack = await build_coder_agent_stack(tmp_path / "agent.db")
+
+    async def fake_initialize() -> None:
+        return None
+
+    async def fake_get_coder_stack():
+        return stack
+
+    monkeypatch.setattr(server, "projects", proj_store)
+    server._auth_manager.set_server_workspace(ws_owner)
+    monkeypatch.setattr(server, "_initialize", fake_initialize)
+    monkeypatch.setattr(server, "_get_coder_stack", fake_get_coder_stack)
+
+    started = await server.start_coder_session(
+        "sensitive owner session",
+        project_id="proj-owner",
+    )
+    session_id = str(started["session_id"])
+
+    await server.set_coder_execution_target(
+        session_id=session_id,
+        runtime_id="codex",
+        model_id="codex-initial",
+    )
+
+    durable_only_id = "durable-only-owner-session"
+    await stack.session_store.save(
+        SessionRecord(
+            session_id=durable_only_id,
+            context=ExecutionContext(
+                workspace_id="proj-owner",
+                project_id="proj-owner",
+            ),
+            runtime_id="codex",
+            model_id="codex-durable",
+            state=SessionState.STOPPED,
+        )
+    )
+
+    history_calls: list[str] = []
+    target_calls: list[str] = []
+
+    async def spy_assemble_resume_history(**kwargs):
+        history_calls.append(str(kwargs.get("project_id")))
+        return ()
+
+    async def spy_set_execution_target(sid, **kwargs):
+        target_calls.append(sid)
+
+    monkeypatch.setattr(
+        server._resume_assembler,
+        "assemble_resume_history",
+        spy_assemble_resume_history,
+    )
+    monkeypatch.setattr(
+        stack.orchestrator,
+        "set_execution_target",
+        spy_set_execution_target,
+    )
+
+    # Switch server workspace binding to attacker's workspace.
+    server._auth_manager.set_server_workspace(ws_attacker)
+
+    with pytest.raises(SecurityAuthorizationError) as exc_live:
+        await server.set_coder_execution_target(
+            session_id=session_id,
+            runtime_id="evil-runtime",
+            model_id="evil-model",
+        )
+    assert exc_live.value.violation_type == "CROSS_PROJECT_IDOR"
+
+    with pytest.raises(SecurityAuthorizationError) as exc_durable:
+        await server.set_coder_execution_target(
+            session_id=durable_only_id,
+            runtime_id="evil-runtime",
+            model_id="evil-model",
+        )
+    assert exc_durable.value.violation_type == "CROSS_PROJECT_IDOR"
+
+    assert history_calls == []
+    assert target_calls == []
+
+    owner_session = stack.orchestrator.get_session(session_id)
+    assert owner_session.runtime_id == "codex"
+    assert owner_session.model_id == "codex-initial"
+
+    await server.publish_coder_event(
+        session_id=session_id,
+        event_type="stop",
+        payload={"reason": "test_complete"},
+    )
+    await asyncio.wait_for(
+        server._coder_tasks[session_id],
+        timeout=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_set_coder_execution_target_denies_missing_bound_project(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from core.security_authorization import SecurityAuthorizationError
+    from persistence.sqlite_project_store import SQLiteProjectStore
+
+    proj_store = SQLiteProjectStore(tmp_path / "projects.db")
+    await proj_store.initialize()
+
+    ws_owner = tmp_path / "ws_owner"
+    ws_unregistered = tmp_path / "ws_unregistered"
+    ws_owner.mkdir()
+    ws_unregistered.mkdir()
+
+    owner = ProjectRecord(
+        project_id="proj-owner",
+        name="Owner",
+        workspace_path=str(ws_owner),
+    )
+    await proj_store.create(owner)
+
+    stack = await build_coder_agent_stack(tmp_path / "agent.db")
+
+    async def fake_initialize() -> None:
+        return None
+
+    async def fake_get_coder_stack():
+        return stack
+
+    monkeypatch.setattr(server, "projects", proj_store)
+    server._auth_manager.set_server_workspace(ws_owner)
+    monkeypatch.setattr(server, "_initialize", fake_initialize)
+    monkeypatch.setattr(server, "_get_coder_stack", fake_get_coder_stack)
+
+    started = await server.start_coder_session(
+        "owner task",
+        project_id="proj-owner",
+    )
+    session_id = str(started["session_id"])
+
+    history_calls: list[object] = []
+    target_calls: list[object] = []
+
+    async def spy_assemble_resume_history(**kwargs):
+        history_calls.append(kwargs)
+        return ()
+
+    async def spy_set_execution_target(sid, **kwargs):
+        target_calls.append(sid)
+
+    monkeypatch.setattr(
+        server._resume_assembler,
+        "assemble_resume_history",
+        spy_assemble_resume_history,
+    )
+    monkeypatch.setattr(
+        stack.orchestrator,
+        "set_execution_target",
+        spy_set_execution_target,
+    )
+
+    server._auth_manager.set_server_workspace(ws_unregistered)
+
+    with pytest.raises(SecurityAuthorizationError) as exc_info:
+        await server.set_coder_execution_target(
+            session_id=session_id,
+            runtime_id="codex",
+            model_id="codex-model",
+        )
+
+    assert exc_info.value.violation_type == "UNAUTHORIZED_WORKSPACE"
+    assert history_calls == []
+    assert target_calls == []
+
+    session = stack.orchestrator.get_session(session_id)
+    assert session.runtime_id is None
+    assert session.model_id is None
+
+    await server.publish_coder_event(
+        session_id=session_id,
+        event_type="stop",
+        payload={"reason": "test_complete"},
+    )
+    await asyncio.wait_for(
+        server._coder_tasks[session_id],
+        timeout=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_set_coder_execution_target_rejects_unknown_session_without_mutation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from persistence.sqlite_project_store import SQLiteProjectStore
+
+    proj_store = SQLiteProjectStore(tmp_path / "projects.db")
+    await proj_store.initialize()
+
+    ws_owner = tmp_path / "ws_owner"
+    ws_owner.mkdir()
+    await proj_store.create(
+        ProjectRecord(
+            project_id="proj-owner",
+            name="Owner",
+            workspace_path=str(ws_owner),
+        )
+    )
+
+    stack = await build_coder_agent_stack(tmp_path / "agent.db")
+
+    async def fake_initialize() -> None:
+        return None
+
+    async def fake_get_coder_stack():
+        return stack
+
+    history_calls: list[object] = []
+    target_calls: list[object] = []
+
+    async def spy_assemble_resume_history(**kwargs):
+        history_calls.append(kwargs)
+        return ()
+
+    async def spy_set_execution_target(sid, **kwargs):
+        target_calls.append(sid)
+
+    monkeypatch.setattr(server, "projects", proj_store)
+    server._auth_manager.set_server_workspace(ws_owner)
+    monkeypatch.setattr(server, "_initialize", fake_initialize)
+    monkeypatch.setattr(server, "_get_coder_stack", fake_get_coder_stack)
+    monkeypatch.setattr(
+        server._resume_assembler,
+        "assemble_resume_history",
+        spy_assemble_resume_history,
+    )
+    monkeypatch.setattr(
+        stack.orchestrator,
+        "set_execution_target",
+        spy_set_execution_target,
+    )
+
+    with pytest.raises(KeyError, match="unknown session"):
+        await server.set_coder_execution_target(
+            session_id="non-existent-session",
+            runtime_id="codex",
+            model_id="codex-model",
+        )
+
+    with pytest.raises(ValueError, match="session_id must not be empty"):
+        await server.set_coder_execution_target(
+            session_id="   ",
+            runtime_id="codex",
+            model_id="codex-model",
+        )
+
+    assert history_calls == []
+    assert target_calls == []
+
+
+async def _setup_approval_auth_env(tmp_path, monkeypatch):
+    from collections.abc import Mapping
+
+    from core.context import ExecutionContext
+    from core.tools import ToolDefinition, ToolPermission
+    from persistence.sqlite_conversation_store import SQLiteConversationStore
+    from persistence.sqlite_project_store import SQLiteProjectStore
+
+    db_path = tmp_path / "approval_auth.db"
+    proj_store = SQLiteProjectStore(db_path)
+    conversation_store = SQLiteConversationStore(db_path)
+    await proj_store.initialize()
+    await conversation_store.initialize()
+
+    ws_owner = tmp_path / "ws_owner"
+    ws_foreign = tmp_path / "ws_foreign"
+    ws_unregistered = tmp_path / "ws_unregistered"
+    ws_owner.mkdir()
+    ws_foreign.mkdir()
+    ws_unregistered.mkdir()
+
+    owner = ProjectRecord(
+        project_id="proj-owner-alpha",
+        name="Owner",
+        workspace_path=str(ws_owner),
+    )
+    foreign = ProjectRecord(
+        project_id="proj-foreign-beta",
+        name="Foreign",
+        workspace_path=str(ws_foreign),
+    )
+    await proj_store.create(owner)
+    await proj_store.create(foreign)
+
+    stack = await build_coder_agent_stack(db_path)
+    tool_calls: list[Mapping[str, object]] = []
+
+    async def destructive_action(
+        context: ExecutionContext,
+        arguments: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        tool_calls.append(dict(arguments))
+        return {"status": "ok", "executed": True, "value": arguments.get("value")}
+
+    destructive_tool = ToolDefinition(
+        name="auth_destructive_op",
+        description="Destructive tool for approval authorization tests.",
+        input_schema={"type": "object"},
+        handler=destructive_action,
+        permissions=frozenset({ToolPermission.DESTRUCTIVE}),
+    )
+    stack.tool_registry.register(destructive_tool)
+
+    async def fake_initialize() -> None:
+        return None
+
+    async def fake_get_coder_stack():
+        return stack
+
+    monkeypatch.setattr(server, "projects", proj_store)
+    monkeypatch.setattr(server, "conversations", conversation_store)
+    monkeypatch.setattr(server, "_initialize", fake_initialize)
+    monkeypatch.setattr(server, "_get_coder_stack", fake_get_coder_stack)
+    server._auth_manager.set_server_workspace(ws_owner)
+
+    return {
+        "db_path": db_path,
+        "stack": stack,
+        "conversation_store": conversation_store,
+        "ws_owner": ws_owner,
+        "ws_foreign": ws_foreign,
+        "ws_unregistered": ws_unregistered,
+        "owner": owner,
+        "foreign": foreign,
+        "tool_calls": tool_calls,
+    }
+
+
+async def _wait_for_pending_approval(stack, session_id: str) -> None:
+    for _ in range(100):
+        durable = await stack.session_store.get(session_id)
+        if durable is not None and durable.state is SessionState.WAITING_APPROVAL:
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail(f"session {session_id} never entered WAITING_APPROVAL")
+
+
+@pytest.mark.asyncio
+async def test_mcp_resolve_coder_approval_allows_same_project_approve_and_reject(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    env = await _setup_approval_auth_env(tmp_path, monkeypatch)
+    stack = env["stack"]
+
+    started_approve = await server.start_coder_session("approve task", project_id="proj-owner-alpha")
+    sid_approve = str(started_approve["session_id"])
+    await server.next_coder_command(sid_approve)
+    await server.next_coder_command(sid_approve)
+    await server.publish_coder_event(
+        session_id=sid_approve,
+        event_type="tool_use",
+        payload={
+            "tool_call_id": "call-auth-approve",
+            "name": "auth_destructive_op",
+            "arguments": {"value": 10},
+        },
+    )
+    await _wait_for_pending_approval(stack, sid_approve)
+
+    approved = await server.resolve_coder_approval(
+        session_id=sid_approve,
+        tool_call_id="call-auth-approve",
+        approved=True,
+    )
+    assert approved["status"] == "approved"
+    assert approved["result"] == {"status": "ok", "executed": True, "value": 10}
+    assert env["tool_calls"] == [{"value": 10}]
+
+    durable_row = await stack.approval_store.get("call-auth-approve")
+    assert durable_row is not None and durable_row["status"] == "APPROVED"
+
+    res_cmd_approve = await server.next_coder_command(sid_approve)
+    assert res_cmd_approve["type"] == RuntimeCommandType.TOOL_RESULT.value
+    assert res_cmd_approve["payload"]["tool_call_id"] == "call-auth-approve"
+
+    started_reject = await server.start_coder_session("reject task", project_id="proj-owner-alpha")
+    sid_reject = str(started_reject["session_id"])
+    await server.next_coder_command(sid_reject)
+    await server.next_coder_command(sid_reject)
+    await server.publish_coder_event(
+        session_id=sid_reject,
+        event_type="tool_use",
+        payload={
+            "tool_call_id": "call-auth-reject",
+            "name": "auth_destructive_op",
+            "arguments": {"value": 20},
+        },
+    )
+    await _wait_for_pending_approval(stack, sid_reject)
+
+    rejected = await server.resolve_coder_approval(
+        session_id=sid_reject,
+        tool_call_id="call-auth-reject",
+        approved=False,
+    )
+    assert rejected["status"] == "rejected"
+    assert rejected["result"] == {"status": "rejected", "tool": "auth_destructive_op"}
+    assert env["tool_calls"] == [{"value": 10}]
+
+    durable_reject_row = await stack.approval_store.get("call-auth-reject")
+    assert durable_reject_row is not None and durable_reject_row["status"] == "REJECTED"
+
+    res_cmd_reject = await server.next_coder_command(sid_reject)
+    assert res_cmd_reject["type"] == RuntimeCommandType.TOOL_RESULT.value
+    assert res_cmd_reject["payload"]["result"] == {"status": "rejected", "tool": "auth_destructive_op"}
+
+    for sid in (sid_approve, sid_reject):
+        await server.publish_coder_event(session_id=sid, event_type="stop", payload={"reason": "done"})
+        await asyncio.wait_for(server._coder_tasks[sid], timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_mcp_resolve_coder_approval_denies_foreign_project_and_preserves_pending_state(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from core.security_authorization import SecurityAuthorizationError
+
+    env = await _setup_approval_auth_env(tmp_path, monkeypatch)
+    stack = env["stack"]
+
+    started = await server.start_coder_session("owner sensitive action", project_id="proj-owner-alpha")
+    sid_owner = str(started["session_id"])
+    await server.next_coder_command(sid_owner)
+    await server.next_coder_command(sid_owner)
+    await server.publish_coder_event(
+        session_id=sid_owner,
+        event_type="tool_use",
+        payload={
+            "tool_call_id": "call-owner-secret",
+            "name": "auth_destructive_op",
+            "arguments": {"value": 99},
+        },
+    )
+    await _wait_for_pending_approval(stack, sid_owner)
+
+    history_before = await env["conversation_store"].history("proj-owner-alpha", sid_owner)
+
+    resolve_calls: list[object] = []
+    submit_calls: list[object] = []
+    orig_resolve = stack.agent.resolve_tool_approval
+    orig_submit = stack.orchestrator.submit_tool_result
+
+    async def spy_resolve(*args, **kwargs):
+        resolve_calls.append(args)
+        return await orig_resolve(*args, **kwargs)
+
+    async def spy_submit(*args, **kwargs):
+        submit_calls.append(args)
+        return await orig_submit(*args, **kwargs)
+
+    monkeypatch.setattr(stack.agent, "resolve_tool_approval", spy_resolve)
+    monkeypatch.setattr(stack.orchestrator, "submit_tool_result", spy_submit)
+
+    # Switch workspace binding to foreign project and attempt both approve=True and approve=False.
+    server._auth_manager.set_server_workspace(env["ws_foreign"])
+
+    for approved_flag in (True, False):
+        with pytest.raises(SecurityAuthorizationError) as exc_info:
+            await server.resolve_coder_approval(
+                session_id=sid_owner,
+                tool_call_id="call-owner-secret",
+                approved=approved_flag,
+            )
+        assert exc_info.value.violation_type == "CROSS_PROJECT_IDOR"
+        assert "proj-owner-alpha" not in str(exc_info.value)
+
+    assert resolve_calls == []
+    assert submit_calls == []
+    assert env["tool_calls"] == []
+    assert (sid_owner, "call-owner-secret") in stack.agent._pending_approvals
+    durable_row = await stack.approval_store.get("call-owner-secret")
+    assert durable_row is not None and durable_row["status"] == "PENDING"
+    history_after = await env["conversation_store"].history("proj-owner-alpha", sid_owner)
+    assert len(history_after) == len(history_before)
+
+    # Owner workspace can still approve cleanly afterward.
+    server._auth_manager.set_server_workspace(env["ws_owner"])
+    resolved = await server.resolve_coder_approval(
+        session_id=sid_owner,
+        tool_call_id="call-owner-secret",
+        approved=True,
+    )
+    assert resolved["status"] == "approved"
+    assert env["tool_calls"] == [{"value": 99}]
+
+    await server.publish_coder_event(session_id=sid_owner, event_type="stop", payload={"reason": "done"})
+    await asyncio.wait_for(server._coder_tasks[sid_owner], timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_mcp_resolve_coder_approval_denies_missing_bound_project_and_unknown_or_blank_inputs(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from core.context import ExecutionContext
+    from core.security_authorization import SecurityAuthorizationError
+    from core.session import SessionRecord
+
+    env = await _setup_approval_auth_env(tmp_path, monkeypatch)
+    stack = env["stack"]
+
+    started = await server.start_coder_session("owner action", project_id="proj-owner-alpha")
+    sid_owner = str(started["session_id"])
+    await server.next_coder_command(sid_owner)
+    await server.next_coder_command(sid_owner)
+    await server.publish_coder_event(
+        session_id=sid_owner,
+        event_type="tool_use",
+        payload={
+            "tool_call_id": "call-missing-ws",
+            "name": "auth_destructive_op",
+            "arguments": {"value": 5},
+        },
+    )
+    await _wait_for_pending_approval(stack, sid_owner)
+
+    # Persist an unresumed durable-only session belonging to owner.
+    unresumed_sid = "unresumed-owner-session"
+    await stack.session_store.save(
+        SessionRecord(
+            session_id=unresumed_sid,
+            context=ExecutionContext(workspace_id="proj-owner-alpha", project_id="proj-owner-alpha"),
+            state=SessionState.WAITING_APPROVAL,
+        )
+    )
+
+    resolve_calls: list[object] = []
+    submit_calls: list[object] = []
+
+    async def spy_resolve(*args, **kwargs):
+        resolve_calls.append(args)
+        raise AssertionError("resolve_tool_approval must not be called")
+
+    async def spy_submit(*args, **kwargs):
+        submit_calls.append(args)
+        raise AssertionError("submit_tool_result must not be called")
+
+    monkeypatch.setattr(stack.agent, "resolve_tool_approval", spy_resolve)
+    monkeypatch.setattr(stack.orchestrator, "submit_tool_result", spy_submit)
+
+    # Missing bound project.
+    server._auth_manager.set_server_workspace(env["ws_unregistered"])
+    with pytest.raises(SecurityAuthorizationError) as exc_ws:
+        await server.resolve_coder_approval(
+            session_id=sid_owner,
+            tool_call_id="call-missing-ws",
+            approved=True,
+        )
+    assert exc_ws.value.violation_type == "UNAUTHORIZED_WORKSPACE"
+
+    # Authorized owner workspace with blank IDs / unknown / unresumed session.
+    server._auth_manager.set_server_workspace(env["ws_owner"])
+    with pytest.raises(ValueError, match="session_id must not be empty"):
+        await server.resolve_coder_approval(session_id="  ", tool_call_id="call-missing-ws", approved=True)
+
+    with pytest.raises(ValueError, match="tool_call_id must not be empty"):
+        await server.resolve_coder_approval(session_id=sid_owner, tool_call_id=" ", approved=True)
+
+    with pytest.raises(KeyError, match="unknown session"):
+        await server.resolve_coder_approval(
+            session_id="non-existent-session",
+            tool_call_id="call-missing-ws",
+            approved=True,
+        )
+
+    with pytest.raises(KeyError, match="unknown session"):
+        await server.resolve_coder_approval(
+            session_id=unresumed_sid,
+            tool_call_id="call-missing-ws",
+            approved=True,
+        )
+
+    assert resolve_calls == []
+    assert submit_calls == []
+    assert env["tool_calls"] == []
+    assert (sid_owner, "call-missing-ws") in stack.agent._pending_approvals
+    durable_row = await stack.approval_store.get("call-missing-ws")
+    assert durable_row is not None and durable_row["status"] == "PENDING"
+
+    await server.publish_coder_event(session_id=sid_owner, event_type="stop", payload={"reason": "done"})
+    await asyncio.wait_for(server._coder_tasks[sid_owner], timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_mcp_resolve_coder_approval_rejects_cross_session_and_contradictory_ownership_and_preserves_legacy_in_memory(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from core.context import ExecutionContext
+    from core.security_authorization import SecurityAuthorizationError
+
+    env = await _setup_approval_auth_env(tmp_path, monkeypatch)
+    stack = env["stack"]
+
+    started_1 = await server.start_coder_session("session one", project_id="proj-owner-alpha")
+    sid_1 = str(started_1["session_id"])
+    started_2 = await server.start_coder_session("session two", project_id="proj-owner-alpha")
+    sid_2 = str(started_2["session_id"])
+
+    for sid in (sid_1, sid_2):
+        await server.next_coder_command(sid)
+        await server.next_coder_command(sid)
+
+    await server.publish_coder_event(
+        session_id=sid_1,
+        event_type="tool_use",
+        payload={
+            "tool_call_id": "call-owned-by-s1",
+            "name": "auth_destructive_op",
+            "arguments": {"value": 77},
+        },
+    )
+    await _wait_for_pending_approval(stack, sid_1)
+
+    resolve_calls: list[object] = []
+    submit_calls: list[object] = []
+    orig_resolve = stack.agent.resolve_tool_approval
+    orig_submit = stack.orchestrator.submit_tool_result
+
+    async def spy_resolve(*args, **kwargs):
+        resolve_calls.append(args)
+        return await orig_resolve(*args, **kwargs)
+
+    async def spy_submit(*args, **kwargs):
+        submit_calls.append(args)
+        return await orig_submit(*args, **kwargs)
+
+    monkeypatch.setattr(stack.agent, "resolve_tool_approval", spy_resolve)
+    monkeypatch.setattr(stack.orchestrator, "submit_tool_result", spy_submit)
+
+    # 1) Tool call owned by sid_1 invoked via sid_2 -> rejected before mutation.
+    with pytest.raises(SecurityAuthorizationError) as exc_cross_sess:
+        await server.resolve_coder_approval(
+            session_id=sid_2,
+            tool_call_id="call-owned-by-s1",
+            approved=True,
+        )
+    assert exc_cross_sess.value.violation_type == "APPROVAL_SESSION_MISMATCH"
+
+    # 2) Contradictory durable approval metadata (project mismatch on sid_2 call) -> denied.
+    await stack.approval_store.save(
+        {
+            "tool_call_id": "call-contradictory-proj",
+            "session_id": sid_2,
+            "project_id": "proj-foreign-beta",
+            "tool_name": "auth_destructive_op",
+            "arguments": {"value": 88},
+            "status": "PENDING",
+        }
+    )
+    stack.agent._pending_approvals[(sid_2, "call-contradictory-proj")] = (
+        "auth_destructive_op",
+        {"value": 88},
+        ExecutionContext(workspace_id="proj-owner-alpha", project_id="proj-owner-alpha"),
+    )
+    with pytest.raises(SecurityAuthorizationError) as exc_contra:
+        await server.resolve_coder_approval(
+            session_id=sid_2,
+            tool_call_id="call-contradictory-proj",
+            approved=True,
+        )
+    assert exc_contra.value.violation_type == "CROSS_PROJECT_IDOR"
+    assert "proj-foreign-beta" not in str(exc_contra.value)
+    assert (sid_2, "call-contradictory-proj") in stack.agent._pending_approvals
+
+    # 3) Contradictory durable approval session mismatch (same project, different session_id in DB).
+    await stack.approval_store.save(
+        {
+            "tool_call_id": "call-contradictory-sess",
+            "session_id": sid_1,
+            "project_id": "proj-owner-alpha",
+            "tool_name": "auth_destructive_op",
+            "arguments": {"value": 89},
+            "status": "PENDING",
+        }
+    )
+    with pytest.raises(SecurityAuthorizationError) as exc_contra_sess:
+        await server.resolve_coder_approval(
+            session_id=sid_2,
+            tool_call_id="call-contradictory-sess",
+            approved=True,
+        )
+    assert exc_contra_sess.value.violation_type == "APPROVAL_SESSION_MISMATCH"
+
+    # 4) Explicit non-default store-less configuration (approval_store=None):
+    # missing/foreign project still fails closed, while valid matching ownership succeeds.
+    from dataclasses import replace
+
+    legacy_stack = replace(stack, approval_store=None)
+    monkeypatch.setattr(stack.agent, "_approval_store", None)
+
+    async def fake_legacy_stack():
+        return legacy_stack
+
+    monkeypatch.setattr(server, "_get_coder_stack", fake_legacy_stack)
+
+    stack.agent._pending_approvals[(sid_2, "call-legacy-unbound")] = (
+        "auth_destructive_op",
+        {"value": 111},
+        ExecutionContext(workspace_id="ws-unbound", project_id=None),
+    )
+    with pytest.raises(SecurityAuthorizationError) as exc_legacy_bad:
+        await server.resolve_coder_approval(
+            session_id=sid_2,
+            tool_call_id="call-legacy-unbound",
+            approved=True,
+        )
+    assert exc_legacy_bad.value.violation_type == "CROSS_PROJECT_IDOR"
+    assert (sid_2, "call-legacy-unbound") in stack.agent._pending_approvals
+
+    assert resolve_calls == []
+    assert submit_calls == []
+    assert env["tool_calls"] == []
+
+    stack.agent._pending_approvals[(sid_2, "call-legacy-valid")] = (
+        "auth_destructive_op",
+        {"value": 123},
+        ExecutionContext(workspace_id="proj-owner-alpha", project_id="proj-owner-alpha"),
+    )
+    legacy_ok = await server.resolve_coder_approval(
+        session_id=sid_2,
+        tool_call_id="call-legacy-valid",
+        approved=True,
+    )
+    assert legacy_ok["status"] == "approved"
+    assert legacy_ok["result"] == {"status": "ok", "executed": True, "value": 123}
+    assert env["tool_calls"] == [{"value": 123}]
+
+    for sid in (sid_1, sid_2):
+        await server.publish_coder_event(session_id=sid, event_type="stop", payload={"reason": "done"})
+        await asyncio.wait_for(server._coder_tasks[sid], timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_mcp_resolve_coder_approval_active_store_missing_durable_row_fails_without_consuming_pending(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Default build_coder_agent_stack() with active SqlitePendingApprovalStore must fail
+    before resolve_tool_approval() when no durable approval row exists, keeping the
+    in-memory pending entry intact and causing zero side effects.
+    """
+    from core.context import ExecutionContext
+
+    env = await _setup_approval_auth_env(tmp_path, monkeypatch)
+    stack = env["stack"]
+    assert stack.approval_store is not None
+
+    started = await server.start_coder_session("owner session", project_id="proj-owner-alpha")
+    sid = str(started["session_id"])
+    await server.next_coder_command(sid)
+    await server.next_coder_command(sid)
+
+    tool_call_id = "call-in-memory-without-durable-row"
+    stack.agent._pending_approvals[(sid, tool_call_id)] = (
+        "auth_destructive_op",
+        {"value": 456},
+        ExecutionContext(workspace_id="proj-owner-alpha", project_id="proj-owner-alpha"),
+    )
+    assert await stack.approval_store.get(tool_call_id) is None
+
+    history_before = await env["conversation_store"].history("proj-owner-alpha", sid)
+    resolve_calls: list[object] = []
+    submit_calls: list[object] = []
+    orig_resolve = stack.agent.resolve_tool_approval
+    orig_submit = stack.orchestrator.submit_tool_result
+
+    async def spy_resolve(*args, **kwargs):
+        resolve_calls.append(args)
+        return await orig_resolve(*args, **kwargs)
+
+    async def spy_submit(*args, **kwargs):
+        submit_calls.append(args)
+        return await orig_submit(*args, **kwargs)
+
+    monkeypatch.setattr(stack.agent, "resolve_tool_approval", spy_resolve)
+    monkeypatch.setattr(stack.orchestrator, "submit_tool_result", spy_submit)
+
+    for approved_flag in (True, False):
+        with pytest.raises(KeyError, match="no pending approval for tool call"):
+            await server.resolve_coder_approval(
+                session_id=sid,
+                tool_call_id=tool_call_id,
+                approved=approved_flag,
+            )
+
+    assert resolve_calls == []
+    assert submit_calls == []
+    assert env["tool_calls"] == []
+    assert (sid, tool_call_id) in stack.agent._pending_approvals
+    assert await stack.approval_store.get(tool_call_id) is None
+
+    history_after = await env["conversation_store"].history("proj-owner-alpha", sid)
+    assert len(history_after) == len(history_before)
+
+    await server.publish_coder_event(session_id=sid, event_type="stop", payload={"reason": "done"})
+    await asyncio.wait_for(server._coder_tasks[sid], timeout=1)
