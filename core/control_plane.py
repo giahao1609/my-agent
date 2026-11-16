@@ -22,6 +22,7 @@ from .plan_service import PlanService
 from .plan_step_execution_coordinator import PlanStepExecutionCoordinator
 from .plan_store import PlanStore
 from .planning_coordinator import PlanningCoordinator
+from .security_authorization import SecurityAuthorizationError
 from .specialist_execution import (
     SpecialistExecutionResult,
     SpecialistRouter,
@@ -112,46 +113,129 @@ class MyAgentControlPlane:
     def user_model_engine(self) -> UserModelEngine | None:
         return self._user_model_engine
 
+    async def _authorize_task_id(
+        self,
+        task_id: str | None,
+        project_id: str,
+    ) -> tuple[str | None, TaskRecord | None]:
+        """Verifies caller-supplied task_id belongs to project_id without existence disclosure."""
+        if task_id is None:
+            return None, None
+        trimmed = task_id.strip()
+        if not trimmed:
+            raise ValueError("task_id must not be blank.")
+        task = await self._task_store.get(trimmed)
+        if task is None or task.project_id != project_id:
+            raise SecurityAuthorizationError(
+                f"TASK_ACCESS_DENIED: Requested task is not accessible in authorized project '{project_id}'.",
+                authorized_project_id=project_id,
+                violation_type="UNAUTHORIZED_ACCESS",
+            )
+        return trimmed, task
+
+    async def _authorize_decision_selection(
+        self,
+        selected_decision: dict[str, str],
+        project_id: str,
+        expected_task_id: str | None,
+    ) -> tuple[str, str]:
+        """Verifies decision ownership against project_id without existence disclosure."""
+        raw_dec_id = selected_decision.get("decision_id")
+        raw_opt_id = selected_decision.get("option_id")
+        dec_id = raw_dec_id.strip() if isinstance(raw_dec_id, str) else ""
+        opt_id = raw_opt_id.strip() if isinstance(raw_opt_id, str) else ""
+        if not dec_id or not opt_id:
+            raise ValueError("selected_decision must include non-empty decision_id and option_id.")
+
+        decision = await self._decision_service.get_decision(dec_id)
+        dec_task = await self._task_store.get(decision.task_id) if decision is not None else None
+        if (
+            decision is None
+            or dec_task is None
+            or dec_task.project_id != project_id
+            or (expected_task_id is not None and decision.task_id != expected_task_id)
+        ):
+            raise SecurityAuthorizationError(
+                f"DECISION_ACCESS_DENIED: Requested decision is not accessible in authorized project '{project_id}'.",
+                authorized_project_id=project_id,
+                violation_type="UNAUTHORIZED_ACCESS",
+            )
+        return dec_id, opt_id
+
+    async def _authorize_approval_response(
+        self,
+        approval_response: dict[str, Any],
+        project_id: str,
+        expected_task_id: str | None,
+    ) -> tuple[str, bool]:
+        """Verifies approval ownership against project_id without existence disclosure."""
+        raw_call_id = approval_response.get("tool_call_id")
+        call_id = raw_call_id.strip() if isinstance(raw_call_id, str) else ""
+        if not call_id:
+            raise ValueError("approval_response must include a non-empty tool_call_id.")
+
+        approval = await self._approval_store.get(call_id)
+        app_project_id = approval.get("project_id") if approval is not None else None
+        app_task_id = approval.get("task_id") if approval is not None else None
+        app_task = (
+            await self._task_store.get(app_task_id)
+            if isinstance(app_task_id, str) and app_task_id.strip()
+            else None
+        )
+        has_anchor = bool(app_project_id) or bool(app_task_id)
+        project_matches = not app_project_id or app_project_id == project_id
+        task_matches = not app_task_id or (app_task is not None and app_task.project_id == project_id)
+        expected_task_matches = expected_task_id is None or app_task_id == expected_task_id
+        if approval is None or not (has_anchor and project_matches and task_matches and expected_task_matches):
+            raise SecurityAuthorizationError(
+                f"APPROVAL_ACCESS_DENIED: Requested approval is not accessible in authorized project '{project_id}'.",
+                authorized_project_id=project_id,
+                violation_type="UNAUTHORIZED_ACCESS",
+            )
+        return call_id, bool(approval_response.get("approved", False))
+
     async def submit_user_request(
         self,
         request: FrontAgentRequest,
     ) -> tuple[ResponseKind, str, FrontAgentProgress | None, DecisionRecord | None, dict[str, Any] | None, FrontAgentResultSummary | None]:
         """Unified entry point for user requests from the Front Agent."""
+        # 0. Enforce task ownership before any decision/approval mutation or lookup
+        task_id, task = await self._authorize_task_id(request.task_id, request.project_id)
+
         # 1. Handle user decision resolution if present
-        if request.selected_decision:
-            dec_id = request.selected_decision.get("decision_id")
-            opt_id = request.selected_decision.get("option_id")
-            if dec_id and opt_id:
-                resolved_dec = await self.resolve_user_decision(
-                    decision_id=dec_id,
-                    option_id=opt_id,
-                    rationale=request.user_input,
-                )
-                progress = await self.get_progress(resolved_dec.task_id)
-                msg = f"Đã ghi nhận lựa chọn '{opt_id}' cho quyết định '{dec_id}'. Tiếp tục tiến trình."
-                return ResponseKind.PROGRESS, msg, progress, None, None, None
+        if request.selected_decision is not None:
+            dec_id, opt_id = await self._authorize_decision_selection(
+                request.selected_decision,
+                request.project_id,
+                task_id,
+            )
+            resolved_dec = await self.resolve_user_decision(
+                decision_id=dec_id,
+                option_id=opt_id,
+                rationale=request.user_input,
+            )
+            progress = await self.get_progress(resolved_dec.task_id)
+            msg = f"Đã ghi nhận lựa chọn '{opt_id}' cho quyết định '{dec_id}'. Tiếp tục tiến trình."
+            return ResponseKind.PROGRESS, msg, progress, None, None, None
 
         # 2. Handle user approval resolution if present
-        if request.approval_response:
-            call_id = request.approval_response.get("tool_call_id")
-            approved = bool(request.approval_response.get("approved", False))
-            if call_id:
-                app_res = await self.resolve_user_approval(
-                    tool_call_id=call_id,
-                    approved=approved,
-                    rationale=request.user_input,
-                )
-                status_txt = "phê duyệt" if approved else "từ chối"
-                msg = f"Đã {status_txt} thao tác '{call_id}'."
-                progress = await self.get_progress(request.task_id) if request.task_id else None
-                return ResponseKind.PROGRESS, msg, progress, None, None, None
+        if request.approval_response is not None:
+            call_id, approved = await self._authorize_approval_response(
+                request.approval_response,
+                request.project_id,
+                task_id,
+            )
+            await self.resolve_user_approval(
+                tool_call_id=call_id,
+                approved=approved,
+                rationale=request.user_input,
+            )
+            status_txt = "phê duyệt" if approved else "từ chối"
+            msg = f"Đã {status_txt} thao tác '{call_id}'."
+            progress = await self.get_progress(task_id) if task_id else None
+            return ResponseKind.PROGRESS, msg, progress, None, None, None
 
-        # 3. Retrieve or create Task
-        task_id = request.task_id
-        task: TaskRecord | None = None
-        if task_id:
-            task = await self._task_store.get(task_id)
-
+        # 3. Create Task only when no task_id was provided
         if task is None:
             new_task_id = f"task-{uuid.uuid4().hex[:8]}"
             task = await self._task_service.create_task(
