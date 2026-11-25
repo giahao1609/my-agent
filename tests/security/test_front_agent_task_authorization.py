@@ -1,9 +1,11 @@
-"""Focused security regression suite for Front Agent and Control Plane authorization (SEC-01 .. SEC-13)."""
+"""Focused security regression suite for Front Agent and Control Plane authorization (SEC-01 .. SEC-18)."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -711,7 +713,20 @@ async def test_sec_12_authorized_same_project_decision_and_approval_succeed(
         approval_response={"tool_call_id": "call-alpha-1", "approved": True},
     )
     assert app_res["status"] == "ok"
-    assert await sqlite_approvals.get("call-alpha-1") is None
+    resolved_row = await sqlite_approvals.get("call-alpha-1")
+    assert resolved_row is not None
+    assert resolved_row["status"] == "APPROVED"
+    assert resolved_row["resolved_at"] is not None
+    assert "Approve widget write" in (resolved_row["resolution_note"] or "")
+
+    # Subsequent task status check must not re-present the already-approved call as PENDING.
+    follow_up = await server.front_agent_request(
+        user_input="Check Alpha task status",
+        project_id="proj-alpha",
+        task_id="task-alpha-1",
+    )
+    assert follow_up["status"] == "ok"
+    assert follow_up["response"]["kind"] == ResponseKind.MESSAGE.value
 
 
 @pytest.mark.asyncio
@@ -794,3 +809,346 @@ async def test_sec_13_mcp_wire_call_tool_positive_and_negative_acceptance(
         )
     assert str(app_unknown.value) == str(app_foreign.value)
     assert await sqlite_approvals.get("call-beta-wire") is not None
+
+
+@pytest.mark.asyncio
+async def test_sec_14_sqlite_approval_lifecycle_replay_expiry_and_race_protection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    env = await _setup_two_project_control_plane(tmp_path)
+    sqlite_approvals = SqlitePendingApprovalStore(env["db_path"])
+    await sqlite_approvals.initialize()
+    env["approval_store"] = sqlite_approvals
+    cp = MyAgentControlPlane(
+        task_store=env["tasks"],
+        task_service=env["task_service"],
+        plan_store=env["plans"],
+        plan_service=PlanService(plan_store=env["plans"], task_store=env["tasks"]),
+        decision_service=env["decision_service"],
+        approval_store=sqlite_approvals,
+    )
+    _patch_front_agent_mcp_server(monkeypatch, env, workspace_root=env["ws_alpha"])
+
+    # 1. Rejection preserves SQLite row with REJECTED status and blocks replay.
+    await sqlite_approvals.save(
+        {
+            "tool_call_id": "call-alpha-reject",
+            "task_id": "task-alpha-1",
+            "project_id": "proj-alpha",
+            "tool_name": "run_command",
+            "arguments": {"cmd": "ls"},
+        }
+    )
+    rej_res = await server.front_agent_request(
+        user_input="Do not run",
+        project_id="proj-alpha",
+        task_id="task-alpha-1",
+        approval_response={"tool_call_id": "call-alpha-reject", "approved": False},
+    )
+    assert rej_res["status"] == "ok"
+    rej_row = await sqlite_approvals.get("call-alpha-reject")
+    assert rej_row is not None and rej_row["status"] == "REJECTED"
+
+    # Replaying terminal approval fails closed without deleting or changing status.
+    with pytest.raises((ValueError, PermissionError)):
+        await server.front_agent_request(
+            user_input="Replay reject as approve",
+            project_id="proj-alpha",
+            task_id="task-alpha-1",
+            approval_response={"tool_call_id": "call-alpha-reject", "approved": True},
+        )
+    after_replay = await sqlite_approvals.get("call-alpha-reject")
+    assert after_replay is not None and after_replay["status"] == "REJECTED"
+
+    # 2. Expired TTL approval fails closed, persists as EXPIRED, and is never deleted.
+    past_iso = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    await sqlite_approvals.save(
+        {
+            "tool_call_id": "call-alpha-expired",
+            "task_id": "task-alpha-1",
+            "project_id": "proj-alpha",
+            "tool_name": "write_file",
+            "arguments": {"path": "x.py"},
+            "expires_at": past_iso,
+        }
+    )
+    with pytest.raises((PermissionError, ValueError)):
+        await server.front_agent_request(
+            user_input="Approve stale call",
+            project_id="proj-alpha",
+            task_id="task-alpha-1",
+            approval_response={"tool_call_id": "call-alpha-expired", "approved": True},
+        )
+    exp_row = await sqlite_approvals.get("call-alpha-expired")
+    assert exp_row is not None and exp_row["status"] == "EXPIRED"
+
+    # Also test already-marked EXPIRED row cannot be deleted/resolved.
+    with pytest.raises((PermissionError, ValueError)):
+        await cp.submit_user_request(
+            FrontAgentRequest(
+                user_input="Retry expired",
+                project_id="proj-alpha",
+                task_id="task-alpha-1",
+                approval_response={"tool_call_id": "call-alpha-expired", "approved": True},
+            )
+        )
+    assert await sqlite_approvals.get("call-alpha-expired") is not None
+
+    # 3. Concurrent race: exactly one resolution succeeds; loser fails closed without corrupting state.
+    await sqlite_approvals.save(
+        {
+            "tool_call_id": "call-alpha-race",
+            "task_id": "task-alpha-1",
+            "project_id": "proj-alpha",
+            "tool_name": "deploy_local",
+            "arguments": {},
+        }
+    )
+    race_results = await asyncio.gather(
+        server.front_agent_request(
+            user_input="Approve race",
+            project_id="proj-alpha",
+            task_id="task-alpha-1",
+            approval_response={"tool_call_id": "call-alpha-race", "approved": True},
+        ),
+        server.front_agent_request(
+            user_input="Reject race",
+            project_id="proj-alpha",
+            task_id="task-alpha-1",
+            approval_response={"tool_call_id": "call-alpha-race", "approved": False},
+        ),
+        return_exceptions=True,
+    )
+    successes = [r for r in race_results if isinstance(r, dict) and r.get("status") == "ok"]
+    failures = [r for r in race_results if isinstance(r, Exception)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    race_row = await sqlite_approvals.get("call-alpha-race")
+    assert race_row is not None and race_row["status"] in {"APPROVED", "REJECTED"}
+
+
+@pytest.mark.asyncio
+async def test_sec_15_in_memory_approval_store_blocks_unscoped_leak_and_preserves_scoped_legacy(
+    tmp_path: Path,
+) -> None:
+    env = await _setup_two_project_control_plane(tmp_path)
+    mem_store: InMemoryPendingApprovalStore = env["approval_store"]
+    cp: MyAgentControlPlane = env["control_plane"]
+
+    # 1. Unscoped in-memory record must NEVER appear under unrelated tasks.
+    await mem_store.save(
+        {
+            "tool_call_id": "call-unscoped-mem",
+            "tool_name": "dangerous_op",
+            "arguments": {},
+        }
+    )
+    assert await mem_store.list_by_task("task-alpha-1") == []
+    assert await mem_store.list_by_task("task-beta-secret") == []
+    assert await cp.get_pending_interaction("task-alpha-1") is None
+
+    kind, _msg, _prog, _dec, app, _res = await cp.submit_user_request(
+        FrontAgentRequest(
+            user_input="Check Alpha task",
+            project_id="proj-alpha",
+            task_id="task-alpha-1",
+        )
+    )
+    assert kind == ResponseKind.MESSAGE
+    assert app is None
+
+    # 2. Explicitly task-scoped legacy registration preserves in-memory flow + durable status retention.
+    await cp.register_pending_approval(
+        tool_call_id="call-alpha-mem-1",
+        tool_name="delete_cache",
+        arguments={"path": "tmp/"},
+        task_id="task-alpha-1",
+    )
+    pending = await cp.get_pending_interaction("task-alpha-1")
+    assert pending is not None and pending["type"] == "approval"
+    assert pending["approval"]["tool_call_id"] == "call-alpha-mem-1"
+
+    res_kind, _msg, _prog, _dec, _app, _res = await cp.submit_user_request(
+        FrontAgentRequest(
+            user_input="Approve memory action",
+            project_id="proj-alpha",
+            task_id="task-alpha-1",
+            approval_response={"tool_call_id": "call-alpha-mem-1", "approved": True},
+        )
+    )
+    assert res_kind == ResponseKind.PROGRESS
+    mem_record = await mem_store.get("call-alpha-mem-1")
+    assert mem_record is not None and mem_record["status"] == "APPROVED"
+    assert await cp.get_pending_interaction("task-alpha-1") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_approved",
+    ["false", "true", "0", "1", 1, 0, None, ["true"], {"value": True}],
+)
+async def test_sec_16_approval_response_requires_strict_boolean_approved(
+    tmp_path: Path, monkeypatch, bad_approved
+) -> None:
+    env = await _setup_two_project_control_plane(tmp_path)
+    sqlite_approvals = SqlitePendingApprovalStore(env["db_path"])
+    await sqlite_approvals.initialize()
+    env["approval_store"] = sqlite_approvals
+    cp = MyAgentControlPlane(
+        task_store=env["tasks"],
+        task_service=env["task_service"],
+        plan_store=env["plans"],
+        plan_service=PlanService(plan_store=env["plans"], task_store=env["tasks"]),
+        decision_service=env["decision_service"],
+        approval_store=sqlite_approvals,
+    )
+    _patch_front_agent_mcp_server(monkeypatch, env, workspace_root=env["ws_alpha"])
+
+    await sqlite_approvals.save(
+        {
+            "tool_call_id": "call-alpha-bool",
+            "task_id": "task-alpha-1",
+            "project_id": "proj-alpha",
+            "tool_name": "write_file",
+            "arguments": {},
+        }
+    )
+
+    with pytest.raises(ValueError, match="approved"):
+        await cp.submit_user_request(
+            FrontAgentRequest(
+                user_input="Bad bool cp",
+                project_id="proj-alpha",
+                task_id="task-alpha-1",
+                approval_response={"tool_call_id": "call-alpha-bool", "approved": bad_approved},
+            )
+        )
+
+    with pytest.raises(ValueError, match="approved"):
+        await server.front_agent_request(
+            user_input="Bad bool mcp",
+            project_id="proj-alpha",
+            task_id="task-alpha-1",
+            approval_response={"tool_call_id": "call-alpha-bool", "approved": bad_approved},
+        )
+
+    # Also test completely missing 'approved' key.
+    with pytest.raises(ValueError, match="approved"):
+        await server.front_agent_request(
+            user_input="Missing approved key",
+            project_id="proj-alpha",
+            task_id="task-alpha-1",
+            approval_response={"tool_call_id": "call-alpha-bool"},
+        )
+
+    row = await sqlite_approvals.get("call-alpha-bool")
+    assert row is not None and row["status"] == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_sec_17_terminal_and_expired_approvals_never_presented_as_pending(
+    tmp_path: Path, monkeypatch
+) -> None:
+    env = await _setup_two_project_control_plane(tmp_path)
+    sqlite_approvals = SqlitePendingApprovalStore(env["db_path"])
+    await sqlite_approvals.initialize()
+    env["approval_store"] = sqlite_approvals
+    cp = MyAgentControlPlane(
+        task_store=env["tasks"],
+        task_service=env["task_service"],
+        plan_store=env["plans"],
+        plan_service=PlanService(plan_store=env["plans"], task_store=env["tasks"]),
+        decision_service=env["decision_service"],
+        approval_store=sqlite_approvals,
+    )
+    _patch_front_agent_mcp_server(monkeypatch, env, workspace_root=env["ws_alpha"])
+
+    past_iso = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+    await sqlite_approvals.save(
+        {
+            "tool_call_id": "call-term-approved",
+            "task_id": "task-alpha-1",
+            "project_id": "proj-alpha",
+            "tool_name": "op1",
+            "status": "APPROVED",
+        }
+    )
+    await sqlite_approvals.save(
+        {
+            "tool_call_id": "call-term-rejected",
+            "task_id": "task-alpha-1",
+            "project_id": "proj-alpha",
+            "tool_name": "op2",
+            "status": "REJECTED",
+        }
+    )
+    await sqlite_approvals.save(
+        {
+            "tool_call_id": "call-term-expired",
+            "task_id": "task-alpha-1",
+            "project_id": "proj-alpha",
+            "tool_name": "op3",
+            "status": "EXPIRED",
+            "expires_at": past_iso,
+        }
+    )
+    await sqlite_approvals.save(
+        {
+            "tool_call_id": "call-ttl-elapsed-pending",
+            "task_id": "task-alpha-1",
+            "project_id": "proj-alpha",
+            "tool_name": "op4",
+            "status": "PENDING",
+            "expires_at": past_iso,
+        }
+    )
+
+    assert await cp.get_pending_interaction("task-alpha-1") is None
+    res = await server.front_agent_request(
+        user_input="What is the task status?",
+        project_id="proj-alpha",
+        task_id="task-alpha-1",
+    )
+    assert res["status"] == "ok"
+    assert res["response"]["kind"] == ResponseKind.MESSAGE.value
+    assert res["response"]["approval_view"] is None
+
+
+@pytest.mark.asyncio
+async def test_sec_18_resolve_user_approval_direct_fails_closed_on_missing_or_foreign(
+    tmp_path: Path,
+) -> None:
+    env = await _setup_two_project_control_plane(tmp_path)
+    sqlite_approvals = SqlitePendingApprovalStore(env["db_path"])
+    await sqlite_approvals.initialize()
+    cp = MyAgentControlPlane(
+        task_store=env["tasks"],
+        task_service=env["task_service"],
+        plan_store=env["plans"],
+        plan_service=PlanService(plan_store=env["plans"], task_store=env["tasks"]),
+        decision_service=env["decision_service"],
+        approval_store=sqlite_approvals,
+    )
+
+    await sqlite_approvals.save(
+        {
+            "tool_call_id": "call-beta-direct",
+            "task_id": "task-beta-secret",
+            "project_id": "proj-beta",
+            "tool_name": "secret_op",
+            "arguments": {},
+        }
+    )
+
+    # Missing tool_call_id must raise KeyError, never report "resolved".
+    with pytest.raises(KeyError, match="no pending approval"):
+        await cp.resolve_user_approval("call-missing-direct", approved=True, project_id="proj-alpha")
+
+    # Cross-project / cross-task scope mismatch fails closed atomically without mutating Beta's row.
+    with pytest.raises(ValueError):
+        await cp.resolve_user_approval("call-beta-direct", approved=True, project_id="proj-alpha")
+    with pytest.raises(ValueError):
+        await cp.resolve_user_approval("call-beta-direct", approved=True, task_id="task-alpha-1")
+
+    beta_row = await sqlite_approvals.get("call-beta-direct")
+    assert beta_row is not None and beta_row["status"] == "PENDING"

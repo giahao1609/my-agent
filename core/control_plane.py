@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Mapping
+from datetime import UTC, datetime
+import inspect
 import uuid
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -32,6 +36,53 @@ from .task_service import TaskService
 from .task_store import TaskStore
 
 
+DEFAULT_APPROVAL_MAX_AGE_SECONDS: float = 86400.0
+
+
+def _is_approval_expired(
+    approval: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+    default_max_age_seconds: float = DEFAULT_APPROVAL_MAX_AGE_SECONDS,
+) -> bool:
+    """Checks expires_at / created_at TTL against UTC now using SqlitePendingApprovalStore semantics."""
+    ref_now = now or datetime.now(UTC)
+    expires_at_str = approval.get("expires_at")
+    if expires_at_str:
+        try:
+            exp_dt = datetime.fromisoformat(str(expires_at_str))
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=UTC)
+            return ref_now >= exp_dt
+        except (ValueError, TypeError):
+            pass
+
+    created_at_str = approval.get("created_at")
+    if created_at_str:
+        try:
+            created_dt = datetime.fromisoformat(str(created_at_str))
+            if created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=UTC)
+            return (ref_now - created_dt).total_seconds() >= default_max_age_seconds
+        except (ValueError, TypeError):
+            pass
+    return False
+
+
+def validate_approval_response_payload(approval_response: Mapping[str, Any]) -> tuple[str, bool]:
+    """Validates tool_call_id and strict boolean 'approved' without truthiness coercion."""
+    if not isinstance(approval_response, Mapping):
+        raise ValueError("approval_response must be a mapping.")
+    raw_call_id = approval_response.get("tool_call_id")
+    call_id = raw_call_id.strip() if isinstance(raw_call_id, str) else ""
+    if not call_id:
+        raise ValueError("approval_response must include a non-empty tool_call_id.")
+    raw_approved = approval_response.get("approved")
+    if not isinstance(raw_approved, bool):
+        raise ValueError("approval_response['approved'] must be an explicit boolean.")
+    return call_id, raw_approved
+
+
 class PendingApprovalStore(Protocol):
     """Async store interface for durable pending tool approval requests."""
 
@@ -49,26 +100,105 @@ class InMemoryPendingApprovalStore:
     pending approvals survive process restarts and host switches.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, default_max_age_seconds: float = DEFAULT_APPROVAL_MAX_AGE_SECONDS) -> None:
         self._store: dict[str, dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+        self._default_max_age_seconds = default_max_age_seconds
+
+    def is_expired(self, approval: Mapping[str, Any], now: datetime | None = None) -> bool:
+        """Determines whether an approval record has exceeded its expiration TTL."""
+        return _is_approval_expired(
+            approval,
+            now=now,
+            default_max_age_seconds=self._default_max_age_seconds,
+        )
 
     async def save(self, approval: dict[str, Any]) -> None:
-        self._store[approval["tool_call_id"]] = approval
+        async with self._lock:
+            record = dict(approval)
+            record.setdefault("status", "PENDING")
+            record.setdefault("created_at", datetime.now(UTC).isoformat())
+            self._store[record["tool_call_id"]] = record
 
     async def get(self, tool_call_id: str) -> dict[str, Any] | None:
-        return self._store.get(tool_call_id)
+        async with self._lock:
+            rec = self._store.get(tool_call_id)
+            return dict(rec) if rec is not None else None
 
-    async def list_by_task(self, task_id: str) -> list[dict[str, Any]]:
-        return [
-            app for app in self._store.values()
-            if app.get("task_id") == task_id or not app.get("task_id")
-        ]
+    async def list_by_task(self, task_id: str, *, active_only: bool = False) -> list[dict[str, Any]]:
+        async with self._lock:
+            now_dt = datetime.now(UTC)
+            matches = [
+                dict(app)
+                for app in self._store.values()
+                if isinstance(app.get("task_id"), str) and app.get("task_id") == task_id
+            ]
+            if active_only:
+                matches = [
+                    app for app in matches
+                    if app.get("status", "PENDING") == "PENDING"
+                    and not self.is_expired(app, now_dt)
+                ]
+            return matches
 
     async def list_all(self) -> list[dict[str, Any]]:
-        return list(self._store.values())
+        async with self._lock:
+            return [dict(app) for app in self._store.values()]
 
     async def delete(self, tool_call_id: str) -> dict[str, Any] | None:
-        return self._store.pop(tool_call_id, None)
+        async with self._lock:
+            return self._store.pop(tool_call_id, None)
+
+    async def claim_and_resolve(
+        self,
+        tool_call_id: str,
+        *,
+        status: str = "APPROVED",
+        session_id: str | None = None,
+        project_id: str | None = None,
+        task_id: str | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Atomically validates scope/TTL/PENDING state and transitions approval status in place."""
+        if status not in {"APPROVED", "REJECTED"}:
+            raise ValueError(f"invalid resolution status: {status}")
+        async with self._lock:
+            rec = self._store.get(tool_call_id)
+            if rec is None:
+                raise KeyError(f"no pending approval for tool call: {tool_call_id}")
+            if session_id and rec.get("session_id") and rec.get("session_id") != session_id:
+                raise ValueError(
+                    f"Approval session mismatch: {rec.get('session_id')} != {session_id}"
+                )
+            if project_id and rec.get("project_id") and rec.get("project_id") != project_id:
+                raise ValueError(
+                    f"Approval project mismatch: {rec.get('project_id')} != {project_id}"
+                )
+            if task_id and rec.get("task_id") != task_id:
+                raise ValueError(
+                    f"Approval task mismatch: {rec.get('task_id')} != {task_id}"
+                )
+
+            now_dt = datetime.now(UTC)
+            now_iso = now_dt.isoformat()
+            curr_status = rec.get("status", "PENDING")
+            if self.is_expired(rec, now_dt):
+                if curr_status != "EXPIRED":
+                    rec["status"] = "EXPIRED"
+                    rec["resolved_at"] = now_iso
+                    rec["resolution_note"] = "Approval TTL expired prior to execution"
+                raise PermissionError(
+                    f"Approval for tool call {tool_call_id} has expired (TTL elapsed)"
+                )
+            if curr_status != "PENDING":
+                raise ValueError(
+                    f"Approval for tool call {tool_call_id} is in non-pending state: {curr_status}"
+                )
+
+            rec["status"] = status
+            rec["resolved_at"] = now_iso
+            rec["resolution_note"] = note
+            return dict(rec)
 
 
 class MyAgentControlPlane:
@@ -167,12 +297,9 @@ class MyAgentControlPlane:
         approval_response: dict[str, Any],
         project_id: str,
         expected_task_id: str | None,
-    ) -> tuple[str, bool]:
-        """Verifies approval ownership against project_id without existence disclosure."""
-        raw_call_id = approval_response.get("tool_call_id")
-        call_id = raw_call_id.strip() if isinstance(raw_call_id, str) else ""
-        if not call_id:
-            raise ValueError("approval_response must include a non-empty tool_call_id.")
+    ) -> tuple[str, bool, str | None]:
+        """Validates approval payload and ownership against project_id without existence disclosure."""
+        call_id, approved_flag = validate_approval_response_payload(approval_response)
 
         approval = await self._approval_store.get(call_id)
         app_project_id = approval.get("project_id") if approval is not None else None
@@ -192,7 +319,36 @@ class MyAgentControlPlane:
                 authorized_project_id=project_id,
                 violation_type="UNAUTHORIZED_ACCESS",
             )
-        return call_id, bool(approval_response.get("approved", False))
+        scoped_task_id = app_task_id if isinstance(app_task_id, str) and app_task_id.strip() else None
+        return call_id, approved_flag, scoped_task_id
+
+    async def _list_active_approvals_for_task(self, task_id: str) -> list[dict[str, Any]]:
+        """Returns only task-scoped, PENDING, non-expired approvals for presentation."""
+        list_fn = self._approval_store.list_by_task
+        supports_active_only = "active_only" in inspect.signature(list_fn).parameters
+        records = (
+            await list_fn(task_id, active_only=True)
+            if supports_active_only
+            else await list_fn(task_id)
+        )
+        store_is_expired = getattr(self._approval_store, "is_expired", None)
+        now_dt = datetime.now(UTC)
+        active: list[dict[str, Any]] = []
+        for app in records:
+            if not isinstance(app, Mapping):
+                continue
+            if app.get("task_id") != task_id:
+                continue
+            if app.get("status", "PENDING") != "PENDING":
+                continue
+            expired = (
+                bool(store_is_expired(app, now_dt))
+                if callable(store_is_expired)
+                else _is_approval_expired(app, now=now_dt)
+            )
+            if not expired:
+                active.append(dict(app))
+        return active
 
     async def submit_user_request(
         self,
@@ -220,7 +376,7 @@ class MyAgentControlPlane:
 
         # 2. Handle user approval resolution if present
         if request.approval_response is not None:
-            call_id, approved = await self._authorize_approval_response(
+            call_id, approved, scoped_task_id = await self._authorize_approval_response(
                 request.approval_response,
                 request.project_id,
                 task_id,
@@ -229,6 +385,8 @@ class MyAgentControlPlane:
                 tool_call_id=call_id,
                 approved=approved,
                 rationale=request.user_input,
+                project_id=request.project_id,
+                task_id=task_id or scoped_task_id,
             )
             status_txt = "phê duyệt" if approved else "từ chối"
             msg = f"Đã {status_txt} thao tác '{call_id}'."
@@ -253,8 +411,8 @@ class MyAgentControlPlane:
             msg = f"Tác vụ đang tạm dừng chờ bạn chọn phương án giải quyết cho: '{open_dec.prompt}'"
             return ResponseKind.DECISION_REQUIRED, msg, progress, open_dec, None, None
 
-        # 4b. Check for any pending approvals on this task
-        task_approvals = await self._approval_store.list_by_task(task_id)
+        # 4b. Check for any active PENDING non-expired approvals on this task
+        task_approvals = await self._list_active_approvals_for_task(task_id)
         if task_approvals:
             app = task_approvals[0]
             progress = await self.get_progress(task_id)
@@ -378,7 +536,7 @@ class MyAgentControlPlane:
                 "type": "decision",
                 "decision": dec.to_dict(),
             }
-        for app in await self._approval_store.list_by_task(task_id):
+        for app in await self._list_active_approvals_for_task(task_id):
             return {
                 "type": "approval",
                 "approval": app,
@@ -403,15 +561,72 @@ class MyAgentControlPlane:
         tool_call_id: str,
         approved: bool,
         rationale: str = "",
+        *,
+        project_id: str | None = None,
+        task_id: str | None = None,
     ) -> dict[str, Any]:
-        """Resolves tool execution approval and removes it from the durable store."""
-        popped = await self._approval_store.delete(tool_call_id)
+        """Atomically resolves a PENDING non-expired approval while preserving durable history."""
+        if not isinstance(approved, bool):
+            raise ValueError("approved must be an explicit boolean.")
+        call_id = tool_call_id.strip() if isinstance(tool_call_id, str) else ""
+        if not call_id:
+            raise ValueError("tool_call_id must not be blank.")
+
+        target_status = "APPROVED" if approved else "REJECTED"
+        claim_fn = getattr(self._approval_store, "claim_and_resolve", None)
+        if callable(claim_fn):
+            claim_params = inspect.signature(claim_fn).parameters
+            kwargs: dict[str, Any] = {
+                "status": target_status,
+                "project_id": project_id,
+                "note": rationale,
+            }
+            if "task_id" in claim_params:
+                kwargs["task_id"] = task_id
+            elif task_id:
+                existing = await self._approval_store.get(call_id)
+                if existing is not None and existing.get("task_id") != task_id:
+                    raise ValueError(f"Approval task mismatch: {existing.get('task_id')} != {task_id}")
+            resolved = await claim_fn(call_id, **kwargs)
+            if not isinstance(resolved, Mapping) or resolved.get("status") != target_status:
+                raise ValueError(f"Approval {call_id} failed valid transition to {target_status}")
+            return {
+                "tool_call_id": call_id,
+                "approved": approved,
+                "rationale": rationale,
+                "status": "resolved",
+                "resolution_status": target_status,
+                "approval": dict(resolved),
+            }
+
+        # Fallback for minimal custom PendingApprovalStore test doubles lacking claim_and_resolve.
+        existing = await self._approval_store.get(call_id)
+        if existing is None:
+            raise KeyError(f"no pending approval for tool call: {call_id}")
+        if project_id and existing.get("project_id") and existing.get("project_id") != project_id:
+            raise ValueError(f"Approval project mismatch: {existing.get('project_id')} != {project_id}")
+        if task_id and existing.get("task_id") != task_id:
+            raise ValueError(f"Approval task mismatch: {existing.get('task_id')} != {task_id}")
+        if _is_approval_expired(existing):
+            raise PermissionError(f"Approval for tool call {call_id} has expired (TTL elapsed)")
+        if existing.get("status", "PENDING") != "PENDING":
+            raise ValueError(
+                f"Approval for tool call {call_id} is in non-pending state: {existing.get('status')}"
+            )
+        updated = {
+            **existing,
+            "status": target_status,
+            "resolved_at": datetime.now(UTC).isoformat(),
+            "resolution_note": rationale,
+        }
+        await self._approval_store.save(updated)
         return {
-            "tool_call_id": tool_call_id,
+            "tool_call_id": call_id,
             "approved": approved,
             "rationale": rationale,
             "status": "resolved",
-            "previous_approval": popped,
+            "resolution_status": target_status,
+            "approval": updated,
         }
 
     async def get_result(self, task_id: str) -> FrontAgentResultSummary | None:

@@ -119,7 +119,7 @@ from core.decision import DecisionOption, DecisionRecord, DecisionSeverity, Deci
 from core.decision_service import DecisionService
 from persistence.sqlite_decision_store import SQLiteDecisionStore
 from core.front_agent import FrontAgent, FrontAgentRequest, PresentationLevel, ResponseKind
-from core.control_plane import MyAgentControlPlane
+from core.control_plane import MyAgentControlPlane, validate_approval_response_payload
 
 # Cross-Agent Durable Execution Ledger & Handoff
 from core.agent_role import AgentRole
@@ -4101,10 +4101,7 @@ async def _authorize_front_agent_inputs(
 
     normalized_approval = approval_response
     if approval_response is not None:
-        raw_call_id = approval_response.get("tool_call_id")
-        call_id = raw_call_id.strip() if isinstance(raw_call_id, str) else ""
-        if not call_id:
-            raise ValueError("approval_response must include a non-empty tool_call_id.")
+        call_id, approved_flag = validate_approval_response_payload(approval_response)
         approval = await pending_approvals.get(call_id)
         if approval is None:
             raise _deny_front_agent_resource(
@@ -4137,7 +4134,7 @@ async def _authorize_front_agent_inputs(
                 audit_reason="CROSS_PROJECT_IDOR_APPROVAL_ACCESS_FORBIDDEN",
                 foreign_project_id=foreign_proj,
             )
-        normalized_approval = {**approval_response, "tool_call_id": call_id}
+        normalized_approval = {"tool_call_id": call_id, "approved": approved_flag}
 
     return normalized_task_id, normalized_decision, normalized_approval
 
