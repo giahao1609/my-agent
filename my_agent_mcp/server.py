@@ -119,7 +119,7 @@ from core.decision import DecisionOption, DecisionRecord, DecisionSeverity, Deci
 from core.decision_service import DecisionService
 from persistence.sqlite_decision_store import SQLiteDecisionStore
 from core.front_agent import FrontAgent, FrontAgentRequest, PresentationLevel, ResponseKind
-from core.control_plane import MyAgentControlPlane
+from core.control_plane import MyAgentControlPlane, validate_approval_response_payload
 
 # Cross-Agent Durable Execution Ledger & Handoff
 from core.agent_role import AgentRole
@@ -4017,6 +4017,128 @@ async def cancel_decision(
         }
 
 
+def _deny_front_agent_resource(
+    *,
+    client_prefix: str,
+    resource_label: str,
+    authorized_project_id: str,
+    audit_reason: str,
+    foreign_project_id: str | None = None,
+) -> SecurityAuthorizationError:
+    """Logs internal security classification while returning an indistinguishable client denial."""
+    _auth_manager._log_security_audit(
+        event="FRONT_AGENT_REQUEST",
+        decision="DENIED",
+        reason=audit_reason,
+        project_id=foreign_project_id,
+        authorized_project_id=authorized_project_id,
+    )
+    return SecurityAuthorizationError(
+        f"{client_prefix}: Requested {resource_label} is not accessible in authorized project '{authorized_project_id}'.",
+        authorized_project_id=authorized_project_id,
+        violation_type="UNAUTHORIZED_ACCESS",
+    )
+
+
+async def _authorize_front_agent_inputs(
+    *,
+    authorized_project_id: str,
+    task_id: str | None,
+    selected_decision: dict[str, str] | None,
+    approval_response: dict[str, Any] | None,
+) -> tuple[str | None, dict[str, str] | None, dict[str, Any] | None]:
+    """Enforces task, decision, and approval project boundaries for front_agent_request()."""
+    normalized_task_id: str | None = None
+    if task_id is not None:
+        normalized_task_id = task_id.strip()
+        if not normalized_task_id:
+            raise ValueError("task_id must not be blank.")
+        existing_task = await _task_service().get_task(normalized_task_id)
+        if existing_task is None:
+            raise _deny_front_agent_resource(
+                client_prefix="TASK_ACCESS_DENIED",
+                resource_label="task",
+                authorized_project_id=authorized_project_id,
+                audit_reason="TASK_NOT_FOUND_OR_UNAUTHORIZED",
+            )
+        if existing_task.project_id != authorized_project_id:
+            raise _deny_front_agent_resource(
+                client_prefix="TASK_ACCESS_DENIED",
+                resource_label="task",
+                authorized_project_id=authorized_project_id,
+                audit_reason="CROSS_PROJECT_IDOR_TASK_ACCESS_FORBIDDEN",
+                foreign_project_id=existing_task.project_id,
+            )
+
+    normalized_decision = selected_decision
+    if selected_decision is not None:
+        raw_dec_id = selected_decision.get("decision_id")
+        raw_opt_id = selected_decision.get("option_id")
+        dec_id = raw_dec_id.strip() if isinstance(raw_dec_id, str) else ""
+        opt_id = raw_opt_id.strip() if isinstance(raw_opt_id, str) else ""
+        if not dec_id or not opt_id:
+            raise ValueError("selected_decision must include non-empty decision_id and option_id.")
+        dec_rec = await _decision_service.get_decision(dec_id)
+        dec_task = await _task_service().get_task(dec_rec.task_id) if dec_rec is not None else None
+        if dec_rec is None or dec_task is None:
+            raise _deny_front_agent_resource(
+                client_prefix="DECISION_ACCESS_DENIED",
+                resource_label="decision",
+                authorized_project_id=authorized_project_id,
+                audit_reason="DECISION_NOT_FOUND_OR_UNAUTHORIZED",
+            )
+        if dec_task.project_id != authorized_project_id or (
+            normalized_task_id is not None and dec_rec.task_id != normalized_task_id
+        ):
+            raise _deny_front_agent_resource(
+                client_prefix="DECISION_ACCESS_DENIED",
+                resource_label="decision",
+                authorized_project_id=authorized_project_id,
+                audit_reason="CROSS_PROJECT_IDOR_DECISION_ACCESS_FORBIDDEN",
+                foreign_project_id=dec_task.project_id,
+            )
+        normalized_decision = {"decision_id": dec_id, "option_id": opt_id}
+
+    normalized_approval = approval_response
+    if approval_response is not None:
+        call_id, approved_flag = validate_approval_response_payload(approval_response)
+        approval = await pending_approvals.get(call_id)
+        if approval is None:
+            raise _deny_front_agent_resource(
+                client_prefix="APPROVAL_ACCESS_DENIED",
+                resource_label="approval",
+                authorized_project_id=authorized_project_id,
+                audit_reason="APPROVAL_NOT_FOUND_OR_UNAUTHORIZED",
+            )
+        app_project_id = approval.get("project_id")
+        app_task_id = approval.get("task_id")
+        app_task = (
+            await _task_service().get_task(app_task_id)
+            if isinstance(app_task_id, str) and app_task_id.strip()
+            else None
+        )
+        has_anchor = bool(app_project_id) or bool(app_task_id)
+        project_matches = not app_project_id or app_project_id == authorized_project_id
+        task_matches = not app_task_id or (app_task is not None and app_task.project_id == authorized_project_id)
+        expected_task_matches = normalized_task_id is None or app_task_id == normalized_task_id
+        if not (has_anchor and project_matches and task_matches and expected_task_matches):
+            foreign_proj = (
+                app_project_id
+                if (app_project_id and app_project_id != authorized_project_id)
+                else (app_task.project_id if app_task and app_task.project_id != authorized_project_id else None)
+            )
+            raise _deny_front_agent_resource(
+                client_prefix="APPROVAL_ACCESS_DENIED",
+                resource_label="approval",
+                authorized_project_id=authorized_project_id,
+                audit_reason="CROSS_PROJECT_IDOR_APPROVAL_ACCESS_FORBIDDEN",
+                foreign_project_id=foreign_proj,
+            )
+        normalized_approval = {"tool_call_id": call_id, "approved": approved_flag}
+
+    return normalized_task_id, normalized_decision, normalized_approval
+
+
 @mcp.tool()
 async def front_agent_request(
     user_input: str,
@@ -4028,12 +4150,13 @@ async def front_agent_request(
 ) -> dict[str, object]:
     """Layer 1 User-Facing Front Agent entry point for MyAgent."""
     await _initialize()
-    project = await _resolve_project(project_id)
-    if project is None:
-        return {
-            "status": "no_active_project",
-            "message": "Không tìm thấy active project nào.",
-        }
+    project = await _require_bound_project(project_id)
+    task_id, selected_decision, approval_response = await _authorize_front_agent_inputs(
+        authorized_project_id=project.project_id,
+        task_id=task_id,
+        selected_decision=selected_decision,
+        approval_response=approval_response,
+    )
 
     pres_level = PresentationLevel.NORMAL
     try:

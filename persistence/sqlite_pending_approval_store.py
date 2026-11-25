@@ -282,6 +282,7 @@ class SqlitePendingApprovalStore:
         status: str = "APPROVED",
         session_id: str | None = None,
         project_id: str | None = None,
+        task_id: str | None = None,
         note: str = "",
     ) -> dict[str, Any] | None:
         return await asyncio.to_thread(
@@ -290,6 +291,7 @@ class SqlitePendingApprovalStore:
             status=status,
             session_id=session_id,
             project_id=project_id,
+            task_id=task_id,
             note=note,
         )
 
@@ -300,6 +302,7 @@ class SqlitePendingApprovalStore:
         status: str = "APPROVED",
         session_id: str | None = None,
         project_id: str | None = None,
+        task_id: str | None = None,
         note: str = "",
     ) -> dict[str, Any]:
         res = await asyncio.to_thread(
@@ -308,6 +311,7 @@ class SqlitePendingApprovalStore:
             status=status,
             session_id=session_id,
             project_id=project_id,
+            task_id=task_id,
             note=note,
         )
         if res is None:
@@ -321,6 +325,7 @@ class SqlitePendingApprovalStore:
         status: str = "APPROVED",
         session_id: str | None = None,
         project_id: str | None = None,
+        task_id: str | None = None,
         note: str = "",
     ) -> dict[str, Any]:
         res = self._resolve_sync(
@@ -328,6 +333,7 @@ class SqlitePendingApprovalStore:
             status=status,
             session_id=session_id,
             project_id=project_id,
+            task_id=task_id,
             note=note,
         )
         if res is None:
@@ -341,6 +347,7 @@ class SqlitePendingApprovalStore:
         status: str = "APPROVED",
         session_id: str | None = None,
         project_id: str | None = None,
+        task_id: str | None = None,
         note: str = "",
     ) -> dict[str, Any] | None:
         now_dt = datetime.now(UTC)
@@ -365,6 +372,10 @@ class SqlitePendingApprovalStore:
             if project_id and rec.get("project_id") and rec.get("project_id") != project_id:
                 raise ValueError(
                     f"Approval project mismatch: {rec.get('project_id')} != {project_id}"
+                )
+            if task_id and rec.get("task_id") != task_id:
+                raise ValueError(
+                    f"Approval task mismatch: {rec.get('task_id')} != {task_id}"
                 )
 
             # Expiry check
